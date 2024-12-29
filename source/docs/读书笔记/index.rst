@@ -7,3 +7,4 @@
 
    《Effect C++》阅读笔记
    《Effect STL》阅读笔记
+   《More Effective C++》阅读笔记
