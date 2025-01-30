@@ -57,7 +57,7 @@ int main(int argc, char **argv){
 &emsp;&emsp;反汇编代码（代码中省略了不需要我们关注的内容）：
 >&emsp;&emsp;本文中的反汇编代码中也会省略很多我们不必要关注的内容，避免干扰我们分析问题。
 
-```asm
+```
 0000000000401110 <main>:
   401110:       55                      push   %rbp
   401111:       48 89 e5                mov    %rsp,%rbp
@@ -118,7 +118,7 @@ int main(){
 }
 ```
 &emsp;&emsp;C++中字符串是常量因此存储在```rodata```中，反汇编中```68 65 6c 6c 6f```就是```hello```，而```p2```中每个字符占2个字节。
-```asm
+```
 0000000000401110 <main>:
     ;...
     401111:       48 89 e5                mov    %rsp,%rbp
@@ -172,7 +172,7 @@ int main(int argc, char **argv){
 }
 ```
 &emsp;&emsp;从下面的汇编代码能够看出来，指针和引用的区别就是指针在进行操作时需要使用```*```解引用才能操作对应内存中的值，而引用直接能操作内存中的值。另外```const```值的立即数在预处理时就被替换了，对于一些复杂的场景，```const```在汇编中和普通变量没有区别，不可变是由编译器语法限制的。
-```asm
+```
 0000000000401110 <main>:
   401110:       55                      push   %rbp
   401111:       48 89 e5                mov    %rsp,%rbp
@@ -229,7 +229,7 @@ int main(){
 }
 ```
 &emsp;&emsp;下面的反汇编比较简单，能够看到都是使用对应的指令实现的。乘法中对于2幂次数利用左移进行了优化。
-```asm
+```
 0000000000401110 <main>:
   401110:       55                      push   %rbp
   401111:       48 89 e5                mov    %rsp,%rbp
@@ -290,7 +290,7 @@ int main(){
 &emsp;&emsp;无符号除法，我们可以从上面的公式中推导出具体的值，$M=\frac{2^n}{c}\rightarrow c=\frac{2^n}{M}=\frac{2^32}{0xaaaaaaab}=2.9999999996507540345598531381041\approx 3$
 &emsp;&emsp;有符号整数的触发的魔数刚好为无符号的一半。
 
-```asm
+```
 0000000000401138 <main>:
   401138:       53                      push   %rbx
   401139:       48 83 ec 10             sub    $0x10,%rsp
@@ -347,7 +347,7 @@ int main(){
 }
 ```
 
-```asm
+```
 0000000000401138 <main>:
   401138:       53                      push   %rbx
   401139:       48 83 ec 10             sub    $0x10,%rsp
@@ -406,7 +406,7 @@ int func2(int c){
   if(num){ func(num - 1); }
 ```
 
-```asm
+```
 0000000000000000 <_Z4funci>:
    0:   55                      push   %rbp
    1:   48 89 e5                mov    %rsp,%rbp
@@ -477,7 +477,7 @@ int func4(int c){
 2. 如果两边的表达式中有一个是有变量的表达式，则是利用jmp指令来实现。
 
 &emsp;&emsp;下面的反汇编注释的比较清楚，唯一需要注意的是有变量情况下创建的临时变量。
-```asm
+```
 0000000000000000 <_Z5func1i>:
    0:   55                      push   %rbp
    1:   48 89 e5                mov    %rsp,%rbp
@@ -545,7 +545,7 @@ int func4(int c){
 3. 当两边有变量且表达式简单时，编译器不使用```jmp```指令而是尝试cmov指令优化；
 4. 但是当两边的表达式比较复杂时，编译器就会使用jmp指令实现。
 
-```cpp
+```
 0000000000000000 <_Z5func1i>:
    0:   31 c0                   xor    %eax,%eax
    2:   83 ff 03                cmp    $0x3,%edi
@@ -639,7 +639,7 @@ int func(int a){
 }
 ```
 
-```asm
+```
 0000000000000000 <_Z4funci>:
    0:   83 ff 03                cmp    $0x3,%edi
    3:   75 11                   jne    16 <_Z4funci+0x16>
@@ -666,7 +666,7 @@ int ifelse(int a){
 }
 ```
 
-```asm
+```
 ;;clang -O0
 0000000000000030 <_Z6ifelsei>:
   30:   55                      push   %rbp
@@ -724,7 +724,7 @@ int ifelseif(int a){
 }
 ```
 
-```asm
+```
 0000000000000000 <_Z8ifelseifi>:
    0:   83 ff 03                cmp    $0x3,%edi
    3:   74 11                   je     16 <_Z8ifelseifi+0x16>         ;a == 3 ? goto 16
@@ -773,7 +773,7 @@ int switch1(int type){
 
 &emsp;&emsp;从下面的反汇编能够简单的看出，当条件小于3时生成的汇编的代码和```if...else if```有些类似（只是类似，还是有区别的）。上半部分，即4011b3以上的部分汇编是计算当前的值和```switch...case```的选项的比较，然后跳转到对应的代码块，下半部分就是具体的代码块儿。
 
-```asm
+```
 //-O0
 0000000000401130 <_Z7switch1i>:
   401130:       55                      push   %rbp
@@ -847,7 +847,7 @@ int switch2(int type){
 
 &emsp;&emsp;跳转表存储在```_IO_stdin_used```地址，从对应的地址中我们能够看到```0x004011fe,0x00401214,0x0040122a,0x00401240```四个地址，刚好对应每个选项的代码块的起始地址。
 
-```asm
+```
 ;-O0
 00000000004011d0 <_Z7switch2i>:
   4011d0:       55                      push   %rbp
@@ -916,7 +916,7 @@ int switch2(int type){
 ```
 
 &emsp;&emsp;```-Os```的代码相比于```-O0```更简单，相比而言```sub```指令被替换成了```dec```和```cmp```。```0x0040115d```这条指令存储的不是代码块的跳转表，而是字符串的表格，因为我们这里的代码比较简单全是```printf```函数唯一不同的地方是参数。因此编译器对这种场景优化，只存储字符串的跳转表。
-```asm
+```
 ;-Os
 000000000040114c <_Z7switch2i>:
   40114c:       50                      push   %rax
@@ -961,7 +961,7 @@ int switch3(int type, int a) {
 2. 如果不跳转则先从索引表中获取跳转表的索引，然后根据索引找到需要跳转的地址，跳转到对应地址执行。
 
 &emsp;&emsp;代码块我们就不看了，比较简单。我们直接看跳转表。跳转表索引中有58个选项，刚好对应3-60。而跳转表里面存储了5个地址（```0x00a21079, 0x00a2108c, 0x00a210a7, 0x00a210ba, 0x00a210c5```）分别对应具体的执行代码块。
-```asm
+```
 ;;跳转表索引
 0x00A210FC  00 04 04 01 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 02 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04 04  
 0x00A2112D  04 04 04 04 04 04 04 04 03 3b 0d 04 30 a2 00 f2 75 02 f2 c3 f2 e9 79 02 00 00 56 6a 01 e8 44 0b 00 00 e8 81 06 00 00 50 e8 6f 0b 00 00 e8 9a 0b 00
@@ -1044,7 +1044,7 @@ int switch3(int type, int a) {
 
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/465578f0c3b72aef0d7c41f8333a1471.png)
 
-```asm
+```
 int main(int argc, char **argv) {
 00961050  push        ebp  
 00961051  mov         ebp,esp  
@@ -1120,7 +1120,7 @@ int main(int argc, char **argv) {
 }
 ```
 
-```asm
+```
 int main(int argc, char **argv) {
 00B81040  push        ebp  
 00B81041  mov         ebp,esp  
@@ -1157,7 +1157,7 @@ int main(int argc, char **argv) {
 }
 ```
 
-```asm
+```
 int main(int argc, char **argv) {
 00A81040  push        ebp  
 00A81041  mov         ebp,esp  
@@ -1199,7 +1199,7 @@ int main(int argc, char **argv) {
 }
 ```
 
-```asm
+```
 int main(int argc, char **argv) {
 00581040  push        ebp  
 00581041  mov         ebp,esp  
@@ -1273,7 +1273,7 @@ int main(int argc, char **argv) {
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/917e770a6ff1df4cd58e339ad8645df8.png)
 
 
-```asm
+```
 void _stdcall stdcall(int v) {
 007E1080  push        ebp  
 007E1081  mov         ebp,esp  
@@ -1332,7 +1332,7 @@ int main(int argc, char **argv) {
 }
 ```
 
-```asm
+```
 a getV() {
 00511010  push        ebp  
 00511011  mov         ebp,esp  
@@ -1372,7 +1372,7 @@ int main(int argc, char **argv) {
 }
 ```
 &emsp;&emsp;从下面的反汇编中可以看出无论是静态变量还是全局变量都是通过绝对地址访问，其数据存储于数据区。
-```asm
+```
 int a = 1;
 static int b = 1;
 int main(int argc, char **argv) {
@@ -1408,7 +1408,7 @@ void func() {
 ```
 
 &emsp;&emsp;从下面的反汇编可以看到初始化静态变量前会检查```0x8a43b0h```这个地址，初始化完后就会改写该标志位。
-```asm
+```
 void func() {
 008A1100  push        ebp  
 008A1101  mov         ebp,esp  
@@ -1502,7 +1502,7 @@ int main(int argc, char **argv) {
 }
 ```
 
-```asm
+```
 int main(int argc, char **argv) {
 00571190  push        ebp  
 00571191  mov         ebp,esp  
@@ -1560,7 +1560,7 @@ int main(int argc, char **argv) {
 }
 ```
 &emsp;&emsp;从下面的反汇编中可以看到```myclass:c```并不占用类空间，myclass也是4字节对齐的。
-```asm
+```
 int main(int argc, char **argv) {
 003E1080  push        ebp  
 003E1081  mov         ebp,esp  
@@ -1605,7 +1605,7 @@ int main(int argc, char **argv) {
 }
 ```
 &emsp;&emsp;上面声明的函数没有参数但是下面函数调用时却给函数传递了个参数ecx
-```asm
+```
 int main(int argc, char **argv) {
 002C1090  push        ebp  
 002C1091  mov         ebp,esp  
@@ -1650,7 +1650,7 @@ int main(int argc, char **argv) {
 }
 ```
 &emsp;&emsp;下面的反汇编中发生了很多次的内存对象拷贝，但是实际代码中不会这样，编译器会优化避免多次拷贝。
-```asm
+```
 myclass func(myclass cls) {
 00971080  push        ebp  
 00971081  mov         ebp,esp  
@@ -1766,7 +1766,7 @@ int main(int argc, char **argv) {
 ```
 &emsp;&emsp;下面的调用关系比较清晰，不详细描述了。
 
-```asm
+```
 myclass func(myclass cls) {
 007310A0  push        ebp  
 007310A1  mov         ebp,esp  
@@ -1854,7 +1854,7 @@ int main(int argc, char **argv) {
 &emsp;&emsp;C++中虚类的继承关系比较复杂，这里不会深究，建议深入了解下类的对象模型，了解下类对象是如何布局的。另外，需要注意的是clang和msvc的虚类布局不同。这里只简单看下普通虚类的结构。
 
 **==实验==**
-```asm
+```
 int main(int argc, char **argv) {
 00F71040  push        ebp  
 00F71041  mov         ebp,esp  

@@ -62,7 +62,7 @@ int main(int argc, char **argv){
 }
 ```
 &emsp;&emsp;使用clang++-18编译器O3编译的返汇编如下，从下面的代码中看不到testFunc的任何调用就是因为编译器认为这部分代码没有任何意义就删除了。
-```asm
+```
 00000000000023e0 <main>:
     23e0:	41 56                	push   %r14
     23e2:	53                   	push   %rbx
@@ -139,7 +139,7 @@ int main(int argc, char **argv){
 }
 ```
 &emsp;&emsp;不加DoNotOptimize的化testFunc、a和t都会被删除，而编译后的结果如下。可以看到两个变量都是读取的栈内存。
-```asm
+```
 0000000000001140 <main>:
     1140:	c7 44 24 f8 01 00 00 	movl   $0x1,-0x8(%rsp)
     1147:	00 
@@ -166,7 +166,7 @@ inline BENCHMARK_ALWAYS_INLINE void DoNotOptimize(Tp& value) {
 - https://releases.llvm.org/14.0.0/tools/clang/docs/LanguageExtensions.html
 
 &emsp;&emsp;DoNotOptimize的实现使用了编译内链汇编的扩展,具体语法如下：
-```asm
+```
 asm asm-qualifiers ( AssemblerTemplate 
                  : OutputOperands 
                  [ : InputOperands
