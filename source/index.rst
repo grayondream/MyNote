@@ -11,4 +11,5 @@ Jiangyao的个人笔记
    docs/读书笔记/index
    docs/随笔/index
    docs/计算机基础/index
+   docs/工具/index
 
