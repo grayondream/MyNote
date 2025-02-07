@@ -108,9 +108,47 @@ struct A{
 **内存分析**
 &emsp;&emsp;不仅仅可以测量程序中运行耗时的热点也可以测量程序运行的内存热点根据测量情况来分析程序中的内存问题提升性能。一般的工具有valgrind，heap profiler等。
 
-**减少DTLB未命中**
+**减少TLB未命中**
+&emsp;&emsp;为了减少TLB的内存cache missing，可以使用大页面来提升减少TLB项的数量来提升性能。 一般主要有两种方式EHP和THP。
 
-#### 2.1.3 内存分析
-#### 2.1.4 减少DTLB未命中
+&emsp;&emsp;EHP 主要用于描述程序在堆内存使用上的有效性。它衡量的是实际使用的堆内存与分配的堆内存之间的比率，反映了内存使用的效率。高的 EHP 值表明程序在内存分配和使用上较为高效，避免了内存浪费。监控 EHP 可以帮助开发者识别内存泄漏或不当的内存管理行为，从而优化应用的内存使用，提升性能。
+
+&emsp;&emsp;THP 是 Linux 内核的一项特性，旨在简化大页内存的管理。传统的页面大小通常为 4KB，THP 通过使用更大的页面（通常为 2MB）来提高内存管理的效率。大页可以减少页表的大小，降低TLB（Translation Lookaside Buffer）缺失的频率，从而提升内存访问性能。
+```bash
+# 查看当前THP状态
+cat /sys/kernel/mm/transparent_hugepage/enabled
+# 启用THP
+echo always > /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+```cpp
+#include <iostream>
+#include <sys/mman.h>
+#include <unistd.h>
+
+int main() {
+    size_t pagesize = getpagesize();
+    size_t hugePageSize = 2 * 1024 * 1024; // 2MB
+
+    void* ptr = mmap(NULL, hugePageSize, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+
+    if (ptr == MAP_FAILED) {
+        std::cerr << "Failed to allocate huge page memory.\n";
+        return 1;
+    }
+
+    // 使用大页内存
+    // ...
+
+    // 释放大页内存
+    munmap(ptr, hugePageSize);
+
+    return 0;
+}
+```
 
 ### 2.2 计算优化
+&emsp;&emsp;当内存访问不再成为瓶颈时，CPU如何处理内存中的数据可能会成为性能的瓶颈。当应用TMA方法时,低效的计算通常反映在CoreBound类别中,以及在一定程度上反映在Retiring类别中。Core Bound类别代表了CPU乱序执行引擎内所有非内存问题引起的停顿。主要有两个类别:
+- 软件指令之间的数据依赖性限制了性能。例如,一系列依赖操作可能导致指令级并行性(ILP)低下,浪费了许多执行槽。下一节将更详细地讨论数据依赖链。
+- 硬件计算资源短缺(也称为执行吞吐量不足)。这表明某些执行单元过载(也称为执行端口竞争)。当工作负载频繁执行许多相同类型的指令时,可能会发生这种情况。例如,AI算法通常执行大量的乘法运算,科学应用程序可能运行许多除法和平方根运算。但在任何给定的CPU核心中,乘法器和除法器的数量都是有限的。因此,当端口竞争发生时,指令排队等待执行。这种性能瓶颈非常特定于特定的CPU微架构,通常没有解决办法。
