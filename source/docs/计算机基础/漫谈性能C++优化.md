@@ -152,3 +152,40 @@ int main() {
 &emsp;&emsp;当内存访问不再成为瓶颈时，CPU如何处理内存中的数据可能会成为性能的瓶颈。当应用TMA方法时,低效的计算通常反映在CoreBound类别中,以及在一定程度上反映在Retiring类别中。Core Bound类别代表了CPU乱序执行引擎内所有非内存问题引起的停顿。主要有两个类别:
 - 软件指令之间的数据依赖性限制了性能。例如,一系列依赖操作可能导致指令级并行性(ILP)低下,浪费了许多执行槽。下一节将更详细地讨论数据依赖链。
 - 硬件计算资源短缺(也称为执行吞吐量不足)。这表明某些执行单元过载(也称为执行端口竞争)。当工作负载频繁执行许多相同类型的指令时,可能会发生这种情况。例如,AI算法通常执行大量的乘法运算,科学应用程序可能运行许多除法和平方根运算。但在任何给定的CPU核心中,乘法器和除法器的数量都是有限的。因此,当端口竞争发生时,指令排队等待执行。这种性能瓶颈非常特定于特定的CPU微架构,通常没有解决办法。
+
+#### 2.2.1 数据依赖
+&emsp;&emsp;数据依赖就是后续指令的计算依赖前面的指令。如果前后指令相互形成数据依赖，这就意味着只有前序指令执行完成，后序的指令才能正常运行。由于CPU支持超标量和乱序执行，这就会导致数据依赖阻塞CPU的并发能力。
+
+&emsp;&emsp;当然写出没有数据依赖的程序是不可能的，但是我们可以分析程序中的数据依赖关系，通过循环展开等其他方式降低数据依赖。
+
+&emsp;&emsp;常见的数据依赖有：
+1. 流依赖，比较常见的就是后续变量的求值依赖前序的变量；
+```cpp
+int a = 5;
+int b = a + 3; // b 依赖于 a
+```
+2. 控制依赖。即表达式计算依赖if语句判断结果。
+```cpp
+if (condition) {
+    a = 5; // a 的赋值依赖于 condition 的结果
+}
+```
+3. 循环依赖。在循环结构中，迭代之间的依赖关系。
+```cpp
+for (int i = 1; i < 10; ++i) {
+    sum += i; // sum 的更新依赖于前一次的值
+}
+```
+
+#### 2.2.2 内联优化
+&emsp;&emsp;早期编译器为了优化程序执行会将成本比较低的函数在对应的代码段进行内联展开来避免函数栈变换引入的性能。但是需要注意的时自从C++17标准开始```inline```的含义已经发生变化，```inline```已经主要表示函数符号在项目中的唯一性。因此函数是否```inline```主要看编译器的判断，即便不加```inline```编译器也会尝试进行```inline```。但是这不意味着```inline```失去起作用，虽然标准改变了```inline```的定义，但是编译器本身的实现为了兼容性通常也会保留就有的```inline```语义。另外如果确切的希望某段代码```inline```，可以通过编译器的扩展比如```always_inline```等```attribute```来强制```inline```。
+```
+Since inline substitution is unobservable in the standard semantics, compilers are free to use inline substitution for any function that's not marked inline, and are free to generate function calls to any function marked inline. Those optimization choices do not change the rules regarding multiple definitions and shared statics listed above.
+
+Because the meaning of the keyword inline for functions came to mean "multiple definitions are permitted" rather than "inlining is preferred" since C++98, that meaning was extended to variables.
+```
+
+#### 2.2.3 循环优化
+&emsp;&emsp;循环是几乎所有高性能程序的核心。由于循环代表了执行大量次的代码片段,因此它们是执行时间花费最多的部分。在这样一个关键代码段进行微小的更改可能会对程序的性能产生重大影响。这就是为什么仔细分析程序中热点循环的性能并了解改进它们的可能方法非常重要。虽然很多时候编译器能够自动识别循环优化，但是大部分情况下还是做不到这一点，我们能够认识到如何优化可以在编译器无法优化的情况下手动优化。
+
+##### 2.2.3.1 
