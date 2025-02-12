@@ -405,3 +405,111 @@ void add_simd(const float* a, const float* b, float* c, int n) {
    - **代码转换**：将标量循环转换为向量化形式，生成相应的 SIMD 指令。
    - **循环重排和优化**：根据需要重排循环，以提高数据局部性和并行性。
    - **生成向量化代码**：输出最终的向量化代码，并确保其在目标硬件上可以有效运行。
+
+&emsp;&emsp;通常我们可以通过编译器的相关参数检查来确认是否进行向量化，比如如下的代码：
+```cpp
+float func(){
+	float *ptr = new float[1024];
+	float sum = 0.0f;
+	for(auto i = 0;i < 1024 - 1;i++){
+		sum += ptr[i];
+	}
+
+	return sum;
+}
+```
+
+&emsp;&emsp;通过命令```clang++ -c main.cpp -O3 -march=core-avx2 -Rpass-analysis=.\*```会有以下输出，帮助我们分析编译器的优化状态。当然还有其他命令，这只是命令之一，具体可以参考具体编译器的文档。
+```cpp
+main.cpp:8:7: remark: loop not vectorized: cannot prove it is safe to reorder floating-point operations; allow reordering by specifying '#pragma clang loop vectorize(enable)' before the loop or by providing the compiler option '-ffast-math' [-Rpass-analysis=loop-vectorize]
+    8 |                 sum += ptr[i];
+      |                     ^
+main.cpp:4:7: remark: Loop Strength Reduction: IR instruction count changed from 55 to 67; Delta: 12 [-Rpass-analysis=size-info]
+    4 | float func(){
+```
+
+##### 2.2.4.2 更好的向量化
+&emsp;&emsp;编译器进行自动向量化时，尽管能够显著提高性能，但生成的向量化代码可能不是最优的，原因如下：
+1. **局限的分析能力**
+   - **数据依赖性判断**：编译器在分析数据依赖时可能无法全面理解程序的上下文，导致某些可向量化的部分被遗漏。
+   - **复杂控制流**：对于复杂的控制流结构（如条件语句和嵌套循环），编译器可能无法正确评估向量化的收益。
+2. **子optimal的向量化策略**
+   - **固定的向量宽度**：编译器通常使用固定的向量宽度，这可能不适合特定的硬件架构，导致性能未达到最佳。
+   - **缺乏循环重排**：编译器可能未能充分利用循环重排等优化技术，导致数据局部性不足。
+3. **内存访问模式**
+   - **缓存未命中**：编译器可能未能优化内存访问模式，导致缓存未命中率高，从而影响性能。
+   - **不对齐的内存访问**：生成的向量化代码可能导致不对齐的内存访问，这会降低性能。
+4. **硬件特性利用不足**
+   - **SIMD指令集的充分利用**：编译器可能未能充分利用特定硬件的 SIMD 指令集特性（如 AVX、SSE），未能生成最优指令。
+   - **寄存器使用效率**：在寄存器使用上，编译器可能未能充分利用可用资源，导致寄存器溢出或频繁的内存访问。
+
+&emsp;&emsp;这就需要我们根据具体的场景和硬件进行手动优化。或者使用现有的框架比如OpenCL，CUDA，OpenMP等进行并行优化。
+
+### 2.3 优化分支预测
+&emsp;&emsp;分支预测旨在减少因分支指令（如条件语句）引起的流水线停顿。通过预测程序执行中的分支方向，处理器可以提前加载指令，从而提高执行效率。分支预测根据预测机制分为
+- 静态预测：基于编译时信息进行预测，例如总是预测为“跳转”或“不中断”。
+- 动态预测：使用历史信息来预测分支的结果，基于过去的执行行为进行预测。
+
+&emsp;&emsp;处理器维护一个分支历史表，记录最近的分支指令及其结果。通过分析历史数据，处理器能够预测未来分支的方向。当预测错误时，处理器必须清空错误路径上的指令并重新加载正确路径的指令，这会导致CPU的指令并行性下降，从而导致性能下降。
+
+&emsp;&emsp;分支预测器使用缓存和历史寄存器,因此容易受到与缓存相关的问题的影响,即三个C:
+- 强制性缺失(Compulsory misses):当采用静态预测时,如果果在分支的第一次动态出现时没有可用的动态历史信息,可能会发生误预测。
+- 容量缺失(Capacity misses):由于程序中分支数量极高或动态模式非常长,导致动态历史丢失,从而产生误预测。
+- 冲突缺失(Conflict misses):分支通过它们的虚拟地址和/或牛物理地址的组合被映射到缓存桶(关联集合)中。如果太多活跃的分支被映射到同一个集合,就可能发生历史丢失。冲突缺失的另一个例子是虚伪共享,当两个独立的分支被映射到同一个缓存条目时,它们可能会相互干扰,从而可能降低预测历史的质量。
+
+&emsp;&emsp;通常我们可以通过调整代码书写的方式来降低分支预测错误的概率。
+**用查找表替换分支**
+&emsp;&emsp;在程序中存在大量条件分支的情况下。通过使用查找表，程序可以避免频繁的条件判断，从而减少分支预测失败的代价和流水线停顿。
+```cpp
+int compute(int x) {
+    if (x == 0) return 10;
+    else if (x == 1) return 20;
+    else if (x == 2) return 30;
+    else return -1; // 默认值
+}
+//优化后
+int lookupTable[] = {10, 20, 30, -1}; // 默认值为 -1
+
+int compute(int x) {
+    if (x < 0 || x >= sizeof(lookupTable)/sizeof(lookupTable[0])) {
+        return -1; // 边界检查
+    }
+    return lookupTable[x]; // 直接查找
+}
+```
+
+**用算术替换分支**
+&emsp;&emsp;通过将条件分支转换为算术运算，来减少分支指令的使用。这种方法可以提高代码的执行效率，特别是在性能敏感的应用中
+```cpp
+int compute(int x) {
+    if (x > 0) return 1;
+    else return 0;
+}
+//优化后
+int compute(int x) {
+    return (x > 0) * 1 + (x <= 0) * 0; // 用算术替换
+}
+```
+
+**用谓词替换分支**
+&emsp;&emsp;通过使用谓词逻辑来消除条件分支，从而提高程序的性能。这种方法特别适用于可以并行化执行的场景，可以减少分支预测失败的影响和流水线停顿。
+```cpp
+void compute(int x, int* result) {
+    if (x > 0) {
+        *result = 1;
+    } else {
+        *result = 0;
+    }
+}
+//优化后
+void compute(int x, int* result) {
+    *result = (x > 0) ? 1 : 0; // 仍然是条件，但可以进一步优化
+}
+```
+
+**利用编译器的能力进行优化**
+&emsp;&emsp;可以使用编译器提供的一些扩展来帮助优化，比如c++20的likely可以告诉编译器程序大概率进入哪个分支让编译器朝着对应的分支优化。另外还有POG和BOLT：
+- PGO：Profile-Guided Optimization (PGO) 是一种编译器优化技术，通过分析程序的运行时行为来优化代码。
+- BOLT：BOLT 是一种二进制优化工具，主要用于优化已编译的程序的性能。
+
+### 2.4 优化机器代码布局
