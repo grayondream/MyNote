@@ -617,8 +617,221 @@ struct _LIBCPP_TEMPLATE_VIS array
     _Tp __elems_[_Size];
 };
 ```
-## 3 参考文献
 
+## 5 ```iterator```
+&emsp;&emsp;迭代器是一种抽象设计模式，旨在不暴露实现细节的情况下按照某种特定的顺序访问类内的数据。简单的说，就类似数组和访问数组的指针的关系。这样就可以将实际承载数据的容器和处理容器的一些算法分离开，算法只需要通过迭代器访问类内的数据完成一些通用的算法处理。但是由于高度抽象没有足够的细节，算法处理只能根据有限的信息做通用处理没法针对特定的场景选择更加优秀的处理方式。一些容器比如```string```就实现了自己的一套算法处理API。
+&emsp;&emsp;迭代器是用来访问容器中数据成员的抽象接口，它的行为类似于指针对象，可以读写对应索引的成员，并进行```--,++```等操作改变索引。
+### 5.1 ```iterator```
+&emsp;&emsp;STL的迭代器就是规定了6大类型的迭代器以及迭代器对应的```iterator_traits```，每个迭代器的访问规则都是固定的，比如前向迭代器可以```++```，随机访问迭代器可以```+n```。具体的迭代器实现和具体的容器实现是强相关的，每个迭代器的实现就有具体的容器负责。当外部希望通过迭代器操作容器的元素时只需要根据规定的语义访问即可，如果期望了解嗲到期存放的类型等信息可以使用```iterator_traits```获取，这样就保证了内部的实现对外是完全隔离的。
+
+### 5.2 ```iterator traits```
+&emsp;&emsp;STL中有6类迭代器：输入迭代器，输出迭代器，前向迭代器，双向迭代器，连续存储迭代器（C++20新增的），随机访问迭代器。
+- 输入迭代器：索引对内的内存可读，比如```istream_iterator```；
+- 输出迭代器：索引对应的内存可写，比如```ostream_iterator```；
+- 前向迭代器：数据可读写，索引的方向只能向前，可以```++```，但是不能向后不支持```--```；
+- 双向迭代器：在前向迭代器的基础上，支持```--```；
+- 随机访问迭代器：功能完全和指针相同，可以通过随机指针随机访问容器内的元素，比如```iter+n```访问相对当前位置后第```n```个元素。
+- 连序存储迭代器：通过该迭代器访问的元素都保证数据存储是连续的。
+
+&emsp;&emsp;下面是libcxx中不同类型迭代器的标识，这些类虽然是空类，但是是不同的类型就可以通过模板推导的方式选择正确的迭代器。
+```cpp
+struct _LIBCPP_TEMPLATE_VIS input_iterator_tag {};
+struct _LIBCPP_TEMPLATE_VIS output_iterator_tag {};
+struct _LIBCPP_TEMPLATE_VIS forward_iterator_tag       : public input_iterator_tag {};
+struct _LIBCPP_TEMPLATE_VIS bidirectional_iterator_tag : public forward_iterator_tag {};
+struct _LIBCPP_TEMPLATE_VIS random_access_iterator_tag : public bidirectional_iterator_tag {};
+#if _LIBCPP_STD_VER >= 20
+struct _LIBCPP_TEMPLATE_VIS contiguous_iterator_tag    : public random_access_iterator_tag {};
+#endif
+```
+
+&emsp;&emsp;STL是迭代器类型的类型萃取器，可以根据当前迭代器的类型推断出一些容器迭代器中需要的类型。STL要求所有迭代器都应该提供这五个基本的类型以方便萃取器获取具体的类型，参考[iterator_traits](https://zh.cppreference.com/w/cpp/iterator/iterator_traits)
+```cpp
+template <class _Iter>
+struct __iterator_traits_impl<_Iter, true>
+{
+    typedef typename _Iter::difference_type   difference_type;
+    typedef typename _Iter::value_type        value_type;
+    typedef typename _Iter::pointer           pointer;
+    typedef typename _Iter::reference         reference;
+    typedef typename _Iter::iterator_category iterator_category;
+};
+//指针的特化版本
+struct _LIBCPP_TEMPLATE_VIS iterator_traits<_Tp*>{
+    typedef ptrdiff_t difference_type;
+    typedef __remove_cv_t<_Tp> value_type;
+    typedef _Tp* pointer;
+    typedef _Tp& reference;
+    typedef random_access_iterator_tag iterator_category;
+#if _LIBCPP_STD_VER >= 20
+    typedef contiguous_iterator_tag    iterator_concept;
+#endif
+};
+```
+
+#### 5.3 不同迭代器的实现
+##### 5.3.1 容器的迭代器
+###### 5.3.1.1 ```__wrap_iter```
+&emsp;&emsp;```vector```的迭代器时```__wrap_iter<pointer>```就是一个指针的包装器，将指针的一系列操作封装了一遍，也就是```vector```的迭代器就是一个指针没有什么特别之处。而```array```的迭代器直接就是一个```value_type*```类型，就是一个裸指针。
+```cpp
+template <class _Iter>
+class __wrap_iter
+{
+public:
+    typedef _Iter                                                      iterator_type;
+    typedef typename iterator_traits<iterator_type>::value_type        value_type;
+    typedef typename iterator_traits<iterator_type>::difference_type   difference_type;
+    typedef typename iterator_traits<iterator_type>::pointer           pointer;
+    typedef typename iterator_traits<iterator_type>::reference         reference;
+    typedef typename iterator_traits<iterator_type>::iterator_category iterator_category;
+
+private:
+    iterator_type __i_;
+
+    _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX14 __wrap_iter& operator+=(difference_type __n) _NOEXCEPT{
+        _LIBCPP_DEBUG_ASSERT(__get_const_db()->__addable(this, __n), "Attempted to add/subtract an iterator outside its valid range");
+        __i_ += __n;
+        return *this;
+    }
+};
+```
+&emsp;&emsp;另外需要注意的是```vector```的```end()```的返回值就是```__end_```指向的位置，该位置是一个未知的地址，只能作为结束位置的标识符不能访问对应的内存。
+
+###### 5.3.1.2 ```list_iterator```
+&emsp;&emsp;```list_iterator```的实现是和```list```的实现相关的，是对根据链表的指针访问节点的一个包装，因为链表只能通过当前节点访问前向节点和后向节点，支持随机访问本身意义不大，因此是双向访问节点。实现也比较简单，不详述。
+```cpp
+template <class _Tp, class _VoidPtr>
+class _LIBCPP_TEMPLATE_VIS __list_iterator
+{
+    typedef __list_node_pointer_traits<_Tp, _VoidPtr> _NodeTraits;
+    typedef typename _NodeTraits::__link_pointer __link_pointer;
+
+    __link_pointer __ptr_;
+
+    _LIBCPP_INLINE_VISIBILITY
+    explicit __list_iterator(__link_pointer __p, const void* __c) _NOEXCEPT
+        : __ptr_(__p){
+        (void)__c;
+    }
+
+    template<class, class> friend class list;
+    template<class, class> friend class __list_imp;
+    template<class, class> friend class __list_const_iterator;
+public:
+    typedef bidirectional_iterator_tag       iterator_category;
+    typedef _Tp                              value_type;
+    typedef value_type&                      reference;
+    typedef __rebind_pointer_t<_VoidPtr, value_type> pointer;
+    typedef typename pointer_traits<pointer>::difference_type difference_type;
+    __list_iterator& operator++(){
+        __ptr_ = __ptr_->__next_;
+        return *this;
+    }
+
+    __list_iterator operator++(int) {__list_iterator __t(*this); ++(*this); return __t;}
+
+    __list_iterator& operator--(){
+        __ptr_ = __ptr_->__prev_;
+        return *this;
+    }
+}
+```
+
+###### 5.3.1.3 ```map_iterator```
+&emsp;&emsp;```map```STL内部实现是红黑树，而```map_iterator```是一个包装器具体的是实现```__tree_iterator```。比如```operator++```的实现就是访问平衡数的下一个节点。
+```cpp
+template <class _EndNodePtr, class _NodePtr>
+inline _LIBCPP_INLINE_VISIBILITY _EndNodePtr __tree_next_iter(_NodePtr __x) _NOEXCEPT{
+    _LIBCPP_ASSERT(__x != nullptr, "node shouldn't be null");
+    if (__x->__right_ != nullptr)
+        return static_cast<_EndNodePtr>(_VSTD::__tree_min(__x->__right_));
+    while (!_VSTD::__tree_is_left_child(__x))
+        __x = __x->__parent_unsafe();
+    return static_cast<_EndNodePtr>(__x->__parent_);
+}
+```
+
+&emsp;&emsp;而```unordered_map```的迭代器实现由```__hash_table```提供，实现比较复杂在了解```hash_table```的实现时再详细描述。
+
+##### 5.3.2 迭代器包装器
+###### 5.3.2.1 ```reverse_iterator```
+
+&emsp;&emsp;```reverse_iterator```是一个迭代器的包装器，，并不是一个真正的迭代器。```reverse_iterator```可以相对于当前迭代器反方向访问元素，它将当前迭代器的操作方向完全逆转，+变成-，-变成+，不详述，代码比较简单。
+```cpp
+template <class _Iter>
+class _LIBCPP_TEMPLATE_VIS reverse_iterator
+#if _LIBCPP_STD_VER <= 14 || !defined(_LIBCPP_ABI_NO_ITERATOR_BASES)
+    : public iterator<typename iterator_traits<_Iter>::iterator_category,
+                      typename iterator_traits<_Iter>::value_type,
+                      typename iterator_traits<_Iter>::difference_type,
+                      typename iterator_traits<_Iter>::pointer,
+                      typename iterator_traits<_Iter>::reference>
+#endif
+{
+_LIBCPP_SUPPRESS_DEPRECATED_POP
+private:
+#ifndef _LIBCPP_ABI_NO_ITERATOR_BASES
+    _Iter __t_; // no longer used as of LWG #2360, not removed due to ABI break
+#endif
+
+#if _LIBCPP_STD_VER >= 20
+    static_assert(__is_cpp17_bidirectional_iterator<_Iter>::value || bidirectional_iterator<_Iter>,
+        "reverse_iterator<It> requires It to be a bidirectional iterator.");
+#endif // _LIBCPP_STD_VER >= 20
+
+protected:
+    _Iter current;
+        _LIBCPP_INLINE_VISIBILITY _LIBCPP_CONSTEXPR_SINCE_CXX17
+    reverse_iterator& operator++() {--current; return *this;}
+    _LIBCPP_INLINE_VISIBILITY _LIBCPP_CONSTEXPR_SINCE_CXX17
+    reverse_iterator operator++(int) {reverse_iterator __tmp(*this); --current; return __tmp;}
+    _LIBCPP_INLINE_VISIBILITY _LIBCPP_CONSTEXPR_SINCE_CXX17
+    reverse_iterator& operator--() {++current; return *this;}
+    _LIBCPP_INLINE_VISIBILITY _LIBCPP_CONSTEXPR_SINCE_CXX17
+    reverse_iterator operator--(int) {reverse_iterator __tmp(*this); ++current; return __tmp;}
+    _LIBCPP_INLINE_VISIBILITY _LIBCPP_CONSTEXPR_SINCE_CXX17
+    reverse_iterator operator+(difference_type __n) const {return reverse_iterator(current - __n);}
+    _LIBCPP_INLINE_VISIBILITY _LIBCPP_CONSTEXPR_SINCE_CXX17
+    reverse_iterator& operator+=(difference_type __n) {current -= __n; return *this;}
+    _LIBCPP_INLINE_VISIBILITY _LIBCPP_CONSTEXPR_SINCE_CXX17
+    reverse_iterator operator-(difference_type __n) const {return reverse_iterator(current + __n);}
+    _LIBCPP_INLINE_VISIBILITY _LIBCPP_CONSTEXPR_SINCE_CXX17
+    reverse_iterator& operator-=(difference_type __n) {current += __n; return *this;}
+    _LIBCPP_INLINE_VISIBILITY _LIBCPP_CONSTEXPR_SINCE_CXX17
+    reference operator[](difference_type __n) const {return *(*this + __n);}
+};
+```
+
+###### 5.3.2.2 ```back_inserter```、```back_insert_iterator```、```insert_iterator```、```front_insert_iterator```、```insert_iterator```和```inserter```
+&emsp;&emsp;后向插入迭代器，在给```back_inserter```赋值是就会调用容器的```push_back```函数插入元素。也就是说只有```push_back```接口的容器才能使用```back_inserter```。
+```cpp
+ _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 back_insert_iterator& operator=(const typename _Container::value_type& __value){
+    container->push_back(__value); return *this;
+}
+
+template <class _Container>
+inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 back_insert_iterator<_Container>
+back_inserter(_Container& __x){
+    return back_insert_iterator<_Container>(__x);
+}
+```
+
+&emsp;&emsp;```insert_iterator```和```front_insert_iterator```通过调用容器的```push_front```函数实现前插。
+```cpp
+_LIBCPP_INLINE_VISIBILITY _LIBCPP_CONSTEXPR_SINCE_CXX20 front_insert_iterator& operator=(const typename _Container::value_type& __value)
+{container->push_front(__value); return *this;}
+```
+
+&emsp;&emsp;```insert_iterator```和```inserter```通过调用```insert```函数来实现插入元素。
+```cpp
+_LIBCPP_INLINE_VISIBILITY _LIBCPP_CONSTEXPR_SINCE_CXX20 insert_iterator& operator=(const typename _Container::value_type& __value)
+{iter = container->insert(iter, __value); ++iter; return *this;}
+```
+# 3 参考文献
+- [iterator_traits](https://zh.cppreference.com/w/cpp/iterator/iterator_traits)
+- [深入理解STL源码(2) 迭代器(Iterators)和Traits](http://ibillxia.github.io/blog/2014/06/21/stl-source-insight-2-iterators-and-traits/)
+- [STL迭代器 基础篇](https://zhuanlan.zhihu.com/p/94629092)
+- [iterator](https://en.cppreference.com/w/cpp/iterator)
 - [stackoverflow——push_back vs emplace_back](https://stackoverflow.com/questions/4303513/push-back-vs-emplace-back)
 - [Proposed Wording for Placement Insert](http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2008/n2642.pdf)
 - [string](https://en.cppreference.com/w/cpp/string/basic_string)
