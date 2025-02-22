@@ -827,6 +827,281 @@ _LIBCPP_INLINE_VISIBILITY _LIBCPP_CONSTEXPR_SINCE_CXX20 front_insert_iterator& o
 _LIBCPP_INLINE_VISIBILITY _LIBCPP_CONSTEXPR_SINCE_CXX20 insert_iterator& operator=(const typename _Container::value_type& __value)
 {iter = container->insert(iter, __value); ++iter; return *this;}
 ```
+
+## 6 deque
+
+&emsp;&emsp;```deque```是STL中的双向队列序列容器，可以在队列的队头和队尾插入或者pop元素。因为限制了操作元素的节点因此操作基本上是常数的。```deque```的实现相比```vector```更加复杂，前者采用了多段内存段的实现而不是一整块连续的内存。因此不能假定```deque```的内存时完全连续的。
+### 6.1 ```deque_map```
+&emsp;&emsp;C++标准库中的队列实现是一个一个block组成的，并不是一整块连续的内存，每个block内存时连续的，而block的地址存储在```__map__```中。```__map__```就是一个序列化容器，类似于```vector```的内部实现，其内部存储的是每个```block```的指针，而每个```block```的指针指向一块连续的内存，每块连续内存的大小是```__block_size * sizeof(value_type)```。
+```cpp
+template <class _ValueType, class _DiffType>
+struct __deque_block_size {
+  static const _DiffType value = sizeof(_ValueType) < 256 ? 4096 / sizeof(_ValueType) : 16;
+};
+```
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/a41e1d346b32a1ce8e827c5a3b27880b.png)
+
+```cpp
+static const difference_type __block_size;
+__map __map_;
+size_type __start_;
+__compressed_pair<size_type, allocator_type> __size_;
+```
+&emsp;&emsp;因此我们先简单看下```__map__```的结构，可以看到```__map```就是一个```split_buffer```，在```vector```源码中有用到这个结构但是只是作为size计算的一个中间产物，并没有什么用。
+```
+using __map = __split_buffer<pointer, __pointer_allocator>;
+```
+
+**split_buffer**
+
+```cpp
+template <class _Tp, class _Allocator = allocator<_Tp> >
+struct __split_buffer
+{
+    static const difference_type __block_size;
+    pointer __first_;
+    pointer __begin_;
+    pointer __end_;
+    __compressed_pair<pointer, allocator_type> __end_cap_;
+};
+```
+&emsp;&emsp;```split_buffer```基本上和```vector```一致，从```construct_to_end```的实现可见一斑。稍有不同就是元素起始位置不是容器开头而是```__first__```，即```distance(__first__, __begin__)```可能不为0，并且前者会频繁调整元素的位置。
+```cpp
+template <class _Tp, class _Allocator>
+template <class _InputIter>
+_LIBCPP_CONSTEXPR_SINCE_CXX20 __enable_if_t<__is_exactly_cpp17_input_iterator<_InputIter>::value>
+__split_buffer<_Tp, _Allocator>::__construct_at_end(_InputIter __first, _InputIter __last)
+{
+    __alloc_rr& __a = this->__alloc();
+    for (; __first != __last; ++__first)
+    {
+        if (__end_ == __end_cap())
+        {
+            size_type __old_cap = __end_cap() - __first_;
+            size_type __new_cap = _VSTD::max<size_type>(2 * __old_cap, 8);
+            __split_buffer __buf(__new_cap, 0, __a);
+            for (pointer __p = __begin_; __p != __end_; ++__p, (void) ++__buf.__end_)
+                __alloc_traits::construct(__buf.__alloc(),
+                        _VSTD::__to_address(__buf.__end_), _VSTD::move(*__p));
+            swap(__buf);
+        }
+        __alloc_traits::construct(__a, _VSTD::__to_address(this->__end_), *__first);
+        ++this->__end_;
+    }
+}
+```
+
+&emsp;&emsp;```split_buffer```会在插入元素时会调整当前元素的位置使得元素始终在整个内存空间的中间，这样能够保证在插入元素时头部和尾部始终由足够的空间进行插入元素，而不至于频繁申请内存。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/bb60935ea17d50bf3199f5a073eddbb0.png)
+
+
+&emsp;&emsp;如果没有足够的空间触发分配内存时的策略也与```vector```不同，重新分配完之后会将当前使用的空间移动到当前容器的正中间。
+```cpp
+void __split_buffer<_Tp, _Allocator>::push_back(const_reference __x)
+{
+    if (__end_ == __end_cap())
+    {
+        if (__begin_ > __first_)
+        {//如果当前容器前半部分由空闲就会将容器内元素前移，push_front刚好相反会将元素后移
+            difference_type __d = __begin_ - __first_;
+            __d = (__d + 1) / 2;
+            __end_ = _VSTD::move(__begin_, __end_, __begin_ - __d);
+            __begin_ -= __d;
+        }
+        else
+        {
+            size_type __c = std::max<size_type>(2 * static_cast<size_t>(__end_cap() - __first_), 1);
+            //push_front的时候这里略有不同
+            //push_front   __split_buffer<value_type, __alloc_rr&> __t(__c, (__c + 3) / 4, __alloc());
+            __split_buffer<value_type, __alloc_rr&> __t(__c, __c / 4, __alloc());   //开始位置的指针刚好让已用空间在中间
+            __t.__construct_at_end(move_iterator<pointer>(__begin_),
+                                   move_iterator<pointer>(__end_));
+            _VSTD::swap(__first_, __t.__first_);
+            _VSTD::swap(__begin_, __t.__begin_);
+            _VSTD::swap(__end_, __t.__end_);
+            _VSTD::swap(__end_cap(), __t.__end_cap());
+        }
+    }
+    __alloc_traits::construct(__alloc(), _VSTD::__to_address(__end_), __x);
+    ++__end_;
+}
+```
+
+### 6.2 ```push_back```
+&emsp;&emsp;直接看下```push_back```的实现，了解如何插入元素，对deque内存结构也会有完整的认识。流程比较简单就是检查是否有足够的的空间，没有的话就会申请，否则直接在尾部创建。
+```cpp
+template <class _Tp, class _Allocator>
+void deque<_Tp, _Allocator>::push_back(const value_type& __v)
+{
+    allocator_type& __a = __alloc();
+    if (__back_spare() == 0)
+        __add_back_capacity();
+    // __back_spare() >= 1
+    __alloc_traits::construct(__a, _VSTD::addressof(*end()), __v);
+    ++__size();
+}
+```
+&emsp;&emsp;从```deque```的size相关的函数实现我们能够大致判断内存结构，可以看到```__start__```指向的是当前队列的开头，而这个值时相对于整个队里的大小，即取值范围为```[0 , block() * __block_size__ - 1]```。通过```__start__,__block_size__,__map__.size()，__size_```就可以计算处当前队列中的尾部以及元素的数量。
+```cpp
+    size_type __capacity() const{
+        return __map_.size() == 0 ? 0 : __map_.size() * __block_size - 1;
+    }
+    size_type __block_count() const{
+        return __map_.size();
+    }
+    size_type __front_spare() const{
+        return __start_;
+    }
+    size_type __front_spare_blocks() const {
+      return __front_spare() / __block_size;
+    }
+    size_type __back_spare() const{
+        return __capacity() - (__start_ + size());
+    }
+    size_type __back_spare_blocks() const {
+      return __back_spare() / __block_size;
+    }
+
+```
+&emsp;&emsp;从上面我们能大致看出```deque```的内存结构：
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/796f3ed81e0cd0445fc91c370bfb42da.png)
+
+
+&emsp;&emsp;从上面的代码中能够看出针对三种情况进行了不同的处理：
+1. 当队列前有整块block时，直接将前面的block移动到后面，这样就不用重新分配内存了；
+2. 当map头部仍然头未使用的block时，直接分配新的block尾插；
+   1. 如果```split_buffer```尾部有空间则直接allocate新的block；
+   2. 如果```split_buffer```尾部没有空间就先头差再pop尾插，这样能够确保已经使用的空间刚好在```split_buffer```的正中间，也不会带来额外的开销；
+3. 当map内完全没有空闲空间时，重新整块map;
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/c8d6ed8652f3ffe998ee1c2094467417.png)
+
+
+```cpp
+template <class _Tp, class _Allocator>
+void
+deque<_Tp, _Allocator>::__add_back_capacity()
+{
+    allocator_type& __a = __alloc();
+    if (__front_spare() >= __block_size){   //队列头有整块block
+        __start_ -= __block_size;
+        pointer __pt = __map_.front();
+        __map_.pop_front();
+        __map_.push_back(__pt);
+    }
+    // Else if __nb <= __map_.capacity() - __map_.size() then we need to allocate __nb buffers
+    else if (__map_.size() < __map_.capacity())
+    {   // we can put the new buffer into the map, but don't shift things around
+        // until it is allocated.  If we throw, we don't need to fix
+        // anything up (any added buffers are undetectible)
+        if (__map_.__back_spare() != 0)         //__map__的尾部还有足够的空间push_back不会触发新分配内存直接插入
+            __map_.push_back(__alloc_traits::allocate(__a, __block_size));
+        else{
+            //这里这样做是为了让可用空间刚好在split_buffer的正中间
+            __map_.push_front(__alloc_traits::allocate(__a, __block_size));
+            // Done allocating, reorder capacity
+            pointer __pt = __map_.front();
+            __map_.pop_front();
+            __map_.push_back(__pt);
+        }
+    }
+    // Else need to allocate 1 buffer, *and* we need to reallocate __map_.
+    else{//重新分配整块map
+        __split_buffer<pointer, __pointer_allocator&>
+            __buf(std::max<size_type>(2* __map_.capacity(), 1),
+                  __map_.size(),
+                  __map_.__alloc());
+
+        typedef __allocator_destructor<_Allocator> _Dp;
+        unique_ptr<pointer, _Dp> __hold(
+            __alloc_traits::allocate(__a, __block_size),
+                _Dp(__a, __block_size));
+        __buf.push_back(__hold.get());
+        __hold.release();
+
+        for (__map_pointer __i = __map_.end();
+                __i != __map_.begin();)
+            __buf.push_front(*--__i);
+        _VSTD::swap(__map_.__first_, __buf.__first_);
+        _VSTD::swap(__map_.__begin_, __buf.__begin_);
+        _VSTD::swap(__map_.__end_, __buf.__end_);
+        _VSTD::swap(__map_.__end_cap(), __buf.__end_cap());
+    }
+}
+```
+
+&emsp;&emsp;```push_front```的逻辑基本相同，只不过方向相反。```emplace_back```和```push_back```的逻辑上是一样的，唯一的区别是对象构建的时机和```vector```中二者的差别相同。
+
+### 6.3 ```pop_front```
+&emsp;&emsp;```pop_front```实现比较简单就是析构对应点的对象。
+```cpp
+template <class _Tp, class _Allocator>
+void deque<_Tp, _Allocator>::pop_front(){
+    allocator_type& __a = __alloc();
+    __alloc_traits::destroy(__a, _VSTD::__to_address(*(__map_.begin() +
+                                                    __start_ / __block_size) +
+                                                    __start_ % __block_size));
+    --__size();
+    ++__start_;
+    __maybe_remove_front_spare();
+}
+```
+&emsp;&emsp;如果队列中空闲的比较多就会尝试回收，这里的阈值是2个block。
+```cpp
+bool __maybe_remove_front_spare(bool __keep_one = true) {
+    if (__front_spare_blocks() >= 2 || (!__keep_one && __front_spare_blocks())) {
+    __alloc_traits::deallocate(__alloc(), __map_.front(),
+                                __block_size);
+    __map_.pop_front();
+    __start_ -= __block_size;
+    return true;
+    }
+    return false;
+}
+```
+
+### 6.4 迭代器
+&emsp;&emsp;```deque```的迭代器时```__deque_iterator```。
+```cpp
+using iterator = __deque_iterator<value_type, pointer, reference, __map_pointer, difference_type>;
+```
+&emsp;&emsp;因为```deque```是非连续内存，因此```deque_iterator```需要对一些节点计算进行处理。```deque_iterator```中包含一个```__m_iter_```就是一个队列中map的普通指针。```__m_iter_```表示当前迭代器指向的map节点，而```__ptr_```表示当前队列中元素在当前block的位置。
+```cpp
+class _LIBCPP_TEMPLATE_VIS __deque_iterator{
+    typedef _MapPointer __map_iterator;
+public:
+    typedef _Pointer  pointer;
+    typedef _DiffType difference_type;
+private:
+    __map_iterator __m_iter_;
+    pointer        __ptr_;
+
+    static const difference_type __block_size;
+};
+```
+
+&emsp;&emsp;我们简单看下迭代器如何自增和自减。从下面的实现可以看出就是进行简单的游标标记，如果当前指针超过当前block则map自增。```dequeue```也是相同的道理，先计算block的索引，再根据block内的索引来计算具体的位置。
+```cpp
+    //deque_iterator
+    _LIBCPP_HIDE_FROM_ABI __deque_iterator& operator++(){
+        if (++__ptr_ - *__m_iter_ == __block_size)
+        {
+            ++__m_iter_;
+            __ptr_ = *__m_iter_;
+        }
+        return *this;
+    }
+    //deque
+      _LIBCPP_HIDE_FROM_ABI iterator begin() _NOEXCEPT {
+      __map_pointer __mp = __map_.begin() + __start_ / __block_size;
+      return iterator(__mp, __map_.empty() ? 0 : *__mp + __start_ % __block_size);
+  }
+```
+
+&emsp;&emsp;根据上面的代码可以看出一个```deque```的内存布局。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/e72dbe9279d856fd2483287453aa5f5c.png)
+
 # 3 参考文献
 - [iterator_traits](https://zh.cppreference.com/w/cpp/iterator/iterator_traits)
 - [深入理解STL源码(2) 迭代器(Iterators)和Traits](http://ibillxia.github.io/blog/2014/06/21/stl-source-insight-2-iterators-and-traits/)
