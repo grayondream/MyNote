@@ -1,6 +1,5 @@
 # Lock-Free环形队列实现
-**摘要**：
-**备注**
+**摘要**：本文描述了使用原子变量实现线程安全队列的基本原理和实现。首先分析了多线程情况下队列的访问冲突情况。然后详细描述了Lock-Free单入单出队列的原理和实现，性能测试发现其性能优势相比于带锁的队列比较明显。最后详细描述了Lock-Free堕入多出队列的原理和实现，并给出了准确的性能测试数据。
 **关键字**：Lock-Free，原子变量，C++
 
 ## 1 Lock-Free
@@ -172,6 +171,7 @@ bool pop(value_type& val) {
 }
 ```
 
+&emsp;&emsp;下面是不同线程数（1，4，8）下的性能数据，可以看到线程数越多竞争越频繁性能越差。
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/mm_circle_buffer_benchmark.png)
 
 ## 5 参考文献
