@@ -1102,6 +1102,136 @@ private:
 &emsp;&emsp;根据上面的代码可以看出一个```deque```的内存布局。
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/e72dbe9279d856fd2483287453aa5f5c.png)
 
+## 7  forward_list
+&emsp;&emsp;```forward_list```是STL中的单向链表序列容器，可以在任意位置快速插入（前提是直到期望插入的位置），不支持快速的随机访问。需要注意的是因为```forward_list```是单向链表也就意味着```size```相关的函数可能是O(1)的。
+&emsp;&emsp;```forward_list```的定义如下：
+```cpp
+template <class _Tp, class _Alloc /*= allocator<_Tp>*/>
+class _LIBCPP_TEMPLATE_VIS forward_list : private __forward_list_base<_Tp, _Alloc>{
+
+};
+```
+
+### 7.1 ```__forward_list_base```
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/f3f3ebb9ff6e27f5c1a0d986051b693a.png)
+
+
+&emsp;&emsp;```forward_list```是基于```__forward_list_base```实现的，其中只有一个头结点。
+```cpp
+template <class _Tp, class _Alloc>
+class __forward_list_base{
+protected:
+    __compressed_pair<__begin_node, __node_allocator> __before_begin_;
+};
+```
+#### 7.1.1 节点
+&emsp;&emsp;链表中由两种节点，一种是```__begin_node```是链表的头结点，另一种是```__node```是链表内数据成员的节点，其存储链表中保存的数据。
+```cpp
+    typedef __forward_list_node<value_type, void_pointer>            __node;
+    typedef __begin_node_of<value_type, void_pointer>                __begin_node;
+```
+&emsp;&emsp;二者的区别就是将索引和值域区分了开来。从下面的代码可以看出```__begin_node```就是一个指针的```adapter```，而```__forward_list_node```和我们常见的链表节点没什么区别。这样做的好处是在使用迭代器时只需要一个指针的空间就可以表示索引，而不用每个迭代器都携带一个没用的```value```域，浪费空间。
+```cpp
+template <class _NodePtr>
+struct __forward_begin_node{
+    typedef _NodePtr pointer;
+    typedef __rebind_pointer_t<_NodePtr, __forward_begin_node> __begin_node_pointer;
+    pointer __next_;
+    _LIBCPP_INLINE_VISIBILITY __forward_begin_node() : __next_(nullptr) {}
+    __begin_node_pointer __next_as_begin() const {
+        return static_cast<__begin_node_pointer>(__next_);
+    }
+};
+
+template <class _Tp, class _VoidPtr>
+using __begin_node_of = __forward_begin_node<__rebind_pointer_t<_VoidPtr, __forward_list_node<_Tp, _VoidPtr> > >;
+
+template <class _Tp, class _VoidPtr>
+struct _LIBCPP_STANDALONE_DEBUG __forward_list_node : public __begin_node_of<_Tp, _VoidPtr>{
+    typedef _Tp value_type;
+    value_type __value_;
+};
+```
+
+#### 7.1.2 ```__forward_list_base```
+&emsp;&emsp;```__forward_list_base```就是存储了一个节点```__before_begin_```，简单封装了一些拷贝和move的函数，唯一有点儿代码的就是```clear()```，代码也比较简单就是用for-loop析构对象释放节点的内存。
+```cpp
+template <class _Tp, class _Alloc>
+void __forward_list_base<_Tp, _Alloc>::clear() _NOEXCEPT{
+    __node_allocator& __a = __alloc();
+    for (__node_pointer __p = __before_begin()->__next_; __p != nullptr;){
+        __node_pointer __next = __p->__next_;
+        __node_traits::destroy(__a, _VSTD::addressof(__p->__value_));
+        __node_traits::deallocate(__a, __p, 1);
+        __p = __next;
+    }
+    __before_begin()->__next_ = nullptr;
+}
+```
+
+### 7.2 ```forward_list```
+#### 7.2.1 迭代器
+&emsp;&emsp;在了解具体实现前明白迭代器是如何实现的可以帮助我们理解内存布局方式。```forward_list```迭代器的实现比较简单就是一个```__forward_list_node```的指针。
+```cpp
+template <class _NodePtr>
+class _LIBCPP_TEMPLATE_VIS __forward_list_iterator{
+    //__forward_list_node *
+    __iter_node_pointer __ptr_;
+};
+```
+&emsp;&emsp;因为是单项链表因此只支持一种方向的索引，实现也比较简单就是当前节点的```next```指针。
+```cpp
+__forward_list_iterator& operator++(){
+        __ptr_ = __traits::__as_iter_node(__ptr_->__next_);
+        return *this;
+    }
+```
+
+#### 7.2.2 ```forward_list```
+&emsp;&emsp;```forward_list```是继承自```__forward_list_base```
+```cpp
+template <class _Tp, class _Alloc /*= allocator<_Tp>*/>
+class _LIBCPP_TEMPLATE_VIS forward_list : private __forward_list_base<_Tp, _Alloc>{};
+```
+
+&emsp;&emsp;因为是单向链表因此只允许头插，实现也比较简单就是创建节点，然后将对应的指针指向对应的节点。
+```cpp
+template <class _Tp, class _Alloc>
+void forward_list<_Tp, _Alloc>::push_front(value_type&& __v){
+    __node_allocator& __a = base::__alloc();
+    typedef __allocator_destructor<__node_allocator> _Dp;
+    unique_ptr<__node, _Dp> __h(__node_traits::allocate(__a, 1), _Dp(__a, 1));
+    __node_traits::construct(__a, _VSTD::addressof(__h->__value_), _VSTD::move(__v));
+    __h->__next_ = base::__before_begin()->__next_;
+    base::__before_begin()->__next_ = __h.release();
+}
+
+template <class _Tp, class _Alloc>
+void forward_list<_Tp, _Alloc>::pop_front()
+{
+    __node_allocator& __a = base::__alloc();
+    __node_pointer __p = base::__before_begin()->__next_;
+    base::__before_begin()->__next_ = __p->__next_;
+    __node_traits::destroy(__a, _VSTD::addressof(__p->__value_));
+    __node_traits::deallocate(__a, __p, 1);
+}
+
+template <class _Tp, class _Alloc>
+typename forward_list<_Tp, _Alloc>::iterator
+forward_list<_Tp, _Alloc>::insert_after(const_iterator __p, const value_type& __v){
+    __begin_node_pointer const __r = __p.__get_begin();
+    __node_allocator& __a = base::__alloc();
+    typedef __allocator_destructor<__node_allocator> _Dp;
+    unique_ptr<__node, _Dp> __h(__node_traits::allocate(__a, 1), _Dp(__a, 1));
+    __node_traits::construct(__a, _VSTD::addressof(__h->__value_), __v);
+    __h->__next_ = __r->__next_;
+    __r->__next_ = __h.release();
+    return iterator(__r->__next_);
+}
+```
+
+&emsp;&emsp;其他几个函数的实现都是改变节点之类的比较简单就不详细描述了。
+
 # 3 参考文献
 - [iterator_traits](https://zh.cppreference.com/w/cpp/iterator/iterator_traits)
 - [深入理解STL源码(2) 迭代器(Iterators)和Traits](http://ibillxia.github.io/blog/2014/06/21/stl-source-insight-2-iterators-and-traits/)
