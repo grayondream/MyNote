@@ -1240,7 +1240,7 @@ forward_list<_Tp, _Alloc>::insert_after(const_iterator __p, const value_type& __
 &emsp;&emsp;**注意**：参考代码时llvm的实现，与gnu和msvc的实现都有区别。
 
 &emsp;&emsp;```list```是STL提供的双向链表，可以在头和尾部操作元素。
-![在这里插入图片描述](https://i-blog.csdnimg.cn/blog_migrate/0edaefd4bb18dd4838bd2621b8f59253.png)
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/0edaefd4bb18dd4838bd2621b8f59253.png)
 
 ### 8.1 节点
 &emsp;&emsp;和```forward_list```一样，```list```针对索引和节点进行了区分，索引只包含对应访问节点的指针，而节点同时包含链接的指针和数据成员。
