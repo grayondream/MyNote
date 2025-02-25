@@ -1232,6 +1232,146 @@ forward_list<_Tp, _Alloc>::insert_after(const_iterator __p, const value_type& __
 
 &emsp;&emsp;其他几个函数的实现都是改变节点之类的比较简单就不详细描述了。
 
+## 8 list
+&emsp;&emsp;**前言**：之前看过侯老师的《STL源码剖析》但是那已经是多年以前的，现在工作中有时候查问题和崩溃都需要了解实际工作中使用到的STL的实现。因此计划把STL的源码再过一遍。
+&emsp;&emsp;**摘要**：本文描述了llvm中libcxx的```list```的实现。
+&emsp;&emsp;**关键字**：```list```
+&emsp;&emsp;**其他**：参考代码[LLVM-libcxx](https://github.com/llvm/llvm-project/tree/main/libcxx)
+&emsp;&emsp;**注意**：参考代码时llvm的实现，与gnu和msvc的实现都有区别。
+
+&emsp;&emsp;```list```是STL提供的双向链表，可以在头和尾部操作元素。
+![在这里插入图片描述](https://i-blog.csdnimg.cn/blog_migrate/0edaefd4bb18dd4838bd2621b8f59253.png)
+
+### 8.1 节点
+&emsp;&emsp;和```forward_list```一样，```list```针对索引和节点进行了区分，索引只包含对应访问节点的指针，而节点同时包含链接的指针和数据成员。
+```cpp
+template <class _Tp, class _VoidPtr>
+struct __list_node_base{
+    typedef __list_node_pointer_traits<_Tp, _VoidPtr> _NodeTraits;
+    typedef typename _NodeTraits::__link_pointer __link_pointer;
+    __link_pointer __prev_;         //前向指针
+    __link_pointer __next_;         //后向指针
+};
+
+template <class _Tp, class _VoidPtr>
+struct _LIBCPP_STANDALONE_DEBUG __list_node : public __list_node_base<_Tp, _VoidPtr>{
+    _Tp __value_;
+};
+```
+
+### 8.2 迭代器
+&emsp;&emsp;```list```的迭代器就是一个```list_node```的指针，其自增和自减的操作实现也比较简单就是访问node的前向和后向连接的指针。
+```cpp
+template <class _Tp, class _VoidPtr>
+class _LIBCPP_TEMPLATE_VIS __list_iterator{
+    typedef __list_node_pointer_traits<_Tp, _VoidPtr> _NodeTraits;
+    typedef typename _NodeTraits::__link_pointer __link_pointer;
+
+    __link_pointer __ptr_;
+
+    __list_iterator& operator++(){
+        _LIBCPP_DEBUG_ASSERT(__get_const_db()->__dereferenceable(this),
+                             "Attempted to increment a non-incrementable list::iterator");
+        __ptr_ = __ptr_->__next_;
+        return *this;
+    }
+
+    __list_iterator& operator--(){
+        _LIBCPP_DEBUG_ASSERT(__get_const_db()->__decrementable(this),
+                             "Attempted to decrement a non-decrementable list::iterator");
+        __ptr_ = __ptr_->__prev_;
+        return *this;
+    }
+};
+```
+
+### 8.3 ```list```实现
+&emsp;&emsp;```list```的内存布局由```__list_impl```描述，成员```__end_```作为索引节点描述当前链表的头尾。```__end_```的```next```和```prev```两个指针分别指向链表的头和尾节点，```__size_alloc_```则保存了当前链表的长度。
+```cpp
+template <class _Tp, class _Alloc>
+class __list_imp{
+    __node_base __end_;
+    __compressed_pair<size_type, __node_allocator> __size_alloc_;
+
+    iterator begin() _NOEXCEPT{
+        return iterator(__end_.__next_, this);
+    }
+
+    iterator end() _NOEXCEPT{
+        return iterator(__end_as_link(), this);
+    }
+};
+```
+
+&emsp;&emsp;而节点的操作就是比较典型的双链表的操作，没什么好说的。```clear```操作时通过```for-loop```来遍历每个节点并销毁对应的节点对象以及内存来实现的。
+```cpp
+template <class _Tp, class _Alloc>
+void __list_imp<_Tp, _Alloc>::clear() _NOEXCEPT{
+    if (!empty()){
+        __node_allocator& __na = __node_alloc();
+        __link_pointer __f = __end_.__next_;
+        __link_pointer __l = __end_as_link();
+        __unlink_nodes(__f, __l->__prev_);
+        __sz() = 0;
+        while (__f != __l){
+            __node_pointer __np = __f->__as_node();
+            __f = __f->__next_;
+            __node_alloc_traits::destroy(__na, _VSTD::addressof(__np->__value_));
+            __node_alloc_traits::deallocate(__na, __np, 1);
+        }
+        std::__debug_db_invalidate_all(this);
+    }
+}
+```
+
+&emsp;&emsp;```list```就是在```__list_impl```的基础上封装了常见的链表操作。
+```cpp
+template <class _Tp, class _Alloc /*= allocator<_Tp>*/>
+class _LIBCPP_TEMPLATE_VIS list : private __list_imp<_Tp, _Alloc>{};
+```
+&emsp;&emsp;我们就简单看下```push_back```和```pop_back```咋实现的（其实就是简单的链表节点的插入）。
+&emsp;&emsp;```push_back```首先创建内存在对应的内存上构造输入的对象，然后将节点插入到尾部，节点插入也比较简单就是一般的双链表节点操作，不详述。
+```cpp
+template <class _Tp, class _Alloc>
+void list<_Tp, _Alloc>::push_back(const value_type& __x){
+    __node_allocator& __na = base::__node_alloc();
+    __hold_pointer __hold = __allocate_node(__na);
+    __node_alloc_traits::construct(__na, _VSTD::addressof(__hold->__value_), __x);
+    __link_nodes_at_back(__hold.get()->__as_link(), __hold.get()->__as_link());
+    ++base::__sz();
+    __hold.release();
+}
+
+template <class _Tp, class _Alloc>
+inline void list<_Tp, _Alloc>::__link_nodes_at_back(__link_pointer __f, __link_pointer __l){
+    __l->__next_ = base::__end_as_link();
+    __f->__prev_ = base::__end_.__prev_;
+    __f->__prev_->__next_ = __f;
+    base::__end_.__prev_ = __l;
+}
+```
+
+&emsp;&emsp;```pop_front```的实现也比较简单直观，不详细描述。
+```cpp
+template <class _Tp, class _Alloc>
+void list<_Tp, _Alloc>::pop_front(){
+    _LIBCPP_ASSERT(!empty(), "list::pop_front() called with empty list");
+    __node_allocator& __na = base::__node_alloc();
+    __link_pointer __n = base::__end_.__next_;
+    base::__unlink_nodes(__n, __n);
+    --base::__sz();
+    __node_pointer __np = __n->__as_node();
+    __node_alloc_traits::destroy(__na, _VSTD::addressof(__np->__value_));
+    __node_alloc_traits::deallocate(__na, __np, 1);
+}
+
+template <class _Tp, class _Alloc>
+inline void __list_imp<_Tp, _Alloc>::__unlink_nodes(__link_pointer __f, __link_pointer __l)_NOEXCEPT{
+    __f->__prev_->__next_ = __l->__next_;
+    __l->__next_->__prev_ = __f->__prev_;
+}
+```
+
 # 3 参考文献
 - [iterator_traits](https://zh.cppreference.com/w/cpp/iterator/iterator_traits)
 - [深入理解STL源码(2) 迭代器(Iterators)和Traits](http://ibillxia.github.io/blog/2014/06/21/stl-source-insight-2-iterators-and-traits/)
