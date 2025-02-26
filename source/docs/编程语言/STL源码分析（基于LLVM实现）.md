@@ -1372,6 +1372,117 @@ inline void __list_imp<_Tp, _Alloc>::__unlink_nodes(__link_pointer __f, __link_p
 }
 ```
 
+## 9 stack
+&emsp;&emsp;C++中有三种常用的容器，本身并不是一个容器而是适配器，即其实际的利用已有的容器实现的对应容器的功能。
+- ```stack```提供了FILO（先入后出）的能力。
+- ```queue```提供了FIFO的能力。
+- ```priority_queue```优先队列。
+
+### 9.1 ```stack```
+&emsp;&emsp;```stack```在STL中的实现默认是通过```deque```，当然也可以指定容器，但是前提是对应的容器包含某些操作接口。说```stack```是适配器也可以看到，该类里面就是包装了另一个容器，然后利用该容器的接口实现需要的功能。如果期望使用自定义的容器，对应的容器应该支持```pop_back(), push_back(), size(), empty()```等接口。
+```cpp
+template <class _Tp, class _Container /*= deque<_Tp>*/>
+class _LIBCPP_TEMPLATE_VIS stack{
+public:
+    typedef _Container                               container_type;
+    typedef typename container_type::value_type      value_type;
+    typedef typename container_type::reference       reference;
+    typedef typename container_type::const_reference const_reference;
+    typedef typename container_type::size_type       size_type;
+    static_assert((is_same<_Tp, value_type>::value), "" );
+
+protected:
+    container_type c;
+};
+```
+
+&emsp;&emsp;```stack```的实现比较简单，没什么好说的。需要注意的是```top```和```pop```分开实现了而不是直接一个接口实现是为了保证异常安全。如果在同一个接口中实现，当获取元素时正常，pop完数据，返回过程中拷贝数据对象时发生异常数据就会丢失。
+```cpp
+void push(const value_type& __v) {c.push_back(__v);}
+const_reference top() const {return c.back();}
+void pop() {c.pop_back();}
+```
+
+### 9.2 ```queue```
+&emsp;&emsp;```queue```和```stack```定义相同默认都是包装了一个```deque```
+```cpp
+template <class _Tp, class _Container /*= deque<_Tp>*/>
+class _LIBCPP_TEMPLATE_VIS queue{
+public:
+    typedef _Container                               container_type;
+    typedef typename container_type::value_type      value_type;
+    typedef typename container_type::reference       reference;
+    typedef typename container_type::const_reference const_reference;
+    typedef typename container_type::size_type       size_type;
+    static_assert((is_same<_Tp, value_type>::value), "" );
+
+protected:
+    container_type c;
+};
+```
+&emsp;&emsp;```deque```的实现也非常简单，不多描述。
+```cpp
+    bool      empty() const {return c.empty();}
+    _LIBCPP_INLINE_VISIBILITY
+    size_type size() const  {return c.size();}
+
+    _LIBCPP_INLINE_VISIBILITY
+    reference       front()       {return c.front();}
+    _LIBCPP_INLINE_VISIBILITY
+    const_reference front() const {return c.front();}
+    _LIBCPP_INLINE_VISIBILITY
+    reference       back()        {return c.back();}
+    _LIBCPP_INLINE_VISIBILITY
+    const_reference back() const  {return c.back();}
+
+    _LIBCPP_INLINE_VISIBILITY
+    void push(const value_type& __v) {c.push_back(__v);}
+```
+### 9.3 ```priority_queue```
+&emsp;&emsp;优先队列就是一个堆，容器内数据某种程度上是有序的。优先队列的实现和前两者有些差别，默认是```vector```，因为容器内元素是某种程度上有序的，所以需要提供比较函数。
+```cpp
+template <class _Tp, class _Container = vector<_Tp>, class _Compare = less<typename _Container::value_type> >
+class _LIBCPP_TEMPLATE_VIS priority_queue{
+public:
+    typedef _Container                               container_type;
+    typedef _Compare                                 value_compare;
+    typedef typename container_type::value_type      value_type;
+    typedef typename container_type::reference       reference;
+    typedef typename container_type::const_reference const_reference;
+    typedef typename container_type::size_type       size_type;
+    static_assert((is_same<_Tp, value_type>::value), "" );
+
+protected:
+    container_type c;
+    value_compare comp;
+};
+```
+
+&emsp;&emsp;在构造堆时会调用```std::make_heap```在当前容器上创建堆。现在不详细具体的实现，等看算法实现时再详细描述（估计是一般的堆构造算法）。
+```cpp
+template <class _Tp, class _Container, class _Compare>
+inline priority_queue<_Tp, _Container, _Compare>::priority_queue(const value_compare& __comp, container_type&& __c)
+    : c(_VSTD::move(__c)),
+      comp(__comp){
+    _VSTD::make_heap(c.begin(), c.end(), comp);
+}
+```
+
+&emsp;&emsp;插入和弹出元素也都调用的是```std```的算法实现。
+```cpp
+template <class _Tp, class _Container, class _Compare>
+inline void priority_queue<_Tp, _Container, _Compare>::push(value_type&& __v){
+    c.push_back(_VSTD::move(__v));
+    _VSTD::push_heap(c.begin(), c.end(), comp);
+}
+
+template <class _Tp, class _Container, class _Compare>
+inline void priority_queue<_Tp, _Container, _Compare>::pop(){
+    _VSTD::pop_heap(c.begin(), c.end(), comp);
+    c.pop_back();
+}
+```
+
 # 3 参考文献
 - [iterator_traits](https://zh.cppreference.com/w/cpp/iterator/iterator_traits)
 - [深入理解STL源码(2) 迭代器(Iterators)和Traits](http://ibillxia.github.io/blog/2014/06/21/stl-source-insight-2-iterators-and-traits/)
