@@ -1372,7 +1372,7 @@ inline void __list_imp<_Tp, _Alloc>::__unlink_nodes(__link_pointer __f, __link_p
 }
 ```
 
-## 9 stack
+## 9 容器适配器
 &emsp;&emsp;C++中有三种常用的容器，本身并不是一个容器而是适配器，即其实际的利用已有的容器实现的对应容器的功能。
 - ```stack```提供了FILO（先入后出）的能力。
 - ```queue```提供了FIFO的能力。
@@ -1483,6 +1483,7 @@ inline void priority_queue<_Tp, _Container, _Compare>::pop(){
 }
 ```
 
+## 10 
 # 3 参考文献
 - [iterator_traits](https://zh.cppreference.com/w/cpp/iterator/iterator_traits)
 - [深入理解STL源码(2) 迭代器(Iterators)和Traits](http://ibillxia.github.io/blog/2014/06/21/stl-source-insight-2-iterators-and-traits/)
