@@ -1483,7 +1483,358 @@ inline void priority_queue<_Tp, _Container, _Compare>::pop(){
 }
 ```
 
-## 10 
+## 10 map和set
+&emsp;&emsp;```map```是STL中的关联容器，和```vector```等的序列容器不同，其内存结构无论是逻辑还是物理上都不是线性的。```map```通过键值对存储元素，每个key是唯一的。因为```map```是用红黑树实现的，因此```map```的查找效率是很高的，基本可以保证在```O(logn)```的时间复杂度内进行查找、插入，删除等操作。
+
+&emsp;&emsp;```map```的实现是通过红黑树实现的，在STL中就是```__tree```。因此我们理解了```__tree```的实现之后基本上能够明白map细节的90%。
+```cpp
+typedef __tree<__value_type, __vc, __allocator_type>   __base;
+```
+### 10.1 树
+#### 10.1.1 节点
+&emsp;&emsp;和一般的STL对象一样，树节点通过```__tree_node_types```描述对应节点的各种类型，这里不详细描述。
+&emsp;&emsp;树节点就是常规的节点，每个节点包含两个子节点指针，一个父节点指针以及一个表示当前根节点的颜色的标志位。这里将值域和索引的指针进行了区分，而不是存在在同一个类里。另外```__tree_node```节点的析构函数是声明为```delete```的，其析构是通过```__tree_node_destructor```实现的，```__tre_node_destructor```的实现比较简单就是根据当前节点是否构造来选择释放内存还是析构对象。
+```cpp
+template <class _Pointer>
+class __tree_end_node{
+public:
+    typedef _Pointer pointer;
+    pointer __left_;
+};
+
+template <class _VoidPtr>
+class _LIBCPP_STANDALONE_DEBUG __tree_node_base : public __tree_node_base_types<_VoidPtr>::__end_node_type{
+    typedef __tree_node_base_types<_VoidPtr> _NodeBaseTypes;
+    pointer          __right_;
+    __parent_pointer __parent_;
+    bool __is_black_;
+};
+
+template <class _Tp, class _VoidPtr>
+class _LIBCPP_STANDALONE_DEBUG __tree_node : public __tree_node_base<_VoidPtr>{
+public:
+    typedef _Tp __node_value_type;
+
+    __node_value_type __value_;
+
+private:
+  ~__tree_node() = delete;
+  __tree_node(__tree_node const&) = delete;
+  __tree_node& operator=(__tree_node const&) = delete;
+};
+
+//树节点的析构器
+template <class _Allocator>
+class __tree_node_destructor{
+public:
+    bool __value_constructed;
+    __tree_node_destructor(const __tree_node_destructor &) = default;
+    __tree_node_destructor& operator=(const __tree_node_destructor&) = delete;
+    explicit __tree_node_destructor(allocator_type& __na, bool __val = false) _NOEXCEPT : __na_(__na), __value_constructed(__val){}
+
+    void operator()(pointer __p) _NOEXCEPT{
+        if (__value_constructed)
+            __alloc_traits::destroy(__na_, _NodeTypes::__get_ptr(__p->__value_));
+        if (__p)
+            __alloc_traits::deallocate(__na_, __p, 1);
+    }
+};
+```
+
+#### 10.1.2 树迭代器
+&emsp;&emsp;树的迭代器就是一个节点的指针，节点操作的方式就是红黑树的基本操作方式。
+```cpp
+//定义在__tree_node_types中
+typedef __conditional_t< is_pointer<__node_pointer>::value, typename __base::__end_node_pointer, __node_pointer>
+      __iter_pointer;
+
+template <class _Tp, class _NodePtr, class _DiffType>
+class _LIBCPP_TEMPLATE_VIS __tree_iterator{
+    typedef typename _NodeTypes::__iter_pointer             __iter_pointer;
+    __iter_pointer __ptr_;
+}
+```
+
+&emsp;&emsp;这里简单看下```++```的操作，```--```类似。平衡树的下一个节点应该是其中序遍历的下一个节点：
+1. 如果当前节点为父节点的左节点，则下一个节点为父节点；
+2. 如果当前节点为父节点的右节点：
+   1. 且其右子节点不为空，则下一个节点为右子树的最小节点（最左子节点）；
+   2. 若右子节点为空，则向上递归找到祖先节点中是其父节点的右子节点的节点；
+
+```cpp
+template <class _EndNodePtr, class _NodePtr>
+inline _LIBCPP_INLINE_VISIBILITY _EndNodePtr __tree_next_iter(_NodePtr __x) _NOEXCEPT{
+    _LIBCPP_ASSERT(__x != nullptr, "node shouldn't be null");
+    if (__x->__right_ != nullptr)       //情况2
+        return static_cast<_EndNodePtr>(_VSTD::__tree_min(__x->__right_));
+    while (!_VSTD::__tree_is_left_child(__x))//情况2和情况3
+        __x = __x->__parent_unsafe();
+    return static_cast<_EndNodePtr>(__x->__parent_);
+}
+```
+
+#### 10.1.3 树
+
+&emsp;&emsp;STL中树的实现是```__tree```，因为是有序的容器因此用户需要提供一个比较器（默认就是```==```）。```__tree```中有两个节点，开始节点和结束节点，一个分配器，和当前数的节点数以及比较器。树的顺序是按照中序排列的，开始节点即整棵树的最左子节点就是```__begin_node_```，根节点就是```__pair1_.first()->left```，尾结点即最右子节点就是```__pair1_.first()```。
+```cpp
+template <class _Tp, class _Compare, class _Allocator>
+class __tree{
+    __iter_pointer                                     __begin_node_;
+    __compressed_pair<__end_node_t, __node_allocator>  __pair1_;
+    __compressed_pair<size_type, value_compare>        __pair3_;
+};
+```
+&emsp;&emsp;树为空时```__begin_node == __end_node```
+&emsp;&emsp;树中针对重复元素和唯一元素实现了不同的接口，这样是为了同时支持```map```和```multmap```。
+```cpp
+iterator __insert_unique(const_iterator __p, _Vp&& __v) {
+    return __emplace_hint_unique(__p, _VSTD::forward<_Vp>(__v));
+}
+
+iterator __insert_multi(__container_value_type&& __v) {
+    return __emplace_multi(_VSTD::move(__v));
+}
+```
+**__emplace_hint_unique**
+&emsp;&emsp;```__emplace_hint_unique```用于向当前树中插入一个节点，其基本步骤是：
+1. 构造节点；
+2. 在树中查找是否存在相同key的节点；
+3. 将节点插入树中。
+
+```cpp
+template <class _Tp, class _Compare, class _Allocator>
+template <class... _Args>
+typename __tree<_Tp, _Compare, _Allocator>::iterator
+__tree<_Tp, _Compare, _Allocator>::__emplace_hint_unique_impl(const_iterator __p, _Args&&... __args){
+    __node_holder __h = __construct_node(_VSTD::forward<_Args>(__args)...);
+    __parent_pointer __parent;
+    __node_base_pointer __dummy;
+    __node_base_pointer& __child = __find_equal(__p, __parent, __dummy, __h->__value_);
+    __node_pointer __r = static_cast<__node_pointer>(__child);
+    if (__child == nullptr)
+    {
+        __insert_node_at(__parent, __child, static_cast<__node_base_pointer>(__h.get()));
+        __r = __h.release();
+    }
+    return iterator(__r);
+}
+```
+
+&emsp;&emsp;下面我们一步一步看，构造节点就是调用```construct_node```实现的，在树中查找节点是通过```__find_equal```实现的。```__find_equal```的实现比较简单就是通过非递归中序遍历的过程。其中```value_comp```是自定义的比较函数对象，默认是```lesser```。需要注意的是
+```cpp
+template <class _Tp, class _Compare, class _Allocator>
+template <class _Key>
+typename __tree<_Tp, _Compare, _Allocator>::__node_base_pointer& __tree<_Tp, _Compare, _Allocator>::__find_equal(__parent_pointer& __parent, const _Key& __v){
+    __node_pointer __nd = __root();
+    __node_base_pointer* __nd_ptr = __root_ptr();
+    if (__nd != nullptr){
+        while (true){
+            if (value_comp()(__v, __nd->__value_)){
+                if (__nd->__left_ != nullptr) {
+                    __nd_ptr = _VSTD::addressof(__nd->__left_);
+                    __nd = static_cast<__node_pointer>(__nd->__left_);
+                } else {
+                    __parent = static_cast<__parent_pointer>(__nd);
+                    return __parent->__left_;
+                }
+            }
+            else if (value_comp()(__nd->__value_, __v)){
+                if (__nd->__right_ != nullptr) {
+                    __nd_ptr = _VSTD::addressof(__nd->__right_);
+                    __nd = static_cast<__node_pointer>(__nd->__right_);
+                } else {
+                    __parent = static_cast<__parent_pointer>(__nd);
+                    return __nd->__right_;
+                }
+            }
+            else{
+                __parent = static_cast<__parent_pointer>(__nd);
+                return *__nd_ptr;
+            }
+        }
+    }
+    __parent = static_cast<__parent_pointer>(__end_node());
+    return __parent->__left_;
+}
+```
+
+&emsp;&emsp;找到要插入的位置，我们看下是如何插入的。基本过程是先插入节点到预定的位置，然后检查节点与父节点的颜色是否正确，如果不正确就会对树进行调整。插入是通过```__insert_node_at```实现的。
+```cpp
+template <class _Tp, class _Compare, class _Allocator>
+void __tree<_Tp, _Compare, _Allocator>::__insert_node_at( __parent_pointer __parent, __node_base_pointer& __child, __node_base_pointer __new_node) _NOEXCEPT{
+    __new_node->__left_   = nullptr;
+    __new_node->__right_  = nullptr;
+    __new_node->__parent_ = __parent;
+    // __new_node->__is_black_ is initialized in __tree_balance_after_insert
+    __child = __new_node;
+    if (__begin_node()->__left_ != nullptr)
+        __begin_node() = static_cast<__iter_pointer>(__begin_node()->__left_);
+    _VSTD::__tree_balance_after_insert(__end_node()->__left_, __child);
+    ++size();
+}
+```
+
+```cpp
+template <class _NodePtr>
+_LIBCPP_HIDE_FROM_ABI void
+__tree_balance_after_insert(_NodePtr __root, _NodePtr __x) _NOEXCEPT{
+    _LIBCPP_ASSERT(__root != nullptr, "Root of the tree shouldn't be null");
+    _LIBCPP_ASSERT(__x != nullptr, "Can't attach null node to a leaf");
+    __x->__is_black_ = __x == __root;
+    while (__x != __root && !__x->__parent_unsafe()->__is_black_){
+        // __x->__parent_ != __root because __x->__parent_->__is_black == false
+        if (_VSTD::__tree_is_left_child(__x->__parent_unsafe())){
+            _NodePtr __y = __x->__parent_unsafe()->__parent_unsafe()->__right_;
+            if (__y != nullptr && !__y->__is_black_){
+                //新插入的节点改变了整棵树的颜色数量，需要对颜色进行改变
+                __x = __x->__parent_unsafe();
+                __x->__is_black_ = true;
+                __x = __x->__parent_unsafe();
+                __x->__is_black_ = __x == __root;
+                __y->__is_black_ = true;
+            }else{
+                //如果插入的位置是左子节点的右节点需要先左旋转，再右旋转，否则只需要右旋转
+                if (!_VSTD::__tree_is_left_child(__x)){
+                    __x = __x->__parent_unsafe();
+                    _VSTD::__tree_left_rotate(__x);
+                }
+                __x = __x->__parent_unsafe();
+                __x->__is_black_ = true;
+                __x = __x->__parent_unsafe();
+                __x->__is_black_ = false;
+                _VSTD::__tree_right_rotate(__x);
+                break;
+            }
+        }
+        else{
+            _NodePtr __y = __x->__parent_unsafe()->__parent_->__left_;
+            if (__y != nullptr && !__y->__is_black_){
+                //新插入的节点改变了整棵树的颜色数量，需要对颜色进行改变
+                __x = __x->__parent_unsafe();
+                __x->__is_black_ = true;
+                __x = __x->__parent_unsafe();
+                __x->__is_black_ = __x == __root;
+                __y->__is_black_ = true;
+            }else{
+                //如果插入的位置是右子节点的左节点需要先右旋转，再左旋转，否则只需要左旋转
+                if (_VSTD::__tree_is_left_child(__x)){
+                    __x = __x->__parent_unsafe();
+                    _VSTD::__tree_right_rotate(__x);
+                }
+                __x = __x->__parent_unsafe();
+                __x->__is_black_ = true;
+                __x = __x->__parent_unsafe();
+                __x->__is_black_ = false;
+                _VSTD::__tree_left_rotate(__x);
+                break;
+            }
+        }
+    }
+}
+```
+**```__emplace_hint_multi```**
+&emsp;&emsp;```__emplace_hint_multi```和```__emplace_hint_unique```的区别就是搜索插入节点的方式。
+```cpp
+template <class _Tp, class _Compare, class _Allocator>
+template <class... _Args>
+typename __tree<_Tp, _Compare, _Allocator>::iterator __tree<_Tp, _Compare, _Allocator>::__emplace_hint_multi(const_iterator __p, _Args&&... __args){
+    __node_holder __h = __construct_node(_VSTD::forward<_Args>(__args)...);
+    __parent_pointer __parent;
+    __node_base_pointer& __child = __find_leaf(__p, __parent, _NodeTypes::__get_key(__h->__value_));
+    __insert_node_at(__parent, __child, static_cast<__node_base_pointer>(__h.get()));
+    return iterator(static_cast<__node_pointer>(__h.release()));
+}
+```
+
+### 10.2 ```pair```
+&emsp;&emsp;STL中通过```std::pair<key, value>```来表示key——value键值对。实现比较简单，不同于```compressed_pair```。
+```cpp
+template <class _T1, class _T2>
+struct _LIBCPP_TEMPLATE_VIS pair
+#if defined(_LIBCPP_DEPRECATED_ABI_DISABLE_PAIR_TRIVIAL_COPY_CTOR)
+: private __non_trivially_copyable_base<_T1, _T2>
+#endif
+{
+    _T1 first;
+    _T2 second;
+};
+```
+### 10.3 ```map```和```multimap```
+&emsp;&emsp;```map```和```multimap```的实现基本差不多，区别是是否允许重复元素。
+```cpp
+template <class _Key, class _Tp, class _Compare = less<_Key>, class _Allocator = allocator<pair<const _Key, _Tp> > >
+class _LIBCPP_TEMPLATE_VIS map{
+public:
+    typedef _Key                                     key_type;
+    typedef _Tp                                      mapped_type;
+    typedef pair<const key_type, mapped_type>        value_type;
+private:
+    __base __tree_;
+};
+
+template <class _Key, class _Tp, class _Compare, class _Allocator>
+_Tp& map<_Key, _Tp, _Compare, _Allocator>::operator[](const key_type& __k){
+    return __tree_.__emplace_unique_key_args(__k,
+        _VSTD::piecewise_construct,
+        _VSTD::forward_as_tuple(__k),
+        _VSTD::forward_as_tuple()).first->__get_value().second;
+}
+   
+```
+
+```cpp
+template <class _Key, class _Tp, class _Compare = less<_Key>, class _Allocator = allocator<pair<const _Key, _Tp> > >
+class _LIBCPP_TEMPLATE_VIS multimap{
+public:
+    typedef _Key                                     key_type;
+    typedef _Tp                                      mapped_type;
+    typedef pair<const key_type, mapped_type>        value_type;
+private:
+    __base __tree_;
+};
+
+    template <class ..._Args>
+    _LIBCPP_INLINE_VISIBILITY
+    iterator emplace(_Args&& ...__args) {
+        return __tree_.__emplace_multi(_VSTD::forward<_Args>(__args)...);
+    }
+```
+
+### 10.4 ```set```和```multiset```
+&emsp;&emsp;```set```和```map```的区别就是其内部的值不同，```set```仅仅存储key。其实现和```map```相同都是红黑树，只是存储的内容不同。```set```和```multiset```的区别与```map```和```multimap```的区别相同，都是是否允许出现重复key。
+```cpp
+template <class _Key, class _Compare = less<_Key>, class _Allocator = allocator<_Key> >
+class _LIBCPP_TEMPLATE_VIS set{
+public:
+    typedef _Key                                     key_type;
+    typedef key_type                                 value_type;
+    static_assert((is_same<typename allocator_type::value_type, value_type>::value),
+                  "Allocator::value_type must be same type as value_type");
+
+private:
+    typedef __tree<value_type, value_compare, allocator_type> __base;
+    __base __tree_;
+public:
+    iterator insert(const_iterator __p, const value_type& __v)
+        {return __tree_.__insert_unique(__p, __v);}
+}
+```
+
+```cpp
+template <class _Key, class _Compare = less<_Key>,class _Allocator = allocator<_Key> >
+class _LIBCPP_TEMPLATE_VIS multiset{
+public:
+    typedef _Key                                     key_type;
+    typedef key_type                                 value_type;
+private:
+    typedef __tree<value_type, value_compare, allocator_type> __base;
+    __base __tree_;
+public:
+    iterator insert(const value_type& __v)
+        {return __tree_.__insert_multi(__v);}
+};
+```
+
 # 3 参考文献
 - [iterator_traits](https://zh.cppreference.com/w/cpp/iterator/iterator_traits)
 - [深入理解STL源码(2) 迭代器(Iterators)和Traits](http://ibillxia.github.io/blog/2014/06/21/stl-source-insight-2-iterators-and-traits/)
