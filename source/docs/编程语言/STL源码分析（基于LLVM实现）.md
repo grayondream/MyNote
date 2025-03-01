@@ -1835,6 +1835,316 @@ public:
 };
 ```
 
+## 11 unordered_map和unordered_set
+
+&emsp;&emsp;```unordered_map```和```unordered_set```是是STL提供的无序的容器，二者都是通过哈希表实现的。
+### 11.1 哈希表
+#### 11.1.1 ```__hash_table```
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/bcb26b4d48e76baaf30613aba5577c61.png)
+
+&emsp;&emsp;STL中的哈希表实现是通过链式实现的，表中有一个数组，数组的每个成员是一个单链表的节点，一个hash值对应一个链表。
+&emsp;&emsp;```__bucket_list_```就是一个链表数组，数组的成员是```__hash_node_base```的指针。```__p1_```存储第一个元素的指针和分配器（```__p1_```就是一个完整链表的头结点，哈希表可以通过```__p1_```访问到每一个元素），```__p2__```为哈希表中元素的数量和哈希函数，```__p3__```为当前哈希表数据的紧缩程度（默认1.0），插入元素时会根据这个值决定是否需要对当前表记性rehash。
+```cpp
+template <class _Tp, class _Hash, class _Equal, class _Alloc>
+class __hash_table{
+    typedef _Tp    value_type;
+    typedef _Hash  hasher;
+    typedef typename _NodeTypes::__next_pointer      __next_pointer;
+    typedef typename _NodeTypes::__node_base_type    __first_node;
+    typedef unique_ptr<__next_pointer[], __bucket_list_deleter> __bucket_list;
+    // --- Member data begin ---
+    __bucket_list                                         __bucket_list_;
+    __compressed_pair<__first_node, __node_allocator>     __p1_;
+    __compressed_pair<size_type, hasher>                  __p2_;
+    __compressed_pair<float, key_equal>                   __p3_;
+};
+```
+
+**__hash_node_base**
+&emsp;&emsp;和STL中其他节点的实现相同，哈希表的节点的索引和值域被拆分了开来，分别为```__hash_node_base```和```__hash_node```。```__bucket_list_```就是一个```__hash_node_base```的数组。
+
+```cpp
+template <class _NodePtr>
+struct __hash_node_base{
+    typedef __hash_node_base __first_node;
+    typedef __rebind_pointer_t<_NodePtr, __first_node> __node_base_pointer;
+    typedef _NodePtr __node_pointer;
+
+#if defined(_LIBCPP_ABI_FIX_UNORDERED_NODE_POINTER_UB)
+  typedef __node_base_pointer __next_pointer;
+#else
+    typedef __conditional_t<is_pointer<__node_pointer>::value, __node_base_pointer, __node_pointer> __next_pointer;
+#endif
+
+    __next_pointer    __next_;
+};
+
+
+template <class _Tp, class _VoidPtr>
+struct _LIBCPP_STANDALONE_DEBUG __hash_node: public __hash_node_base<__rebind_pointer_t<_VoidPtr, __hash_node<_Tp, _VoidPtr> >>{
+    typedef _Tp __node_value_type;
+    size_t            __hash_;
+    __node_value_type __value_;
+};
+```
+
+**__bucket_list**
+&emsp;&emsp;我们从```__bucket_list```的声明中能够看出其就是一个智能指针，其大小保存在自身的销毁器```__bucket_list_deallocator```中。
+```cpp
+typedef unique_ptr<__next_pointer[], __bucket_list_deleter> __bucket_list;
+
+template <class _Alloc>
+class __bucket_list_deallocator{
+    typedef _Alloc                                          allocator_type;
+    typedef allocator_traits<allocator_type>                __alloc_traits;
+    typedef typename __alloc_traits::size_type              size_type;
+
+    __compressed_pair<size_type, allocator_type> __data_;
+};
+```
+
+#### 11.1.2 插入元素
+**__node_insert_unique**
+&emsp;&emsp;插入节点时先调用哈希函数计算当前节点值的哈希值，然后调用```__node_insert_unique_prepare```在哈希表中查找是否有对应的节点。没有的话再根据hash值插入节点。
+```cpp
+template <class _Tp, class _Hash, class _Equal, class _Alloc>
+pair<typename __hash_table<_Tp, _Hash, _Equal, _Alloc>::iterator, bool>
+__hash_table<_Tp, _Hash, _Equal, _Alloc>::__node_insert_unique(__node_pointer __nd){
+    __nd->__hash_ = hash_function()(__nd->__value_);
+    __next_pointer __existing_node =
+        __node_insert_unique_prepare(__nd->__hash(), __nd->__value_);
+
+    // Insert the node, unless it already exists in the container.
+    bool __inserted = false;
+    if (__existing_node == nullptr)
+    {
+        __node_insert_unique_perform(__nd);
+        __existing_node = __nd->__ptr();
+        __inserted = true;
+    }
+    return pair<iterator, bool>(iterator(__existing_node, this), __inserted);
+}
+```
+**__node_insert_unique_prepare**
+&emsp;&emsp;```__node_insert_unique_prepare```的基本流程是先利用```__constrain_hash```计算对应元素在哈希表中的节点。
+>&emsp;&emsp;```__constrain_hash```计算的方式比较简单就是，如果```__bc```比较大等于```size_t::max```就会按照````__bc```对````__hash```进行截断，否则就是根据二者大小选择是否取余。
+```cpp
+size_t __constrain_hash(size_t __h, size_t __bc){
+    return !(__bc & (__bc - 1)) ? __h & (__bc - 1) :
+        (__h < __bc ? __h : __h % __bc);
+}
+```
+&emsp;&emsp;拿到头结点后就是遍历每个链表寻找是否有对应的元素。最后根据当前哈希表的元素数量和实际大小选择是否进行rehash。如果进行rehash，rehash后的大小是当前bucket大小的2倍和元素数量/factor的最大值。
+```cpp
+template <class _Tp, class _Hash, class _Equal, class _Alloc>
+_LIBCPP_INLINE_VISIBILITY
+typename __hash_table<_Tp, _Hash, _Equal, _Alloc>::__next_pointer
+__hash_table<_Tp, _Hash, _Equal, _Alloc>::__node_insert_unique_prepare(
+    size_t __hash, value_type& __value){
+    size_type __bc = bucket_count();
+    if (__bc != 0){
+        size_t __chash = std::__constrain_hash(__hash, __bc);
+        __next_pointer __ndptr = __bucket_list_[__chash];
+        if (__ndptr != nullptr){
+            for (__ndptr = __ndptr->__next_; __ndptr != nullptr &&
+                                             std::__constrain_hash(__ndptr->__hash(), __bc) == __chash;
+                                                     __ndptr = __ndptr->__next_){
+                if (key_eq()(__ndptr->__upcast()->__value_, __value))
+                    return __ndptr;
+            }
+        }
+    }
+    if (size()+1 > __bc * max_load_factor() || __bc == 0)
+    {
+        __rehash_unique(_VSTD::max<size_type>(2 * __bc + !std::__is_hash_power2(__bc),
+                                     size_type(std::ceil(float(size() + 1) / max_load_factor()))));
+    }
+    return nullptr;
+}
+```
+**__rehash**
+&emsp;&emsp;在进行rehash前还会再次计算实际需要的大小，最后调用```__do_rehash```做实际上的rehash,```__do_rehash```只会重新分配```__bucket_list```然后将之前元素的节点连接到```__buck_list```上。
+```cpp
+template <class _Tp, class _Hash, class _Equal, class _Alloc>
+template <bool _UniqueKeys>
+void
+__hash_table<_Tp, _Hash, _Equal, _Alloc>::__rehash(size_type __n)
+_LIBCPP_DISABLE_UBSAN_UNSIGNED_INTEGER_CHECK{
+    if (__n == 1)
+        __n = 2;
+    else if (__n & (__n - 1))
+        __n = std::__next_prime(__n);
+    size_type __bc = bucket_count();
+    if (__n > __bc)
+        __do_rehash<_UniqueKeys>(__n);
+    else if (__n < __bc){
+        __n = _VSTD::max<size_type>
+              (
+                  __n,
+                  std::__is_hash_power2(__bc) ? std::__next_hash_pow2(size_t(std::ceil(float(size()) / max_load_factor()))) :
+                                           std::__next_prime(size_t(std::ceil(float(size()) / max_load_factor())))
+              );
+        if (__n < __bc)
+            __do_rehash<_UniqueKeys>(__n);
+    }
+}
+```
+&emsp;&emsp;从```__node_insert_unique_perform```的实现中能够看出这里采取的是头插入。
+```cpp
+template <class _Tp, class _Hash, class _Equal, class _Alloc>
+_LIBCPP_INLINE_VISIBILITY
+void __hash_table<_Tp, _Hash, _Equal, _Alloc>::__node_insert_unique_perform(
+    __node_pointer __nd) _NOEXCEPT{
+    size_type __bc = bucket_count();
+    size_t __chash = std::__constrain_hash(__nd->__hash(), __bc);
+    // insert_after __bucket_list_[__chash], or __first_node if bucket is null
+    __next_pointer __pn = __bucket_list_[__chash];
+    if (__pn == nullptr){
+        __pn =__p1_.first().__ptr();
+        __nd->__next_ = __pn->__next_;
+        __pn->__next_ = __nd->__ptr();
+        // fix up __bucket_list_
+        __bucket_list_[__chash] = __pn;
+        if (__nd->__next_ != nullptr)
+            __bucket_list_[std::__constrain_hash(__nd->__next_->__hash(), __bc)] = __nd->__ptr();
+    }else{
+        __nd->__next_ = __pn->__next_;
+        __pn->__next_ = __nd->__ptr();
+    }
+    ++size();
+}
+```
+
+#### 11.1.3 删除元素
+&emsp;&emsp;删除元素比较简单就是改变链表的指向，不会改变哈希表的大体结构。
+```cpp
+template <class _Tp, class _Hash, class _Equal, class _Alloc>
+typename __hash_table<_Tp, _Hash, _Equal, _Alloc>::__node_holder
+__hash_table<_Tp, _Hash, _Equal, _Alloc>::remove(const_iterator __p) _NOEXCEPT{
+    // current node
+    __next_pointer __cn = __p.__node_;
+    size_type __bc = bucket_count();
+    size_t __chash = std::__constrain_hash(__cn->__hash(), __bc);
+    // find previous node
+    __next_pointer __pn = __bucket_list_[__chash];
+    for (; __pn->__next_ != __cn; __pn = __pn->__next_)
+        ;
+    // Fix up __bucket_list_
+        // if __pn is not in same bucket (before begin is not in same bucket) &&
+        //    if __cn->__next_ is not in same bucket (nullptr is not in same bucket)
+    if (__pn == __p1_.first().__ptr()
+            || std::__constrain_hash(__pn->__hash(), __bc) != __chash)
+    {
+        if (__cn->__next_ == nullptr
+            || std::__constrain_hash(__cn->__next_->__hash(), __bc) != __chash)
+            __bucket_list_[__chash] = nullptr;
+    }
+        // if __cn->__next_ is not in same bucket (nullptr is in same bucket)
+    if (__cn->__next_ != nullptr)
+    {
+        size_t __nhash = std::__constrain_hash(__cn->__next_->__hash(), __bc);
+        if (__nhash != __chash)
+            __bucket_list_[__nhash] = __pn;
+    }
+    // remove __cn
+    __pn->__next_ = __cn->__next_;
+    __cn->__next_ = nullptr;
+    --size();
+    return __node_holder(__cn->__upcast(), _Dp(__node_alloc(), true));
+}
+```
+
+**clear**
+
+```cpp
+template <class _Tp, class _Hash, class _Equal, class _Alloc>
+void __hash_table<_Tp, _Hash, _Equal, _Alloc>::clear() _NOEXCEPT{
+    if (size() > 0){
+        __deallocate_node(__p1_.first().__next_);
+        __p1_.first().__next_ = nullptr;
+        size_type __bc = bucket_count();
+        for (size_type __i = 0; __i < __bc; ++__i)
+            __bucket_list_[__i] = nullptr;
+        size() = 0;
+    }
+}
+
+template <class _Tp, class _Hash, class _Equal, class _Alloc>
+void __hash_table<_Tp, _Hash, _Equal, _Alloc>::__deallocate_node(__next_pointer __np) _NOEXCEPT{
+    __node_allocator& __na = __node_alloc();
+    while (__np != nullptr){
+        __next_pointer __next = __np->__next_;
+        __node_pointer __real_np = __np->__upcast();
+        __node_traits::destroy(__na, _NodeTypes::__get_ptr(__real_np->__value_));
+        __node_traits::deallocate(__na, __real_np, 1);
+        __np = __next;
+    }
+}
+```
+
+#### 11.2 ```unordered_map```
+&emsp;&emsp;```unordered_map```中存储的元素是键值对。
+```cpp
+
+template <class _Key, class _Tp, class _Hash = hash<_Key>, class _Pred = equal_to<_Key>,
+          class _Alloc = allocator<pair<const _Key, _Tp> > >
+class _LIBCPP_TEMPLATE_VIS unordered_map
+{
+public:
+    // types
+    typedef _Key                                           key_type;
+    typedef _Tp                                            mapped_type;
+    typedef __type_identity_t<_Hash>                       hasher;
+    typedef __type_identity_t<_Pred>                       key_equal;
+    typedef __type_identity_t<_Alloc>                      allocator_type;
+    typedef pair<const key_type, mapped_type>              value_type;
+    typedef value_type&                                    reference;
+    typedef const value_type&                              const_reference;
+    static_assert((is_same<value_type, typename allocator_type::value_type>::value),
+                  "Allocator::value_type must be same type as value_type");
+
+private:
+    typedef __hash_value_type<key_type, mapped_type>                          __value_type;
+    typedef __unordered_map_hasher<key_type, __value_type, hasher, key_equal> __hasher;
+    typedef __unordered_map_equal<key_type, __value_type, key_equal, hasher>  __key_equal;
+    typedef __rebind_alloc<allocator_traits<allocator_type>, __value_type>    __allocator_type;
+
+    typedef __hash_table<__value_type, __hasher,
+                         __key_equal,  __allocator_type>   __table;
+
+    __table __table_;
+}
+```
+### 11.3 ```unordered_set```
+&emsp;&emsp;```unordered_set```中存储的元素是键值。
+&emsp;&emsp;
+```cpp
+template <class _Value, class _Hash = hash<_Value>, class _Pred = equal_to<_Value>,
+          class _Alloc = allocator<_Value> >
+class _LIBCPP_TEMPLATE_VIS unordered_set
+{
+public:
+    // types
+    typedef _Value                                                     key_type;
+    typedef key_type                                                   value_type;
+    typedef __type_identity_t<_Hash>                                   hasher;
+    typedef __type_identity_t<_Pred>                                   key_equal;
+    typedef __type_identity_t<_Alloc>                                  allocator_type;
+    typedef value_type&                                                reference;
+    typedef const value_type&                                          const_reference;
+    static_assert((is_same<value_type, typename allocator_type::value_type>::value),
+                  "Allocator::value_type must be same type as value_type");
+
+    static_assert(is_same<allocator_type, __rebind_alloc<allocator_traits<allocator_type>, value_type> >::value,
+                  "[allocator.requirements] states that rebinding an allocator to the same type should result in the "
+                  "original allocator");
+
+  private:
+    typedef __hash_table<value_type, hasher, key_equal, allocator_type> __table;
+
+    __table __table_;
+}
+```
 # 3 参考文献
 - [iterator_traits](https://zh.cppreference.com/w/cpp/iterator/iterator_traits)
 - [深入理解STL源码(2) 迭代器(Iterators)和Traits](http://ibillxia.github.io/blog/2014/06/21/stl-source-insight-2-iterators-and-traits/)
