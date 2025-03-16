@@ -1,6 +1,4 @@
-
-
-
+# STL源码分析（基于LLVM实现）
 ## 1 ```allocator```
 ### 1.1 ```allocator```
 #### 1.1.1 简介
@@ -2145,7 +2143,7 @@ public:
     __table __table_;
 }
 ```
-# 3 参考文献
+## 12 参考文献
 - [iterator_traits](https://zh.cppreference.com/w/cpp/iterator/iterator_traits)
 - [深入理解STL源码(2) 迭代器(Iterators)和Traits](http://ibillxia.github.io/blog/2014/06/21/stl-source-insight-2-iterators-and-traits/)
 - [STL迭代器 基础篇](https://zhuanlan.zhihu.com/p/94629092)
