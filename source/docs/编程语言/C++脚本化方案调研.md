@@ -137,13 +137,11 @@ target_compile_definitions(main_app PRIVATE MODULE_DIR="${CMAKE_BINARY_DIR}")
 ```cpp
 // 版本号校验
 void verify_abi_version(const ScriptEngine* engine) {
-  assert(engine->get_abi_version() == 
-         SCRIPT_ABI_VERSION && "ABI不兼容");
+  assert(engine->get_abi_version() == SCRIPT_ABI_VERSION && "ABI不兼容");
 }
 
 // 结构体对齐测试
-static_assert(sizeof(ModuleHeader) == 64,
-  "头结构体大小变化，需重新编译模块");
+static_assert(sizeof(ModuleHeader) == 64, "头结构体大小变化，需重新编译模块");
 ```
 
 **性能提升数据**（模块化前后对比）：
@@ -260,3 +258,8 @@ SSL_write(ssl, data, data_len);
 ```
 
 ## 4 详细示例
+### 4.1 嵌入解释器
+#### 4.1.1 LuaJIT
+&emsp;&emsp;
+
+### 4.2 子程序调用
