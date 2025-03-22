@@ -307,7 +307,7 @@ print(add(1, 2))
 ```
 
 #### 4.1.2 LuaBridge
-&emsp;&emsp;直接使用liblua的api和C++交互比较麻烦，可以使用一些第三方库比如LuaBridge，luabind，Kahlua，Sol2等。LuaBridge 是一个轻量级的 C++ 库，用于将 C++ 类和函数绑定到 Lua，简单易用，支持基本的类型绑定，没有外部依赖，易于集成，支持 C++11 的功能。因此，下面就使用LuaBridge来实现一个简单的例子：
+&emsp;&emsp;直接使用liblua的api和C++交互比特别是自定义数据需要构建userdata比较麻烦，可以使用一些第三方库比如LuaBridge，luabind，Kahlua，Sol2等。LuaBridge 是一个轻量级的 C++ 库，用于将 C++ 类和函数绑定到 Lua，简单易用，支持基本的类型绑定，没有外部依赖，易于集成，支持 C++11 的功能。因此，下面就使用LuaBridge来实现一个简单的例子：
 ```cpp
 #include <iostream>
 #include <lua.hpp>
@@ -360,5 +360,161 @@ print(obj:getName())
 obj:setName("LuaMyClass")
 print(obj:getName())
 ```
+&emsp;&emsp;更详细的例子可以参考[LuaBridge Source Example](https://github.com/vinniefalco/LuaBridge/blob/master/Tests/Source/)。
 
 &emsp;&emsp;需要注意的是，虽然使用了LuaBridge库，但是底层还是使用的liblua的api，因此还是需要在C++中创建lua的虚拟机，通过lua的虚拟机将参数传递给C++函数。另外LuaBridge库的使用比较简单，但是也有一些限制，比如不能使用C++11的特性，LuaBridge 对 C++ 的模板、多态、异常处理、复杂类型、引用和指针、运算符重载、命名空间以及最新 C++ 特性的支持有限。
+
+#### 4.1.3 lua调用动态库
+&emsp;&emsp;lua调用动态库需要使用C的接口，和C++调用动态库的方式类似，需要使用dlopen打开动态库，然后使用dlsym获取函数指针，最后使用函数指针调用函数。下面是一个简单的示例：
+```
+#include <lua.hpp>
+#include <LuaBridge/LuaBridge.h>
+#include <iostream>
+
+#if defined(_WIN32)
+#define SYM_EXPORT __declspec(dllexport)
+#else
+#define SYM_EXPORT
+#endif
+
+class SYM_EXPORT MyClass {
+public:
+    MyClass(const std::string& name) : name(name) {}
+
+    std::string getName() {
+        return name;
+    }
+
+    void setName(const std::string& newName) {
+        name = newName;
+    }
+
+private:
+    std::string name;
+};
+
+// 导出到 Lua 的初始化函数
+extern "C" {
+    extern "C" SYM_EXPORT int luaopen_mylib(lua_State* L) {
+        luabridge::getGlobalNamespace(L)
+            .beginClass<MyClass>("MyClass") // 注册 MyClass
+                .addConstructor<void(*)(const std::string&)>()
+                .addFunction("getName", &MyClass::getName)
+                .addFunction("setName", &MyClass::setName)
+            .endClass();
+
+        return 0;
+    }
+}
+```
+
+&emsp;&emsp;调用动态库的lua脚本如下：
+```cpp
+local mylib, err = package.loadlib("mylib.dll", "luaopen_mylib")
+if not mylib then
+    error("Failed To Load DLL: "..tostring(err))
+end
+mylib()
+local obj = MyClass("World")
+print(obj:getName())
+obj:setName("LuaBridge")
+print(obj:getName())
+```
+### 4.2 Python与C++交互
+&emsp;&emsp;Python本身也支持与C++交互，可以使用Python的C API来调用C++的函数。使用一些额外的库来实现Python与C++的交互，比如pybind11，cffi，swig等更加简单高效。
+- ctypes: 最简单的方式，适合快速集成。
+- Cython: 提供更高的性能和更好的类型安全，适合中小型项目。
+- SWIG: 自动化程度高，适合大型项目。
+- pybind11: 简单易用，适合现代 C++，依赖较少。
+
+&emsp;&emsp;swig是一个跨语言的编译器，它可以将C++代码编译成多种语言的接口，比如Python，Java，C#，Ruby等。swig的使用比较简单，但是也有一些限制。下面是一个简单的示例：
+```cpp
+//add.h
+#pragma once
+int add(const int a, const int b);
+
+//add.c
+#include "add.h"
+
+int add(const int a, const int b) {
+    return a + b;
+}
+```
+
+&emsp;&emsp;除了上面两个文件还需要一个add.i的文件，这个文件是swig的接口文件，里面定义了C++的函数和参数类型。接口文件是告诉 Swig 应该怎样把原生语言（这里指的是 C++），转换为目标语言（这里指的是 Python），如原生语言中一些数据接口与目标语言不一样的地方。那 C++ 来说，C++ 中会用到指针，vector, string, map, pair 等部分，那么这部分就需要明确的告诉 Swig 应该怎样处理。Swig 有一些标准库的接口文件，已经对这个做了很好的处理，我们只需要在接口文件中对此做个简单的描述即可。
+
+```cpp
+%module add
+
+%{
+#define SWIG_FILE_WITH_INIT
+#include "add.h"
+%}
+
+int add(const int a, const int b);
+```
+
+&emsp;&emsp;然后使用swig命令生成对应的python文件：
+```bash
+swig -c++ -python add.i
+```
+
+&emsp;&emsp;最后编写自动编译的脚本：
+```python
+from distutils.core import setup, Extension
+
+add_module = Extension('_add',
+                           sources=['add_wrap.c', 'add.c'],
+                           )
+
+setup(name='add',
+      version='0.1',
+      author="gg",
+      description="""Simple swig example from docs""",
+      ext_modules=[add_module],
+      py_modules=["add"],
+      )
+```
+
+&emsp;&emsp;最后执行下面的脚本编译可得到python的模块文件，随后在python中导入使用即可。
+```bash
+python setup.py build_ext --inplace
+```
+
+### 4.3 JS与C++交互
+&emsp;&emsp;一些流行的 JavaScript 调用 C++ 的框架和工具，适合不同场景。Node.js 原生模块允许通过 C++ 扩展与 JavaScript 直接交互，适合服务器端高性能需求。Emscripten将 C/C++ 代码编译为 WebAssembly，可在浏览器中直接调用，适合游戏和图形处理。SWIG自动生成 C/C++ 与多种语言的接口，适合需要快速多语言绑定的项目。N-API为 Node.js 提供稳定的 API，适合长期维护的扩展。WebAssembly是一种现代二进制格式，能在浏览器中高效运行，适合高性能客户端应用。Qt for WebAssembly支持将 Qt 应用程序编译为 WebAssembly，适合图形用户界面开发。最后，nan简化了在 Node.js 中编写 C++ 扩展的过程，尤其是处理 V8 API 的复杂性。这些工具和框架为开发者在 JavaScript 环境中高效调用 C++ 提供了多种选择。
+
+&emsp;&emsp;JS和C++交互和Python都可以使用SWIG来进行，实现比较简单。代码文件和Python类似也需要```.i```文件。需要额外准备编译的gyp文件，下面文件中的```example_wrap.cxx```是通过swig命令```swig.exe -c++ -javascript -node .\example.i```生成的。
+```cpp
+{
+  "targets": [
+    {
+      "target_name": "example",
+      "sources": [ "example.cxx", "example_wrap.cxx" ]
+    }
+  ]
+}
+```
+
+&emsp;&emsp;生成之后再调用```node-gyp configure build```编译即可得到node模块，随即可以在js中直接调用。
+
+### 4.4 其他
+&emsp;&emsp;其他语言也都提供了和C/C++交互的方式或者库，rbo语言，比如Rust，Go，Dart等。这里就不再赘述。除了语言提供的一些native能力外，还可以通过其他通信方式来实现，比如消息队列，RPC等。这些属于其他的话题了，这里不详细展开。
+
+&emsp;&emsp;另外还有一些专门为C++脚本化开发的库或者第三方工具，比如：
+
+- ChaiScript: 一种基于Lua的脚本语言，支持C++的绑定，支持动态类型和自动类型转换，轻量级脚本语言，专门为 C++ 设计，易于嵌入和使用。
+- AngelScript：一种基于C++的脚本语言，支持C++的绑定，支持静态类型和类型安全，强类型的嵌入式脚本语言，适合游戏开发和其他 C++ 项目。
+- Squirrel：一种基于C++的脚本语言，支持C++的绑定，支持静态类型和类型安全，高性能的嵌入式脚本语言，适合游戏和应用程序的扩展。
+
+
+## 5 总结
+&emsp;&emsp;能够看到不同语言的脚本化方案都有自己的优缺点，需要根据具体的场景来选择合适的方案。总的来说，脚本化方案可以提高开发效率，减少开发成本，提高代码的可维护性和可扩展性。但是，脚本化方案也存在一些问题，比如性能损失，安全风险，开发难度等。因此，在选择脚本化方案时，需要综合考虑这些问题，选择合适的方案。
+
+## 6 参考文献
+- [C++/Lua交互指南](https://zhuanlan.zhihu.com/p/40406096)
+- [Lua - Lua 与 C/C++ 交互](https://github.com/andycai/luaprimer/blob/master/08.md)
+- [Chapter 26. Calling C from Lua](https://www.lua.org/pil/26.1.html)
+- [Swig Wrap C++ for Python](https://github.com/amaork/notes/blob/master/python/Swig%20Wrap%20C%2B%2B%20for%20Python.md)
+- [SWIG JS](https://www.swig.org/Doc3.0/Javascript.html#Javascript_simple_example)
+- [C/C++脚本化: 探索篇](https://www.7-0.cc/cpp_scripting_exploration_1/)
