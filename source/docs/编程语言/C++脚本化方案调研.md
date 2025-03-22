@@ -258,8 +258,107 @@ SSL_write(ssl, data, data_len);
 ```
 
 ## 4 详细示例
-### 4.1 嵌入解释器
-#### 4.1.1 LuaJIT
-&emsp;&emsp;
+### 4.1 Lua与C++交互
+#### 4.1.1 C++调用Lua函数
+&emsp;&emsp;lua与C++交互需要在C++创建lua的虚拟机，通过lua的虚拟机将参数传递给C++函数。调用C++函数时需要提前注册调用的函数，随后通过Lua虚拟机将参数传递给C++函数。Lua 是一种基于栈的虚拟机，使用一个单一的栈来存储所有变量和函数参数，对应C++的函数就是：
+- 压栈: 使用 ```lua_pushinteger```、```lua_pushstring``` 等函数将数据压入栈中。
+- 弹栈: 使用 ```lua_pop``` 函数从栈中移除数据。
+- 访问栈: 使用 ```lua_tointeger```、```lua_tostring``` 等函数从栈中读取数据（需要注意的是lua虚拟机的栈从1开始计数而不是0）。
 
-### 4.2 子程序调用
+&emsp;&emsp;下面是一个简单的示例，演示了如何在C++中调用Lua函数并传递参数：
+```cpp
+#include <iostream>
+#include <lua.hpp>
+#include <format>
+
+static int add(lua_State* lua) {
+    if (lua_gettop(lua) < 2) {
+        lua_pushstring(lua, "Add need two parameters");
+        lua_error(lua);
+    }
+    const auto a = luaL_checkinteger(lua, 1);
+    const auto b = luaL_checkinteger(lua, 2);
+    const auto sum = a + b;
+    lua_pushnumber(lua, sum);
+    return 1;
+}
+
+int main(int argc, char **argv){
+    std::cout<<"hello world\n";
+    auto lua = luaL_newstate();
+    luaL_openlibs(lua);
+    lua_register(lua, "add", add);
+    const std::string script = "main.lua";
+    if (luaL_dofile(lua, script.c_str()) != LUA_OK) {
+        auto error = lua_tostring(lua, -1);
+        std::cerr << "Error Msg: " << error <<std::endl;
+        lua_settop(lua, 0); // 清空栈保证状态
+    }
+
+    lua_close(lua);
+    return 0;
+}
+```
+
+&emsp;&emsp;对应的lua脚本比较简单：
+```cpp
+print("Hello Lua")
+print(add(1, 2))
+```
+
+#### 4.1.2 LuaBridge
+&emsp;&emsp;直接使用liblua的api和C++交互比较麻烦，可以使用一些第三方库比如LuaBridge，luabind，Kahlua，Sol2等。LuaBridge 是一个轻量级的 C++ 库，用于将 C++ 类和函数绑定到 Lua，简单易用，支持基本的类型绑定，没有外部依赖，易于集成，支持 C++11 的功能。因此，下面就使用LuaBridge来实现一个简单的例子：
+```cpp
+#include <iostream>
+#include <lua.hpp>
+#include <LuaBridge/LuaBridge.h>
+class MyClass {
+public:
+    MyClass(const std::string& name) : name(name) {}
+
+    std::string getName() {
+        return name;
+    }
+
+    void setName(const std::string& newName) {
+        name = newName;
+    }
+
+    static void bind(lua_State* L) {
+        luabridge::getGlobalNamespace(L)
+            .beginClass<MyClass>("MyClass")
+            .addConstructor<void(*)(const std::string&)>()
+            .addFunction("getName", &MyClass::getName)
+            .addFunction("setName", &MyClass::setName)
+            .endClass();
+    }
+private:
+    std::string name;
+};
+
+int main() {
+    lua_State* L = luaL_newstate();
+    luaL_openlibs(L);
+
+    MyClass::bind(L);
+
+    // 执行 Lua 脚本
+    if (luaL_dofile(L, "main.lua") != LUA_OK) {
+        std::cerr << "Error: " << lua_tostring(L, -1) << std::endl;
+        lua_pop(L, 1);
+    }
+
+    lua_close(L);
+    return 0;
+}
+```
+
+&emsp;&emsp;Lua的脚本内容如下：
+```cpp
+local obj = MyClass("MyClass")
+print(obj:getName())
+obj:setName("LuaMyClass")
+print(obj:getName())
+```
+
+&emsp;&emsp;需要注意的是，虽然使用了LuaBridge库，但是底层还是使用的liblua的api，因此还是需要在C++中创建lua的虚拟机，通过lua的虚拟机将参数传递给C++函数。另外LuaBridge库的使用比较简单，但是也有一些限制，比如不能使用C++11的特性，LuaBridge 对 C++ 的模板、多态、异常处理、复杂类型、引用和指针、运算符重载、命名空间以及最新 C++ 特性的支持有限。
