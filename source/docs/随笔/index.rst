@@ -2,7 +2,7 @@
 ======================
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1
    :caption: 随笔
 
    关于写博客
