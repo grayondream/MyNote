@@ -101,3 +101,25 @@ dynamic_type->search_above_dst(&info, dynamic_ptr, dynamic_ptr, public_path, fal
 
 **搜索策略**
 &emsp;&emsp;对于不同继承类型的类的 type info 有不同的搜索策略。例如对于有虚多继承的类的 type info（__vmi_class_type_info）、单继承的类的 type info（__si_class_info）等。搜索的方式看起来就是广度优先搜索再加上一些剪枝的优化。
+
+## 3 ```dynamic_cast```失败
+&emsp;&emsp;C++中，我们经常会使用```dynamic_cast```将基础类型转换为派生类型。当```dynamic_cast```失败时，会返回```nullptr```。一般情况下只要我们使用的指针的类型和目标转换类型一致，那么```dynamic_cast```就不会失败。为了理解```dynamic_cast```失败的原因，我们需要理解```dynamic_cast```的实现原理。```dynamic_cast```的实现原理之前的文章详细探究过，这里不再详细描述，只需要知道```dynamic_cast```的实现原理是基于```RTTI```的。其基本步骤为：
+1. 检查```RTTI```信息，确保类型信息是可转换的，如果不可转换，则返回```nullptr```。
+2. 搜索继承树，直到找到和目标```typeinfo```相同的类型。
+3. 然后根据找到的```typeinfo```进行指针偏移并执行```static_cast```。
+
+&emsp;&emsp;根据上面的实现原理，我们可以知道```dynamic_cast```失败的原因是：
+1. 类型信息不可转换；
+2. 继承树中没有找到和目标```typeinfo```相同的类型。
+
+&emsp;&emsp;第一种情况纯粹是代码写错了，而第二种情况一般比较容易出现在跨模块使用相同类型的场景中。
+1. 两个模块的编译器版本不一致导致ABI不一致；
+2. 两个模块采用了不同的编译选项，特别是其中有一个模块禁用了RTTI即```-fno-rtti```。
+3. 两个模块的代码不一致导致ABI不一致从而导致```typeinfo```不一致。
+4. 符号导出不一致导致```typeinfo```不一致，这个是LLVM特有的问题参考[Failed to dynamic_cast when compile with -fvisibility=hidden -stdlib=libc++](https://github.com/llvm/llvm-project/issues/72464)
+
+&emsp;&emsp;一般情况出现类似的问题都比较好排查，按照上面的思路排查即可。
+
+## 4 参考文献
+- [Failed to dynamic_cast when compile with -fvisibility=hidden -stdlib=libc++](https://github.com/llvm/llvm-project/issues/72464)
+- [libcxxabi 中的 __dynamic_cast 函数是如何工作的？](https://www.zhihu.com/question/61101212)
