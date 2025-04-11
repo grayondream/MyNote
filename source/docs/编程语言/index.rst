@@ -18,3 +18,4 @@
    MagicEnum实现原理
    C++脚本化方案调研
    Volatile的含义
+   DoNotOptimize
