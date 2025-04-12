@@ -1,7 +1,7 @@
 # Volatile的含义
+## 1 volatile
 &emsp;&emsp;似乎很多人不理解voliate和atomic啥区别，本文主要主要描述volatile的作用和使用场景。对比了atomic和volatile的区别，以及性能差异。最后补充了几条可能导致C++代码测试volatile导致正确结果错误结论的依据。
 
-## 1 volatile
 ### 1.1 c++标准中对于volatile的定义
 >&emsp;&emsp;Every access (read or write operation, member function call, etc.) made through a glvalue expression of volatile-qualified type is treated as a visible side-effect for the purposes of optimization (that is, within a single thread of execution, volatile accesses cannot be optimized out or reordered with another visible side effect that is sequenced-before or sequenced-after the volatile access. This makes volatile objects suitable for communication with a signal handler, but not with another thread of execution, see std::memory_order). Any attempt to access a volatile object through a glvalue of non-volatile type (e.g. through a reference or pointer to non-volatile type) results in undefined behavior.
 

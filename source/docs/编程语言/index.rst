@@ -19,3 +19,4 @@
    C++脚本化方案调研
    Volatile的含义
    DoNotOptimize
+   动态注入
