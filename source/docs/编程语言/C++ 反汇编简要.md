@@ -1,5 +1,4 @@
 # C++ 反汇编简要
-
 &emsp;&emsp;**摘要**：本文主要描述x86_64机器中C++代码在汇编中的具体代码。
 &emsp;&emsp;**关键字**：cpp,IA32,asm
 &emsp;&emsp;**注意**：本书假定你拥有基本的C++软件开发能力，能够理解基本的C++代码。并且熟悉汇编代码，了解基本的取址模式并且熟悉IA32指令集（文中会对IA32的部分指令集进行描述，但是不会过于详细的深入）。
@@ -26,8 +25,7 @@
 **单精度浮点类型和双精度浮点类型**
 &emsp;&emsp;浮点类型在内存中表示是按照[IEEE 754](https://en.wikipedia.org/wiki/IEEE_754)标准存储的，```float```和```double```而这表示方式差不多，只是表示的范围有差异。因为按照IEEE 754存储浮点是由精度误差的，因此在比较浮点类型的大小是不能用```==```，而是```val - val2 < elps```。
 
-![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/be21f310dc8cb88d6b48734471e394b6.png)
-
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/Float_example.svg.png)
 
 **布尔类型**
 &emsp;&emsp;在内存中就是0或者1。
@@ -143,7 +141,7 @@ int main(){
 
 ### 2.3 地址，指针，引用和常量
 **指针**
-&emsp;&emsp;地址就是进程地址空间中的一个索引，而指针变量，就是存储一块地址内容的变量。所以其重点是其本身是一个变量，只不过存储的内容是一个地址索引而已。一个指针的大小根据系统位数不同而不同，32bit机器指针大小为4字节，64bit机器指针大小为8字节。而解释这块地址的内容的方式是根据其类型而来的，因此在对指针变量进行```++```等操作时，其结果是根据具体的类型而来的：
+&emsp;&emsp;地址就是进程地址空间中的一个索引，而指针变量，就是存储一块地址内容的变量。所以其重点是其本身是一个变量，只不过存储的内容是一个地址索引而已。一个指针的大小根据系统位数不同而不同，32bit机器指针大小为4字节，64bit机器指针大小为8字节。而解释这块地址的内容的方式是根据其类型而来的，因此在对指针变量进行```++``` 等操作时，其结果是根据具体的类型而来的：
 ```cpp
 ptr + n = 当前ptr地址+sizeof(Type) * n
 ```
@@ -609,7 +607,7 @@ Disassembly of section .comment:
 #### 4.3.2 流水线优化
 &emsp;&emsp;一条指令被CPU执行会经历：取指、译码、访存（访存分为读地址和取值两部分）、执行、写回（将计算的结果写回到对应地址或者寄存器）。其中取指、译码、执行是每个指令都需要的，比如nop指令。流水线就是将上述的多个步骤错开执行提升CPU的指令运行吞吐率。比如在执行第一条的译码工作时就可以尝试读取下一条指令准备译码。
 
-![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/41cbfd18bf778be84444e5e3db2799b8.png)
+![](https://upload.wikimedia.org/wikipedia/commons/thumb/6/67/5_Stage_Pipeline.svg/400px-5_Stage_Pipeline.svg.png)
 
 &emsp;&emsp;指令流水线的实现有两种方式：
 1. 长指令：比如Intel的CSIC架构，每个指令划分更多的阶段单个指令更长，每个步骤的工作简单更容易设计，但是在出现跳转指令且分支预测失败是失败的成本也高；
@@ -1041,8 +1039,7 @@ int switch3(int type, int a) {
 }
 ```
 &emsp;&emsp;如下面的反汇编所示，编译器会根据当前已经有的值生成判定树，不断判断跳转，直至跳转到对应的代码块。下面是对应代码判定树的结构：
-
-![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/465578f0c3b72aef0d7c41f8333a1471.png)
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/iftree.svg)
 
 ```
 int main(int argc, char **argv) {
@@ -1270,8 +1267,7 @@ int main(int argc, char **argv) {
 6. 栈平衡
 
 >&emsp;&emsp;cdcel复写传播优化，当调用多个相同函数时并不会每次都在函数结尾平衡栈，而是统一平衡栈。
-![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/917e770a6ff1df4cd58e339ad8645df8.png)
-
+![](imgs/fun.svg)
 
 ```
 void _stdcall stdcall(int v) {
