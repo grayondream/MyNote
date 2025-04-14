@@ -11,4 +11,5 @@
    理解PLT表和GOT表
    《Performance Analysisi and Tuning on Modern CPU》阅读笔记
    自旋锁
+   ELF文件格式
 
