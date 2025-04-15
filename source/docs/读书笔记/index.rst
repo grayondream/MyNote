@@ -5,6 +5,7 @@
    :maxdepth: 1
    :caption: 读书笔记
 
+   程序员的自我修养/index
    《Effect C++》阅读笔记
    《Effect STL》阅读笔记
    《More Effective C++》阅读笔记
