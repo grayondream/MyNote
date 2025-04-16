@@ -1267,7 +1267,8 @@ int main(int argc, char **argv) {
 6. 栈平衡
 
 >&emsp;&emsp;cdcel复写传播优化，当调用多个相同函数时并不会每次都在函数结尾平衡栈，而是统一平衡栈。
-![](imgs/fun.svg)
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/fun.svg)
 
 ```
 void _stdcall stdcall(int v) {

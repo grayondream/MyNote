@@ -99,7 +99,7 @@ Program Headers:
 ```
 &emsp;&emsp;从上面的结果能够看出32个Section被映射成了5个Segment，而我们只关心其中涉及LOAD的Segment，可以看到分别被合并为00和01两个Segment。
 
-![](img/image.drawio.svg)
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/image.drawio.svg)
 
 &emsp;&emsp;对应到ELF文件中（ELF文件和动态库文件，目标文件不涉及转载不存在）都有一个程序表头来表示Segment的信息，其基本结构如下：
 ```cpp
@@ -118,7 +118,7 @@ typedef struct elf32_phdr{
 #### 1.4.2 堆和栈
 &emsp;&emsp;在操作系统里面，VMA(虚拟内存区域)除了被用来映射可执行文件中的各个Segment以外，它还可以有其他的作用，操作系统通过使用VMA来对进程的地址空间进行管理。我们知道进程在执行的时候它还需要用到堆和栈等空间，事实上它们在进程的虚拟空间中的表现也是以VMA的形式存在的，很多情况下，一个进程中的堆和栈分别都有一个对应的VMA。
 &emsp;&emsp;执行刚才编译的可执行文件，查看linux系统中的proc目录下的maps就能看到VMA的映射情况。
-```cpp
+```
 ➜  Desktop ./main.elf &
 [1] 265
 ➜  Desktop cat /proc/265/maps
@@ -140,7 +140,7 @@ typedef struct elf32_phdr{
 - 堆VMA：可读可写；
 - 栈VMA：可读可写。
 
-![](img/vma.svg)
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/vma.svg)
 
 ## 2 Linux内核装载ELF文件过程
 &emsp;&emsp;Linux通过bash创建进程的方式：
