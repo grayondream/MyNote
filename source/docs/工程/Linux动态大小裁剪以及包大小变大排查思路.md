@@ -191,16 +191,46 @@ int processData(const std::vector<int>& data) {
 
 ### 2.1.2 不同操作对二进制大小的影响
 
-|默认| -O1 | -O2| -O3| -Os|-Os| 包大小（Byte）| 
-| --- | --- | --- | ---|--- | --- |---|
-|   √  |     |     ||||57400|
-|   √  |  √   |     ||||53752|
-|   √  |     |  √   ||||53560|
-|   √  |     |     |√|||54784|
-|   √  |     |     ||√||53464|
+|默认| -O1 | -O2| -O3| -Os|符号|section|lto|whole|rtti|异常|debug|strip| 包大小（Byte）| 
+| --- | --- | --- | ---|--- | --- |---|---|---|---|---|---|---|---|
+|   √  |     |     |||||||||||57400|
+|   √  |  √   |     |||||||||||53752|
+|   √  |     |  √   |||||||||||53560|
+|   √  |     |     |√||||||||||54784|
+|   √  |     |     ||√|||||||||53464|
+|   √  |     |     ||√|√||||||||53480|
+|   √  |     |     ||√|√|√|||||||53936|
+|   √  |     |     ||√|√|√|√||||||23120|
+|   √  |     |     ||√|√|√|√|√|||||10408|
+|   √  |     |     ||√|√|√|√|√|√||||10016|
+|   √  |     |     ||√|√|√|√|√|√|√|||10016|
+|   √  |     |     ||√|√|√|√|√|√|√|√||9640|
+|   √  |     |     ||√|√|√|√|√|√|√|√|√|6008|
+
 
 &emsp;&emsp;下面是不同配置的详细说明：
 - 默认配置：使用默认的编译选项和编译方式，不进行任何裁剪和优化。
   - ```g++ -fPIC -shared Mylib.cpp -g -DMY_LARGE_LIBRARY_BUILD -o mylib.so```
 - 使用不同优化选项对比，具体```-O0```、```-O1```、```-O2```、```-O3```。
+- 隐藏符号：使用```-fvisibility=hidden```选项隐藏所有符号。
+  - ```g++ -fPIC -shared Mylib.cpp -g -DMY_LARGE_LIBRARY_BUILD -o mylibos_hidden.so -fvisibility=hidden -Os```
+- 独立section裁剪：使用```-ffunction-sections```和```-fdata-sections```选项将每个函数和数据放入单独的代码段和数据段。
+  - ```g++ -fPIC -shared Mylib.cpp -g -DMY_LARGE_LIBRARY_BUILD -o mylibos_sections.so -ffunction-sections -fdata-sections -Os```
+- ```lto```
+  - ```g++ -fPIC -shared Mylib.cpp -g -DMY_LARGE_LIBRARY_BUILD -o mylibos_sections_lto.so -ffunction-sections -fdata-sections -Os -Wl,--gc-sections -flto```
+- 更激进的优化：```-fwhole-program```
+  - ```g++ -fPIC -shared Mylib.cpp -g -DMY_LARGE_LIBRARY_BUILD -o mylibos_sections_lto_whole.so -ffunction-sections -fdata-sections -Os -Wl,--gc-sections -flto -fwhole-program```
+- 禁用RTTI:```-fno-rtti```
+  - ```g++ -fPIC -shared Mylib.cpp -g -DMY_LARGE_LIBRARY_BUILD -o mylibos_sections_lto_whole_nortti.so -ffunction-sections -fdata-sections -Os -Wl,--gc-sections -flto -fwhole-program -fno-rtti```
+- 禁用异常```-fno-exceptions```
+  - ```g++ -fPIC -shared Mylib.cpp -g -DMY_LARGE_LIBRARY_BUILD -o mylibos_sections_lto_whole_nortti_noex.so -ffunction-sections -fdata-sections -Os -Wl,--gc-sections -flto -fwhole-program -fno-rtti -fno-exceptions```
+- 分离调试信息:```-gsplit-dwarf```
+  - ```g++ -fPIC -shared Mylib.cpp -g -DMY_LARGE_LIBRARY_BUILD -o mylibos_sections_lto_whole_nortti_noex_debuginfo.so -ffunction-sections -fdata-sections -Os -Wl,--gc-sections -flto -fwhole-program -fno-rtti -fno-exceptions -gsplit-dwarf```
+- 删除无用的信息:```strip```
+  - ```strip -g -x -s mylib.so```
+
+&emsp;&emsp;从上面的结果来看我们上面大部分操作都可以减少二进制，而且效果明显，我们的库从最开始的57400Byte减少到了6008Byte。能够看到成效是非常明显的。但是本来预期能够降低包大小的操作没有降低包大小的同时，反而增加了包大小这是为什么。
+
+&emsp;&emsp;下面我们就简单排查下。
+
 ## 2.1 包大小排查思路
