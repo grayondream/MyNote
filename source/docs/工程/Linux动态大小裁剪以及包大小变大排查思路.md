@@ -65,3 +65,142 @@
 - 调试信息分离： 可以使用 ```--only-keep-debug``` 和 ```--add-gnu-debuglink``` 选项将调试信息分离到单独的文件中。 这样可以在不影响程序运行的情况下进行调试。
 
 ## 2 实验
+### 2.1 测试代码和环境
+&emsp;&emsp;我们的测试环境是：
+```
+Linux DESKTOP-JLHBOB4 4.4.0-19041-Microsoft #4355-Microsoft Thu Apr 12 17:37:00 PST 2024 x86_64 x86_64 x86_64 GNU/Linux
+g++ (Ubuntu 7.5.0-3ubuntu1~18.04) 7.5.0
+```
+
+&emsp;&emsp;测试代码如下，分别是一个头文件和一个源文件编译成so库：
+```cpp
+// my_lib.h
+#ifndef MY_LARGE_LIBRARY_H
+#define MY_LARGE_LIBRARY_H
+
+#include <iostream>
+#include <vector>
+
+// 用于控制导出符号，可以参考之前的通用 EXPORT 宏
+#ifdef _WIN32
+  #ifdef MY_LARGE_LIBRARY_BUILD
+    #define MY_LARGE_LIBRARY_API __declspec(dllexport)
+  #else
+    #define MY_LARGE_LIBRARY_API __declspec(dllimport)
+  #endif
+#elif defined(__GNUC__)
+  #define MY_LARGE_LIBRARY_API __attribute__((visibility("default")))
+#else
+  #define MY_LARGE_LIBRARY_API
+#endif
+
+
+// 模板类
+template <typename T>
+class MY_LARGE_LIBRARY_API MyTemplateClass {
+public:
+    MyTemplateClass(T value);
+    T getValue() const;
+private:
+    T m_value;
+};
+
+// 内联函数
+inline int MY_LARGE_LIBRARY_API inlineFunction(int x) {
+    return x * x * x; // 复杂的计算，增加内联的代价
+}
+
+// 虚基类
+class MY_LARGE_LIBRARY_API BaseClass {
+public:
+    BaseClass(int id);
+    virtual ~BaseClass();
+    virtual int calculate() const;
+    int getId() const;
+protected:
+    int m_id;
+};
+
+// 派生类
+class MY_LARGE_LIBRARY_API DerivedClass : public BaseClass {
+public:
+    DerivedClass(int id, double factor);
+    ~DerivedClass() override;
+    int calculate() const override;
+private:
+    double m_factor;
+};
+
+// 一个导出函数，使用了上述的类和函数
+MY_LARGE_LIBRARY_API int processData(const std::vector<int>& data);
+
+#endif // MY_LARGE_LIBRARY_H
+```
+
+```cpp
+// my_lib.cpp
+#include "Mylib.hpp"
+#include <numeric> // std::accumulate
+
+// 模板类的实现
+template <typename T>
+MyTemplateClass<T>::MyTemplateClass(T value) : m_value(value) {}
+
+template <typename T>
+T MyTemplateClass<T>::getValue() const {
+    return m_value;
+}
+
+// 显式实例化一些常用的模板类型，减少编译单元间的重复实例化
+template class MY_LARGE_LIBRARY_API MyTemplateClass<int>;
+template class MY_LARGE_LIBRARY_API MyTemplateClass<double>;
+
+// 基类的实现
+BaseClass::BaseClass(int id) : m_id(id) {}
+
+BaseClass::~BaseClass() {}
+
+int BaseClass::calculate() const {
+    return m_id * 2;
+}
+
+int BaseClass::getId() const {
+    return m_id;
+}
+
+// 派生类的实现
+DerivedClass::DerivedClass(int id, double factor) : BaseClass(id), m_factor(factor) {}
+
+DerivedClass::~DerivedClass() {}
+
+int DerivedClass::calculate() const {
+    return static_cast<int>(m_id * m_factor * 3);
+}
+
+// processData 函数的实现
+int processData(const std::vector<int>& data) {
+    int sum = std::accumulate(data.begin(), data.end(), 0);
+    int inlinedResult = inlineFunction(sum);
+    MyTemplateClass<int> templateObject(inlinedResult);
+    BaseClass* baseObject = new DerivedClass(sum, 2.5);
+    int finalResult = templateObject.getValue() + baseObject->calculate();
+    delete baseObject;
+    return finalResult;
+}
+```
+
+### 2.1.2 不同操作对二进制大小的影响
+
+|默认| -O1 | -O2| -O3| -Os|-Os| 包大小（Byte）| 
+| --- | --- | --- | ---|--- | --- |---|
+|   √  |     |     ||||57400|
+|   √  |  √   |     ||||53752|
+|   √  |     |  √   ||||53560|
+|   √  |     |     |√|||54784|
+|   √  |     |     ||√||53464|
+
+&emsp;&emsp;下面是不同配置的详细说明：
+- 默认配置：使用默认的编译选项和编译方式，不进行任何裁剪和优化。
+  - ```g++ -fPIC -shared Mylib.cpp -g -DMY_LARGE_LIBRARY_BUILD -o mylib.so```
+- 使用不同优化选项对比，具体```-O0```、```-O1```、```-O2```、```-O3```。
+## 2.1 包大小排查思路
