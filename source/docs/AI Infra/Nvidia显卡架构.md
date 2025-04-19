@@ -124,13 +124,209 @@
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/kepler_dp.png)
 
 ### 3.4 Maxwell（2014-2016）
+#### 3.4.1 Maxwell Architecture Overview
+
+&emsp;&emsp;Maxwell 架构作为 NVIDIA 在 Kepler 之后推出的 GPU 微架构，其核心目标是显著提升能效比，并在图形性能和功能上进行优化。与 Kepler 相比，Maxwell 的主要新特性和区别体现在以下几个方面：
+
+- SM 设计的重大改进： Maxwell 架构重新设计了流式多处理器 (SM)，将其划分为更小的处理单元，每个单元包含更少的 CUDA 核心。这种设计使得 Maxwell 能够更精细地控制功耗，并更好地利用 GPU 的并行计算资源。具体来说，Maxwell 的 SM 包含 128 个 CUDA 核心，分为 4 个独立的调度器和 4 个 32 核心的处理块，而 Kepler 的 SMX 则包含 192 个 CUDA 核心。
+- 能效比的显著提升： 通过对 SM 设计的优化和寄存器文件的改进，Maxwell 架构在能效比上实现了显著的提升。这意味着在相同功耗下，Maxwell 能够提供更高的性能。
+- 图形性能和功能的改进： Maxwell 架构支持 NVIDIA 的 VXGI (Voxel Global Illumination) 技术，能够提供更逼真的光照效果。此外，Maxwell 还支持多帧采样抗锯齿 (MFAA) 技术，能够以较低的性能代价提供高质量的抗锯齿效果。
+- 视频编码的改进： Maxwell 架构引入了新的 NVENC 视频编码器，能够提供更高的编码效率和更好的视频质量。此外，Maxwell 架构还支持 HDCP 2.2，能够播放受保护的 4K 内容。
+- L2 缓存的改进： 在 Maxwell 架构的 GM20x 版本中，NVIDIA 增加了 L2 缓存的容量，提高了显存带宽，从而进一步提升了性能。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/maxwell_vs_kepler_power_efficiency.png)
+
+#### 3.4.2 SMM: The Maxwell Multiprocessor
+&emsp;&emsp;Maxwell 架构能效表现的核心在于其流式多处理器，即 SMM。Maxwell 的全新数据路径组织和改进的指令调度器，每个 CUDA 核心提供的性能提升超过 40%，整体效率是 Kepler GK104 的两倍。新的 SMM 包含了第一代 Maxwell 的所有架构优势，包括控制逻辑分区、工作负载平衡、时钟门控粒度、指令调度、每个时钟周期发出的指令数量等方面的改进。SMM 采用基于象限的设计，包含四个 32 核处理块，每个块都有一个专用的 warp 调度器，能够每个时钟周期分派两条指令。每个 SMM 提供八个纹理单元、一个多形引擎（用于图形的几何处理），以及专用的寄存器文件和共享内存。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/GeForce_GTX_980_SM_Diagram-545x1024.png)
 
 ### 3.5 Pascal (2016-2017）
+#### 3.5.1 Pascal Architecture Overview
+&emsp;&emsp;Pascal 架构是 NVIDIA 在 Maxwell 之后推出的 GPU 微架构，主要应用于 GeForce 10 系列和 Tesla P100 等显卡。Pascal 架构在性能、能效和功能方面都实现了显著的提升。以下是 Pascal 架构的一些新特性：
+1. 16nm FinFET 工艺： Pascal 架构采用了 16nm FinFET 制造工艺，相比 Maxwell 的 28nm 工艺，晶体管密度更高，功耗更低，从而提高了性能和能效。
+2. SM 设计的改进： Pascal 架构的 SM 包含 64-128 个 CUDA 核心 (取决于 GP100 还是 GP104 芯片)，改进了 SM 的调度器和指令分派机制，提高了 SM 的效率。引入了并发指令调度技术，允许 SM 同时执行多个独立的指令，从而进一步提高了性能。
+3. HBM2 和 GDDR5X 显存： Pascal 架构采用了 HBM2 和 GDDR5X 两种显存技术。HBM2 具有更高的带宽和更低的功耗，主要应用于 Tesla P100 等高性能计算卡。GDDR5X 则具有更高的频率和更大的容量，主要应用于 GeForce 10 系列显卡。
+4. NVLink 互联技术： Pascal 架构引入了 NVLink 技术，能够提供更高的带宽和更低的延迟，主要应用于 Tesla P100 等高性能计算卡，用于连接多个 GPU 和 CPU。
+5. FP16 计算支持： Pascal 架构支持 FP16 (半精度浮点数) 计算，能够加速深度学习的训练和推理。
+6. CUDA 8.0： Pascal 架构支持 CUDA 8.0，提供了更丰富的 API 和工具，方便开发者进行 GPU 编程. 
+7. 统一内存 (Unified Memory): CPU 和 GPU 可以访问主系统内存和显卡上的内存，这要归功于一种称为“页面迁移引擎”的技术。
+8. 动态负载平衡调度系统: 允许调度程序动态调整分配给多个任务的 GPU 数量，确保 GPU 保持工作饱和状态，除非没有更多可以安全地分配以进行分配的工作。
+
+&emsp;&emsp;总的来说，Pascal 架构在制造工艺、SM 设计、显存技术、互联技术和计算能力等方面都进行了重大改进，为深度学习、高性能计算和游戏等领域带来了革命性的变革。（下图是GP100的架构图，其他类型的架构类似区别是不同的CUDA核心和SM数量）
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/Nvidia%20Pascal.png)
+
+#### 3.5.2 Stream Multiprocessor
+&emsp;&emsp;Pascal 架构的 SM (Streaming Multiprocessor) 相比于前代 Maxwell 架构的 SM，主要区别体现在以下几个方面：
+- CUDA 核心数量： Pascal 架构的 SM 中 CUDA 核心的数量取决于具体的芯片型号。在 GP100 芯片中，每个 SM 包含 64 个 CUDA 核心，而在 GP104 芯片中，每个 SM 包含 128 个 CUDA 核心。相比之下，Maxwell 架构的 GM204 芯片中，每个 SM 包含 128 个 CUDA 核心。
+- 调度器和指令分派机制的改进： Pascal 架构改进了 SM 的调度器和指令分派机制，提高了 SM 的效率。Pascal 架构引入了并发指令调度 (Concurrent Instruction Scheduling) 技术，允许 SM 同时执行多个独立的指令，从而进一步提高了性能。
+- FP16 计算支持： Pascal 架构的 SM 支持 FP16 (半精度浮点数) 计算，能够加速深度学习的训练和推理。Maxwell 架构的 SM 则不支持 FP16 计算。
+- 统一内存 (Unified Memory): CPU 和 GPU 可以访问主系统内存和显卡上的内存，这要归功于一种称为“页面迁移引擎”的技术。
+- 动态负载平衡调度系统: 允许调度程序动态调整分配给多个任务的 GPU 数量，确保 GPU 保持工作饱和状态，除非没有更多可以安全地分配以进行分配的工作。
+
+&emsp;&emsp;总的来说，Pascal 架构的 SM 在调度器和指令分派机制、FP16 计算支持和 CUDA 8.0 支持等方面都进行了改进，从而提高了性能和效率。
+
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/Nvidia%20Pascal_sm.png)
+
+> 图上的黄色部分DPUnit为双精度运算单元。
+
 ### 3.6 Volta (2017-2018)
+#### 3.6.1 Volta Architecture Overview
+&emsp;&emsp;
+&emsp;&emsp;Volta 架构是 NVIDIA 在 Pascal 架构之后推出的 GPU 微架构，主要应用于 Tesla V100 等高性能计算卡。Volta 架构在深度学习性能方面实现了显著的提升，为人工智能领域带来了新的突破。 Volta 架构的核心目标是加速深度学习的训练和推理。为了实现这一目标，Volta 架构在 SM (Streaming Multiprocessor) 设计、显存技术、互联技术和计算能力等方面都进行了重大改进。
+
+&emsp;&emsp;Volta 架构的 SM 包含 640 个 CUDA 核心和 80 个 Tensor 核心。Tensor 核心是 Volta 架构中新增的专门用于加速深度学习计算的硬件单元。每个 Tensor 核心能够执行混合精度浮点运算 (FP16 和 FP32)，从而加速深度学习模型的训练和推理。
+
+&emsp;&emsp;在显存技术方面，Volta 架构采用了 HBM2 (High Bandwidth Memory 2) 显存，能够提供更高的带宽和更低的功耗。
+
+&emsp;&emsp;在互联技术方面，Volta 架构引入了 NVLink 2.0 技术，能够提供更高的带宽和更低的延迟。NVLink 2.0 技术主要应用于 Tesla V100 等高性能计算卡，用于连接多个 GPU 和 CPU。
+
+&emsp;&emsp;在计算能力方面，Volta 架构支持 CUDA 9.0，提供了更丰富的 API 和工具，方便开发者进行 GPU 编程。此外，Volta 架构还支持独立线程调度 (Independent Thread Scheduling)，能够提高 GPU 的利用率。
+
+&emsp;&emsp;Volta 架构的主要特点包括：
+- Tensor 核心： Volta 架构中新增的专门用于加速深度学习计算的硬件单元，能够执行混合精度浮点运算 (FP16 和 FP32)。
+- HBM2 显存： 能够提供更高的带宽和更低的功耗。
+- NVLink 2.0 技术： 能够提供更高的带宽和更低的延迟。
+- CUDA 9.0： 提供了更丰富的 API 和工具，方便开发者进行 GPU 编程。
+- 独立线程调度： 能够提高 GPU 的利用率。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/volta.png)
+
+#### 3.6.2 Volta Streaming Multiprocessor
+&emsp;&emsp;Volta 架构的 SM (Streaming Multiprocessor) 单元的组成是其核心创新之一，尤其是在深度学习性能方面。与之前的 Pascal 架构相比，Volta 的 SM 单元进行了重大改进。以下是 Volta SM 单元的主要组成部分：
+- CUDA 核心 (CUDA Cores): Volta 架构的 SM 包含 640 个 CUDA 核心。这些核心用于执行传统的浮点和整数运算，是 GPU 通用计算的基础。
+- Tensor 核心 (Tensor Cores): 这是 Volta 架构中最显著的创新。每个 SM 包含 8 个 Tensor 核心。 Tensor 核心专门设计用于加速深度学习中的矩阵乘法运算，尤其是在训练神经网络时。 Tensor 核心能够高效地执行混合精度浮点运算 (FP16 乘法和 FP32 累加)，从而显著提高深度学习模型的训练速度。
+- L1 Cache 和共享内存 (Shared Memory): Volta 架构的 SM 共享一个统一的 128KB L1 Cache 和共享内存。 这个统一的内存池可以灵活地配置为 L1 Cache 或共享内存，以适应不同的工作负载。 L1 Cache 用于缓存常用的数据，减少对全局内存的访问，提高性能。 共享内存允许 SM 中的线程共享数据，实现高效的线程间通信。
+- 纹理单元 (Texture Units): Volta 架构的 SM 仍然包含纹理单元，用于执行纹理过滤等操作。 虽然 Volta 架构主要关注深度学习，但它仍然保留了对传统图形应用的支持。
+- 调度器 (Schedulers) 和分派单元 (Dispatch Units): Volta 架构的 SM 包含多个调度器和分派单元，用于管理和分配线程的执行。 这些调度器和分派单元能够高效地利用 SM 中的各个单元，实现高吞吐量。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/volta_sm.png)
+
 ### 3.7 Turing (2018-2020)
+#### 3.7.1 Turing Architecture Overview
+&emsp;&emsp;图灵 (Turing) 架构是 NVIDIA 在 Volta 架构之后推出的 GPU 微架构。 它主要应用于 GeForce RTX 20 系列和 Quadro RTX 系列显卡。 图灵架构在游戏和专业可视化领域引入了多项创新技术，例如光线追踪和深度学习超采样 (DLSS)。
+
+&emsp;&emsp;图灵架构的核心目标是实现实时光线追踪和 AI 增强图形。 为了实现这些目标，图灵架构在 SM (Streaming Multiprocessor) 设计、显存技术、光线追踪单元和 AI 核心等方面都进行了重大改进。
+
+&emsp;&emsp;图灵架构的 SM 包含 CUDA 核心、Tensor 核心和 RT 核心 (光线追踪核心)。 CUDA 核心用于执行传统的浮点和整数运算。 Tensor 核心用于加速深度学习计算。 RT 核心则专门用于加速光线追踪计算。
+
+&emsp;&emsp;在显存技术方面，图灵架构采用了 GDDR6 显存，能够提供更高的带宽和更低的功耗。
+
+图灵架构的主要特点包括：
+- RT 核心 (Ray Tracing Cores): 图灵架构中新增的专门用于加速光线追踪计算的硬件单元。 RT 核心能够加速光线与三角形的相交测试，从而实现实时光线追踪。
+- Tensor 核心 (Tensor Cores): 图灵架构的 Tensor 核心经过改进，能够更高效地执行深度学习计算。 Tensor 核心主要用于加速 DLSS (Deep Learning Super-Sampling) 等 AI 增强图形技术。
+- GDDR6 显存: 能够提供更高的带宽和更低的功耗。
+- Mesh Shading: 一种新的几何处理技术，能够提高复杂场景的渲染效率。
+- 可变速率着色 (Variable Rate Shading, VRS): 一种新的着色技术，能够根据图像内容调整着色速率，从而提高性能。
+- NVIDIA NGX: 一种新的神经网络图形框架，能够简化 AI 增强图形技术的开发。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/turing%20arch.png)
+#### 3.7.2 Turing Streaming Multiprocessor
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/turing_sm.png)
+&emsp;&emsp;图灵 (Turing) 架构的 SM (Streaming Multiprocessor) 单元在设计上借鉴了 Volta GV100 架构的许多特性，并进行了改进。主要特点：
+
+- 数量和组成： 每个 TPC (Texture Processing Cluster) 包含两个 SM。 每个 SM 包含 64 个 FP32 核心 (用于浮点运算) 和 64 个 INT32 核心 (用于整数运算)。 相比之下，Pascal GP10x GPU 每个 TPC 只有一个 SM，每个 SM 有 128 个 FP32 核心。
+- 并行执行： 图灵 SM 支持 FP32 和 INT32 操作的并行执行，以及类似于 Volta GV100 GPU 的独立线程调度。
+- 专用核心： 每个图灵 SM 还包含 8 个混合精度图灵 Tensor 核心 (用于加速深度学习) 和 1 个 RT 核心 (用于加速光线追踪)。
+- 处理块： 图灵 SM 被划分为四个处理块，每个块包含 16 个 FP32 核心、16 个 INT32 核心、2 个 Tensor 核心、1 个 warp 调度器和 1 个分派单元。
+- 缓存： 每个处理块包含一个新的 L0 指令缓存和一个 64 KB 寄存器文件。 四个处理块共享一个组合的 96 KB L1 数据缓存/共享内存。
+- 内存分配： 对于传统的图形工作负载，96 KB L1/共享内存被划分为 64 KB 的专用图形着色器 RAM 和 32 KB 的纹理缓存和寄存器文件溢出区域。 对于计算工作负载，可以将 96 KB 划分为 32 KB 共享内存和 64 KB L1 缓存，或 64 KB 共享内存和 32 KB L1 缓存。
+- 执行数据路径： 图灵架构对核心执行数据路径进行了重大改进。 它在每个 CUDA 核心旁边增加了一个并行的执行单元，用于并行执行整数运算等非浮点运算指令，从而提高了效率
+
 ### 3.8 Ampere (2020-2022)
+#### 3.8.1 Ampere Architecture Overview
+&emsp;&emsp;Ampere 架构是 NVIDIA 在 Turing 架构之后推出的 GPU 微架构。 它主要应用于 GeForce RTX 30 系列显卡和 NVIDIA A100 等数据中心 GPU。 Ampere 架构在游戏、专业可视化和数据中心等领域都实现了显著的性能提升。
+
+&emsp;&emsp;Ampere 架构的核心目标是提高 GPU 的计算效率和性能，尤其是在人工智能和高性能计算方面。 为了实现这些目标，Ampere 架构在 SM (Streaming Multiprocessor) 设计、显存技术、Tensor 核心和互联技术等方面都进行了重大改进。
+
+&emsp;&emsp;Ampere 架构的 SM 在 Turing 架构的基础上进行了重新设计，提高了 FP32 和 INT32 的吞吐量。 Ampere 架构的 SM 包含更多的 CUDA 核心，能够提供更高的计算性能。
+
+&emsp;&emsp;在显存技术方面，Ampere 架构采用了 GDDR6X 显存 (在 GeForce RTX 3080 和 RTX 3090 上) 和 HBM2e 显存 (在 NVIDIA A100 上)，能够提供更高的带宽和更低的功耗。
+
+&emsp;&emsp;Ampere 架构的主要特点包括：
+
+- 第二代 RT 核心 (2nd Generation Ray Tracing Cores): Ampere 架构的 RT 核心在第一代的基础上进行了改进，能够提供更高的光线追踪性能。
+- 第三代 Tensor 核心 (3rd Generation Tensor Cores): Ampere 架构的 Tensor 核心在第二代的基础上进行了改进，能够更高效地执行深度学习计算。 Ampere 架构的 Tensor 核心支持稀疏性 (sparsity)，能够进一步提高深度学习模型的训练和推理速度。
+- GDDR6X 显存: 能够提供更高的带宽和更低的功耗 (仅限部分型号)。
+- HBM2e 显存: 能够提供更高的带宽和更低的功耗 (仅限部分型号)。
+- PCIe 4.0: 支持 PCIe 4.0，能够提供更高的带宽。
+- NVLink 3.0: Ampere 架构引入了 NVLink 3.0 技术，能够提供更高的带宽和更低的延迟 (仅限部分型号)。
+- 多实例 GPU (Multi-Instance GPU, MIG): Ampere 架构支持 MIG 技术，可以将一个 GPU 划分为多个独立的 GPU 实例，从而提高 GPU 的利用率 (仅限部分型号)。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/ampere.png)
+
+#### 3.8.2 Ampere Streaming Multiprocessor
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/ampere_sm.png)
+&emsp;&emsp;Ampere 架构对 SM 进行了重大改进，使其在性能和效率方面都得到了提升。与 Turing 架构相比，Ampere SM 的主要变化包括：
+1. 更高的 FP32 吞吐量：
+    - 在 Turing 架构中，SM 包含独立的 FP32 (浮点) 和 INT32 (整数) 单元。Ampere 架构将 FP32 的吞吐量翻倍。
+    - Ampere SM 中的每个分区都包含 16 个 FP32 CUDA 核心，这些核心可以并行执行 FP32 运算。这意味着 Ampere 架构在处理图形和计算任务时，可以更快地完成浮点运算。
+2. 独立的 FP32 和 INT32 数据路径：与 Turing 架构类似，Ampere 架构也保留了独立的 FP32 和 INT32 数据路径，允许并行执行浮点和整数运算。这对于现代着色器和计算工作负载非常重要，因为它们通常需要混合使用浮点和整数运算。
+3. 改进的 Tensor 核心：
+    - Ampere 架构配备了第三代 Tensor 核心，与 Turing 架构的第二代 Tensor 核心相比，性能得到了显著提升。
+    - 第三代 Tensor 核心支持稀疏性 (Sparsity)，这是一种利用神经网络中零值数据的技术，可以进一步提高深度学习模型的训练和推理速度。
+4. 更大的 L1 缓存：Ampere 架构的 L1 缓存容量更大，可以减少对全局内存的访问，提高性能。
+5. 统一的共享内存和 L1 缓存： 与 Turing 架构类似，Ampere 架构也采用了统一的共享内存和 L1 缓存，可以灵活地配置以适应不同的工作负载。
+
 ### 3.9 Ada Lovelace (2022-至今)
+#### 3.9.1 Ada Lovelace Architecture Overview
+&emsp;&emsp;Ada Lovelace 架构是 NVIDIA 在 Ampere 架构之后推出的最新一代 GPU 微架构。 它主要应用于 GeForce RTX 40 系列显卡。 Ada Lovelace 架构在游戏、专业可视化和人工智能等领域都带来了显著的性能提升和创新技术。
+
+&emsp;&emsp;Ada Lovelace 架构的核心目标是实现更高的性能和效率，并提供更逼真的图形效果。 为了实现这些目标，Ada Lovelace 架构在 SM (Streaming Multiprocessor) 设计、显存技术、光线追踪单元和 AI 核心等方面都进行了重大改进。
+
+&emsp;&emsp;Ada Lovelace 架构的主要特点包括：
+
+- 第三代 RT 核心 (3rd Generation Ray Tracing Cores): Ada Lovelace 架构的 RT 核心在第二代的基础上进行了改进，能够提供更高的光线追踪性能。 新的 RT 核心引入了 Displaced Micro-Meshes 和 Opacity Micromaps 等技术，可以更高效地处理复杂的光线追踪场景。
+- 第四代 Tensor 核心 (4th Generation Tensor Cores): Ada Lovelace 架构的 Tensor 核心在第三代的基础上进行了改进，能够更高效地执行深度学习计算。 新的 Tensor 核心支持 FP8 数据类型，可以进一步提高深度学习模型的训练和推理速度。
+- DLSS 3 (Deep Learning Super Sampling 3): Ada Lovelace 架构引入了 DLSS 3 技术，它利用 AI 生成额外的帧，从而显著提高游戏性能。 DLSS 3 结合了 DLSS Super Resolution、DLSS Frame Generation 和 NVIDIA Reflex 等技术，可以提供更流畅、更逼真的游戏体验。
+- Shader Execution Reordering (SER): Ada Lovelace 架构引入了 SER 技术，可以动态地重新排序着色器工作负载，从而提高 GPU 的利用率和性能。
+- AV1 编码器: Ada Lovelace 架构集成了 AV1 编码器，可以提供更高的视频编码效率。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/ada.png)
+
+
+#### 3.9.2 Ada Lovelace Streaming Multiprocessor
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/ada%20sm.png)
+
+&emsp;&emsp;Ada Lovelace 架构的 SM 在 Ampere 架构的基础上进行了显著的改进，旨在提高性能、效率和光线追踪能力。
+
+&emsp;&emsp;主要改进和特点:
+
+- 更高的时钟频率和效率: Ada Lovelace 架构的 SM 旨在以更高的时钟频率运行，从而提高整体性能。此外，架构改进旨在提高每个时钟周期的指令吞吐量，从而提高效率。
+- 第三代 RT Cores: Ada Lovelace 架构包含第三代 RT Cores，与之前的架构相比，光线追踪性能得到了显著提升。这些 RT Cores 包含新的硬件单元，可以加速光线三角形相交测试和光线追踪计算。
+- 第四代 Tensor Cores: Ada Lovelace 架构包含第四代 Tensor Cores，与之前的架构相比，AI 性能得到了显著提升。这些 Tensor Cores 支持新的数据类型和技术，例如 FP8，可以加速深度学习训练和推理。
+- Shader Execution Reordering (SER): SER 是一种新的技术，可以动态地重新排序着色器工作负载，从而提高 GPU 的利用率和性能。SER 可以通过减少着色器核心的停顿时间来提高效率。
+- Displaced Micro-Meshes: Ada Lovelace 架构引入了 Displaced Micro-Meshes，这是一种新的几何图形表示方法，可以更有效地表示复杂场景中的细节。Displaced Micro-Meshes 可以与光线追踪技术结合使用，以实现更逼真的渲染效果。
+
 ### 3.10 Blackwell (2024-)
+#### 3.10.1 Blackwell Architecture Overview
+&emsp;&emsp;NVIDIA Blackwell 架构是 NVIDIA 最新发布的 GPU 架构，旨在为加速计算、人工智能和数据分析提供前所未有的性能。 它被认为是 NVIDIA 有史以来最强大的芯片，并有望在各个行业带来革命性的变化。
+&emsp;&emsp;主要特点和创新：
+
+- 双芯片设计： Blackwell 架构采用双芯片设计，将两个独立的 GPU 芯片互连为一个统一的 GPU。 这种设计可以有效地提高 GPU 的计算能力和内存带宽。
+- 下一代 Tensor Cores： Blackwell 架构配备了下一代 Tensor Cores，与之前的架构相比，AI 性能得到了显著提升。 新的 Tensor Cores 支持 FP4 和 FP6 等新的数据类型，可以进一步提高深度学习模型的训练和推理速度。
+- Transformer Engine： Blackwell 架构引入了 Transformer Engine，专门用于加速 Transformer 模型的训练和推理。 Transformer 模型是自然语言处理领域最流行的模型之一，Transformer Engine 可以显著提高这些模型的性能。
+- NVLink 5： Blackwell 架构支持 NVLink 5 互连技术，可以提供更高的带宽和更低的延迟。 NVLink 5 可以将多个 Blackwell GPU 连接在一起，以构建更大规模的计算系统。
+- 保密计算： Blackwell 架构支持保密计算，可以在保护数据隐私的同时进行计算。 保密计算对于金融、医疗保健等敏感数据处理领域非常重要。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/blackwell.png)
+
+#### 3.10.2 Blackwell Streaming Architecture
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/blackwell_sm.png)
+
+&emsp;&emsp;Blackwell 架构 SM 的主要特点：
+
+- SM 数量： 每个完整的 GB202 芯片包含 192 个 SM。
+- CUDA 核心： 每个 SM 包含 128 个 CUDA 核心。
+- RT 核心： 每个 SM 包含 1 个 Blackwell 第四代 RT 核心。
+- Tensor 核心： 每个 SM 包含 4 个 Blackwell 第五代 Tensor 核心。
+- 纹理单元： 每个 SM 包含 4 个纹理单元。
+- 寄存器文件： 每个 SM 包含 256 KB 的寄存器文件。
+- L1/共享内存： 每个 SM 包含 128 KB 的 L1/共享内存，可以根据图形和计算工作负载的需求配置不同的内存大小。
+- INT32 整数运算： Blackwell 架构中的 INT32 整数运算数量是 Ada 架构的两倍，通过将它们与 FP32 核心完全统一来实现。 但是，在任何给定的时钟周期内，统一的核心只能作为 FP32 或 INT32 核心运行。
 
 ## 4 参考文献
 - [Nvidia-NV1](https://zh.wikipedia.org/wiki/NV1)
@@ -143,3 +339,11 @@
 - [Whitepaper NVIDIA’s Next Generation CUDATM Compute Architecture: Fermi](https://www.nvidia.com/content/pdf/fermi_white_papers/nvidiafermicomputearchitecturewhitepaper.pdf)
 - [List of Fermi series GeForce GPUs](https://nvidia.custhelp.com/app/answers/detail/a_id/4656/~/list-of-fermi-series-geforce-gpus)
 - [Whitepaper NVIDIA’s Next Generation CUDATM Compute Architecture: Kepler TM GK110/210](https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/tesla-product-literature/NVIDIA-Kepler-GK110-GK210-Architecture-Whitepaper.pdf)
+- [Maxwell: The Most Advanced CUDA GPU Ever Made](https://developer.nvidia.com/blog/maxwell-most-advanced-cuda-gpu-ever-made/)
+- [Whitepaper NVIDIA Tesla P100 The Most Advanced Datacenter Accelerator Ever Built Featuring Pascal GP100, the World’s Fastest GPU](https://images.nvidia.com/content/pdf/tesla/whitepaper/pascal-architecture-whitepaper-v1.2.pdf)
+- [NVIDIA TESLA V100 GPU ARCHITECTURE THE WORLD’S MOST ADVANCED DATA CENTER GPU](https://images.nvidia.com/content/volta-architecture/pdf/volta-architecture-whitepaper.pdf)
+- [NVIDIA TURING GPU ARCHITECTURE Graphics Reinvented](https://images.nvidia.com/aem-dam/en-zz/Solutions/design-visualization/technologies/turing-architecture/NVIDIA-Turing-Architecture-Whitepaper.pdf)
+- [NVIDIA TURING GPU ARCHITECTURE](https://images.nvidia.com/aem-dam/en-zz/Solutions/design-visualization/technologies/turing-architecture/NVIDIA-Turing-Architecture-Whitepaper.pdf)
+- [NVIDIA AMPERE GA102 GPU ARCHITECTURE Second-Generation RTX](https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.pdf)
+- [NVIDIA ADA GPU ARCHITECTURE Designed to deliver outstanding gaming and creating, professional graphics, AI, and compute performance.](https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf)
+- [NVIDIA RTX BLACKWELL GPU ARCHITECTURE Built for Neural Rendering](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf)
