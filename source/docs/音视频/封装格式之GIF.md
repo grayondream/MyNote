@@ -119,7 +119,7 @@ $$
 &emsp;&emsp;如果有全局调色板，全局调色板的存储方式和87a相同，不再赘述。
 
 &emsp;&emsp;从下面的数据中能够看出宽高都为```0x000a```即10，标志位为```0xF2```，即```11110010```（M=1，cr=7，s=0，pixel=2），pxiel为2表示GIF中颜色至少需要3bit保存，即最多8个颜色，当前的GIF为7个颜色。之后就是全局调色板，每个颜色占3个字节。
-![](img/gif-89a-screen-descriptor.png)
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/gif-89a-screen-descriptor.png)
 
 #### 2.2.4 Application Extension
 &emsp;&emsp;描述应用信息，块标识为```0xFF```。
