@@ -6,6 +6,7 @@ FFmpeg
    :caption: FFmpeg
 
    FFplay源码分析
+   FFmpeg简介
    AVFrame
    AVOption
    AVPacket
@@ -17,3 +18,10 @@ FFmpeg
    FFmpeg解码转码播放
    FFmpeg中VideoToolBox实现
    FFmpeg中mov解封装
+   avformat_open_input
+   avformat_find_stream_info
+   avcodec_send_packet and avcodec_receive_frame
+   avcodec_send_frame and avcodec_receive_packet
+   avcodec_open2
+   av_read_frame
+   av_interleaved_write_frame
