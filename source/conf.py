@@ -18,6 +18,7 @@ extensions = [
     'myst_parser',
     "sphinxcontrib.mermaid",
     "sphinx_copybutton",
+    'sphinx.ext.mathjax'
 ]
 
 templates_path = ['_templates']
@@ -43,3 +44,4 @@ html_theme_options = {
     'titles_only': False,
 }
 
+mathjax_path = 'https://cdn.jsdelivr.net/npm/mathjax@2/MathJax.js?config=TeX-AMS-MML_HTMLorMML'
