@@ -3,4 +3,3 @@ sphinx_copybutton
 sphinxcontrib.mermaid
 sphinx-rtd-theme
 Pygments
-sphinx-mathjax3
