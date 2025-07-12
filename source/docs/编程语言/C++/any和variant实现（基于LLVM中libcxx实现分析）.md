@@ -276,4 +276,336 @@ int main(int argc, char **argv){
     return 0;
 }
 ```
+
 ## 2 std::variant
+### 2.1 简介
+&emsp;&emsp;```std::variant```是C++17引入的一个类模板，用于在编译时存储不同类型的值。它的实现基于类型擦除和联合体，能够存储任意指定的类型，并且在访问时可以自动进行类型检查和转换。
+```cpp
+#include <cassert>
+#include <iostream>
+#include <string>
+#include <variant>
+ 
+int main()
+{
+    std::variant<int, float> v, w;
+    v = 42; // v contains int
+    int i = std::get<int>(v);
+    assert(42 == i); // succeeds
+    w = std::get<int>(v);
+    w = std::get<0>(v); // same effect as the previous line
+    w = v; // same effect as the previous line
+ 
+//  std::get<double>(v); // error: no double in [int, float]
+//  std::get<3>(v);      // error: valid index values are 0 and 1
+ 
+    try
+    {
+        std::get<float>(w); // w contains int, not float: will throw
+    }
+    catch (const std::bad_variant_access& ex)
+    {
+        std::cout << ex.what() << '\n';
+    }
+ 
+    using namespace std::literals;
+ 
+    std::variant<std::string> x("abc");
+    // converting constructors work when unambiguous
+    x = "def"; // converting assignment also works when unambiguous
+ 
+    std::variant<std::string, void const*> y("abc");
+    // casts to void const* when passed a char const*
+    assert(std::holds_alternative<void const*>(y)); // succeeds
+    y = "xyz"s;
+    assert(std::holds_alternative<std::string>(y)); // succeeds
+}
+```
+
+### 2.2 实现
+&emsp;&emsp;简单看了下llvm的实现，看的头疼就去看msvc的实现发现msvc的实现了，就不折磨自己了，下面的分析来自与msvc。首先是对象存储，对象存储是使用union实现的，而为什么不在charbuffer上使用placement new是因为c++17不支持constexpr，该特性c++20才支持。
+
+&emsp;&emsp;能够看到Variant_storage中使用union递归来存储对象，并且使用了constexpr来确保在编译时就能够确定对象的大小。这里的代码是trivial对象的代码实现，对于非trivial的代码区别是添加了一个显式的构造函数来确保对象能够正常析构。
+```cpp
+template <class _First, class... _Rest>
+class _Variant_storage_<true, _First, _Rest...> { // Storage for variant alternatives (trivially destructible case)
+public:
+    static constexpr size_t _Size = 1 + sizeof...(_Rest);
+    union {
+        remove_cv_t<_First> _Head;
+        _Variant_storage<_Rest...> _Tail;
+    };
+
+    _CONSTEXPR20 _Variant_storage_() noexcept {} // no initialization (no active member)
+
+    template <class... _Types>
+    constexpr explicit _Variant_storage_(integral_constant<size_t, 0>, _Types&&... _Args) noexcept(
+        is_nothrow_constructible_v<_First, _Types...>)
+        : _Head(static_cast<_Types&&>(_Args)...) {} // initialize _Head with _Args...
+
+    template <size_t _Idx, class... _Types, enable_if_t<(_Idx > 0), int> = 0>
+    constexpr explicit _Variant_storage_(integral_constant<size_t, _Idx>, _Types&&... _Args) noexcept(
+        is_nothrow_constructible_v<_Variant_storage<_Rest...>, integral_constant<size_t, _Idx - 1>, _Types...>)
+        : _Tail(integral_constant<size_t, _Idx - 1>{}, static_cast<_Types&&>(_Args)...) {} // initialize _Tail (recurse)
+
+    _NODISCARD constexpr _First& _Get() & noexcept {
+        return _Head;
+    }
+    _NODISCARD constexpr const _First& _Get() const& noexcept {
+        return _Head;
+    }
+    _NODISCARD constexpr _First&& _Get() && noexcept {
+        return _STD move(_Head);
+    }
+    _NODISCARD constexpr const _First&& _Get() const&& noexcept {
+        return _STD move(_Head);
+    }
+};
+```
+
+&emsp;&emsp;元素获取也是通过递归实现的，只不过好粗暴啊。
+```cpp
+template <size_t _Idx, class _Storage>
+_NODISCARD constexpr decltype(auto) _Variant_raw_get(_Storage&& _Obj) noexcept {
+    // access the _Idx-th element of a _Variant_storage
+    if constexpr (_Idx == 0) {
+        return static_cast<_Storage&&>(_Obj)._Get();
+    } else if constexpr (_Idx == 1) {
+        return static_cast<_Storage&&>(_Obj)._Tail._Get();
+    } else if constexpr (_Idx == 2) {
+        return static_cast<_Storage&&>(_Obj)._Tail._Tail._Get();
+    } else if constexpr (_Idx == 3) {
+        return static_cast<_Storage&&>(_Obj)._Tail._Tail._Tail._Get();
+    } else if constexpr (_Idx == 4) {
+        return static_cast<_Storage&&>(_Obj)._Tail._Tail._Tail._Tail._Get();
+    } else if constexpr (_Idx == 5) {
+        return static_cast<_Storage&&>(_Obj)._Tail._Tail._Tail._Tail._Tail._Get();
+    } else if constexpr (_Idx == 6) {
+        return static_cast<_Storage&&>(_Obj)._Tail._Tail._Tail._Tail._Tail._Tail._Get();
+    } else if constexpr (_Idx == 7) {
+        return static_cast<_Storage&&>(_Obj)._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Get();
+    } else if constexpr (_Idx < 16) {
+        return _STD _Variant_raw_get<_Idx - 8>(
+            static_cast<_Storage&&>(_Obj)._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail);
+    } else if constexpr (_Idx < 32) {
+        return _STD _Variant_raw_get<_Idx - 16>(
+            static_cast<_Storage&&>(_Obj)
+                ._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail);
+    } else if constexpr (_Idx < 64) {
+        return _STD _Variant_raw_get<_Idx - 32>(
+            static_cast<_Storage&&>(_Obj)
+                ._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail
+                ._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail);
+    } else { // _Idx >= 64
+        return _STD _Variant_raw_get<_Idx - 64>(
+            static_cast<_Storage&&>(_Obj)
+                ._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail
+                ._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail
+                ._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail
+                ._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail._Tail);
+    }
+}
+```
+
+&emsp;&emsp;存储方式搞清楚了，下来看一下如何获取元素，获取元素有两种方式，第一种是根据类型获取，第二种是根据索引获取。
+```cpp
+_EXPORT_STD template <size_t _Idx, class... _Types>
+_NODISCARD constexpr auto get_if(variant<_Types...>* _Ptr) noexcept {
+    // get the address of *_Ptr's contained value if it holds alternative _Idx
+    static_assert(_Idx < sizeof...(_Types), "variant index out of bounds");
+    return _Ptr && _Ptr->index() == _Idx ? _STD addressof(_STD _Variant_raw_get<_Idx>(_Ptr->_Storage())) : nullptr;
+}
+```
+&emsp;&emsp;最后是析构，比较简单，单纯的递归搜索析构。
+```cpp
+ _CONSTEXPR20 void _Destroy() noexcept { // destroy the contained value, if any
+     if constexpr (!conjunction_v<is_trivially_destructible<_Types>...>) {
+         _STD _Variant_raw_visit(index(), _Storage(), [](auto _Ref) noexcept {
+             if constexpr (decltype(_Ref)::_Idx != variant_npos) {
+                 using _Indexed_value_type = _Remove_cvref_t<decltype(_Ref._Val)>;
+                 _Ref._Val.~_Indexed_value_type();
+             }
+         });
+     }
+ }
+```
+
+### 2.3 自己实现
+&emsp;&emsp;参考上面的代码，我们自己实现一个，原理比较简单就是递归union，由于递归union无法处理析构问题所以需要我们自己处理。其实还有一种实现方式是通过buffer实现，但是该实现无法实现constexpr版本，因此推荐使用union实现。
+```cpp
+#include <iostream>
+#include <new>
+#include <stdexcept>
+#include <type_traits>
+#include <variant>
+
+
+template <typename... Ts>
+struct VariantStorage {
+    // ���ػ�������û�и������͵����
+};
+
+template <typename Head, typename... Ts>
+struct VariantStorage<Head, Ts...> {
+    union {
+        std::remove_cv_t<Head> value;
+        VariantStorage<Ts...> next;
+    };
+
+    constexpr VariantStorage() {};
+    constexpr ~VariantStorage() noexcept {}
+    constexpr VariantStorage(VariantStorage&&) = default;
+    constexpr VariantStorage(const VariantStorage&) = default;
+    constexpr VariantStorage& operator=(VariantStorage&&) = default;
+    constexpr VariantStorage& operator=(const VariantStorage&) = default;
+   
+};
+
+// �ػ�������ֹ�ݹ�
+template<size_t index, typename Head, typename ...Ts>
+constexpr auto& get(VariantStorage<Head, Ts...>& v) {
+    if constexpr (index == 0) {
+        return v.value;
+    }else {
+        return get<index - 1>(v.next);
+    }
+}
+
+template <typename T>
+constexpr T& get(const VariantStorage<>&) {
+    throw std::bad_variant_access();  // �׳��쳣
+}
+
+template<typename T, typename Head, typename ...Ts>
+constexpr auto& get(VariantStorage<Head, Ts...>& v) {
+    using Type = std::remove_cvref_t<T>;
+    if constexpr (std::is_same_v<Type, Head>) {
+        return v.value;
+    }else {
+        return get<T>(v.next);
+    }
+}
+
+template<class T, typename Head, typename... Ts>
+constexpr void assign(VariantStorage<Head, Ts...>& v, T&& vv) {
+    using Type = std::remove_cvref_t<T>;
+    if constexpr (std::is_same_v<T, Head>) {
+        *new(&v.value)Type = std::forward<T>(vv);
+    }else {
+        assign(v.next, std::forward<T>(vv));
+    }
+}
+
+template <size_t id, typename Head, typename... Ts>
+constexpr void destroy(VariantStorage<Head, Ts...>& v) {
+    if constexpr (id == 0) {
+        v.value.~Head();
+    }
+    else {
+        destroy<id - 1>(v._next);
+    }
+}
+
+template <typename... Ts>
+constexpr bool is_all_trivial_v = false;
+
+template <>
+constexpr bool is_all_trivial_v<> = true;
+
+template <typename T, typename... Ts>
+constexpr bool is_all_trivial_v<T, Ts...> = std::is_trivial_v<T> && is_all_trivial_v<Ts...>;
+
+constexpr static auto kBadIndex = ~((size_t)0);
+
+template<size_t index, typename U, typename T, typename ...Ts>
+struct FindPosition {
+    constexpr static size_t value = std::is_same_v<U, T> ? index : FindPosition<index + 1, U, Ts...>::value;
+};
+
+template<size_t index, typename U, typename T>
+struct FindPosition<index, U, T> {
+    constexpr static auto value = std::is_same_v<T, U> ? index : kBadIndex;
+};
+
+template<typename U, typename... Ts>
+constexpr auto variant_get_index = FindPosition<0, U, Ts...>::value;
+
+template <typename... Ts>
+struct Variant {
+    constexpr static auto is_all_trivial = is_all_trivial_v<Ts...>;
+    constexpr static auto size = sizeof...(Ts);
+
+    Variant() {};
+    Variant(const Variant<Ts...>& rhs) = default;
+    Variant(Variant<Ts...>&& rhs) = default;
+    Variant& operator=(const Variant<Ts...>& rhs) = default;
+    Variant& operator=(Variant<Ts...>&& rhs) = default;
+    ~Variant() {
+        if constexpr (is_all_trivial) {
+            destroy(storage);
+            index = kBadIndex;
+        }
+    }
+    template <typename T>
+        requires(!std::is_same_v<Variant, std::remove_cvref_t<T>>) Variant(T&& rhs) {
+        assign(storage, std::forward<T>(rhs));
+        index = variant_get_index<T, Ts...>;
+    }
+
+    template <typename T>
+        requires(!std::is_same_v<Variant, std::remove_cvref_t<T>>)
+    auto& operator=(T&& rhs) {
+        destroy<index>(storage);
+        assign(storage, std::forward<T>(rhs));
+        index = variant_get_index<T, Ts...>;
+        return *this;
+    }
+
+    size_t index;
+    VariantStorage<Ts...> storage;
+};
+
+template<size_t index, typename ...Ts>
+constexpr auto& get(Variant<Ts...>& v) {
+    return get<index>(v.storage);
+}
+
+template<typename T, typename ...Ts>
+constexpr auto& get(Variant<Ts...>& v) {
+    return get<T>(v.storage);
+}
+
+struct ClassA {
+public:
+    ~ClassA() {
+        printf("destro\n");
+    }
+};
+
+// ʾ��ʹ��
+int main() {
+    VariantStorage<int, double, std::string> v;
+    static_assert(std::is_same_v<int, decltype(v.value)>);
+    static_assert(std::is_same_v<double, decltype(v.next.value)>);
+    static_assert(std::is_same_v<std::string, decltype(v.next.next.value)>);
+
+    get<0>(v) = 42;
+    std::cout << get<0>(v) << "\n";
+
+    assign(v, std::string("avc"));
+    std::cout << get<std::string>(v) << "\n";
+
+    std::cout << variant_get_index<std::string, std::string, int, double> << std::endl;
+    std::cout << variant_get_index<int, std::string, int, double> << std::endl;
+    std::cout << variant_get_index<double, std::string, int, double> << std::endl;
+    std::cout << variant_get_index<char, std::string, int, double> << std::endl;
+
+    Variant<int, double, std::string> a1 = 2.2;
+    std::cout << get<double>(a1) << std::endl;
+    std::cout << get<1>(a1) << std::endl;
+
+    Variant<int, ClassA> a2 = ClassA();
+
+    return 0;
+}
+```
