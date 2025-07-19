@@ -37,6 +37,8 @@ ECS 架构的工作流程可以简单概括为以下几个步骤：​
 &emsp;&emsp;用ECS实现2D场景下物体移动效果，效果如下图所示，下图中红色小球是通过键盘控制移动的，其他物体是自由下落循环播放。
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/GIF%202025-7-19%2014-23-20.gif)
 
+- Demo地址 [Github-ECS](https://github.com/grayondream/Entity-Component-System-Demo)
+
 **实体**
 &emsp;&emsp;ECS中的Entity只是一个标记记号，用来标识不同的实体，实际中的具体实例是Entity标记和Component共同组成的。
 ```cpp
