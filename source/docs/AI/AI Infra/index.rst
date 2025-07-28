@@ -5,5 +5,5 @@ Ai Infra
    :maxdepth: 1
    :caption: Ai Infra
 
-   AI Infra/index
+   Nvidia显卡架构
    
