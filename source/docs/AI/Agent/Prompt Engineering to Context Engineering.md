@@ -1,7 +1,7 @@
-#
+# Prompt Engineering to Context Engineering
 
 **摘要**:
-&emsp;详细探讨了从 Prompt Engineering（提示工程） 到 Context Engineering（上下文工程） 的演进过程及其技术背景。Prompt Engineering 是早期大语言模型（LLM）应用的核心技能，通过精心设计输入指令引导模型生成特定输出。然而，随着应用场景的复杂化和模型能力的提升，Prompt Engineering 的局限性逐渐显现，包括对提示敏感、泛化能力不足、可维护性差等问题。这促使行业转向 Context Engineering，强调通过系统化的上下文管理、外部知识检索、多模态信息融合和长期记忆机制，构建更加稳健和可扩展的 LLM 应用。
+&emsp;本文详细探讨了从 Prompt Engineering（提示工程） 到 Context Engineering（上下文工程） 的演进过程及其技术背景。Prompt Engineering 是早期大语言模型（LLM）应用的核心技能，通过精心设计输入指令引导模型生成特定输出。然而，随着应用场景的复杂化和模型能力的提升，Prompt Engineering 的局限性逐渐显现，包括对提示敏感、泛化能力不足、可维护性差等问题。这促使行业转向 Context Engineering，强调通过系统化的上下文管理、外部知识检索、多模态信息融合和长期记忆机制，构建更加稳健和可扩展的 LLM 应用。
 &emsp;&emsp;文档分析了 Prompt 和 Context 的定义、区别及互补关系，并深入探讨了 Context Engineering 的核心技术框架，包括动态上下文拼接、检索增强（RAG）、上下文压缩与优化等策略。此外，文档还结合实际案例（如企业客服助手、GitHub Copilot、学术研究助手）展示了 Context Engineering 的价值。最后，文档展望了未来趋势，包括自动 Prompt 与 Context 的混合、多模态上下文整合、Agent 驱动的上下文自治以及可控性和可解释性的提升。
 **关键字**: Prompt Engineering, Context Engineering, 大语言模型, 提示词工程, 上下文工程, 技术背景, 演进过程, 技术框架, 案例分析, 未来趋势
 
