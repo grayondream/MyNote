@@ -133,7 +133,7 @@ LLM 本身缺乏持久记忆能力，Context Engineering 可以通过显式的�
 
 - **上下文压缩 (Context Compression)**：  
 通过抽取摘要、提取关键点、知识图谱化等方式，对长文本进行压缩后再输入模型，从而减少 token 消耗。  
-参考：Zhang et al. (2023), Extract, then Distill: Efficient and Effective Context Compression for LLMs, https://arxiv.org/abs/2305.10601  
+参考：Zhang et al. (2023), Extract, then Distill: Efficient and Effective Context Compression for LLMs, https://arxiv.org/abs/2406.06110  
 
 - **知识蒸馏与缓存 (Cache/Distillation)**：  
 对于常见任务或固定知识，可以通过缓存模型的输出，或蒸馏成轻量化模型，从而减少上下文依赖。例如：FAQ 问答系统不必每次都检索整个数据库，而是可以直接使用缓存结果。  
