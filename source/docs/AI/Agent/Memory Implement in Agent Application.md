@@ -190,6 +190,9 @@ else:
 - 灵活 Prompt 设计，支持摘要、画像与策略生成。
 
 ## 2 MemGPT: Towards LLMs as Operating Systems
+>论文地址：[MemGPT: Towards LLMs as Operating Systems](https://arxiv.org/pdf/2310.08560)
+>代码地址：[https://github.com/letta-ai/letta](https://github.com/letta-ai/letta)
+
 ### 2.1 MemGPT
 &emsp;&emsp;MemGPT（MemoryGPT）借鉴传统操作系统的分层内存管理思想（物理内存与磁盘间的分页机制），通过 “虚拟上下文管理” 技术，让固定上下文窗口的 LLM 具备 “无限上下文” 的使用错觉。其核心逻辑是：将 LLM 的上下文窗口视为 “物理内存”，外部存储视为 “磁盘”，通过函数调用实现信息在两者间的 “分页调入 / 调出”，同时管理控制流以优化上下文利用效率。
 
@@ -215,4 +218,275 @@ else:
   - 多函数顺序执行：通过 “request heartbeat=true” 标志，支持 LLM 在返回用户响应前，连续调用多个函数（如多页文档检索、多跳键值对查询），提升复杂任务处理能力。
 
 ## 2.2 源码分析
+### 2.2.1 内存层次结构 — 主内存 / 归档 / 检索层
+&emsp;&emsp;Memory hierarchy（论文里的主内存 / 外部存储分层）是通过 Memory Blocks + Archival Memory 来实现的：
+- 核心上下文（主内存）由 memory blocks 组成，每个 block 都是可编辑、可共享的小单元，在 `client.blocks.create()` 与 agent 的 `block_ids` 字段绑定后，会被拼接进 agent 的 `in-context prompt` 中。
+```python
+agent_state = client.agents.create(
+    memory_blocks=[
+        {
+          "label": "human",
+          "value": "The human's name is Bob the Builder.",
+          "limit": 5000
+        },
+        {
+          "label": "persona",
+          "value": "My name is Sam, the all-knowing sentient AI.",
+          "limit": 5000
+        }
+    ],
+    model="openai/gpt-4o-mini",
+    embedding="openai/text-embedding-3-small"
+)
+```
+- 外部上下文：超出 context 的长期存储（外部存储层）则通过 `filesystem / folders / passages` 模块实现，文件内容会被分段、索引、存档，必要时由`agent`通过工具调用再取回到主内存。这样 Letta 就把 “有限的 prompt context” 和 “无限的外部持久存储” 分层管理。
+```python
+# create the folder
+folder = client.folders.create(
+    name="my_folder",
+    embedding_config=embedding_config
+)
+
+# upload a file into the folder
+job = client.folders.files.upload(
+    folder_id=folder.id,
+    file=open("my_file.txt", "rb")
+)
+```
+
+**MemoryBlock**
+&emsp;&emsp;MemGPT中定义了一些系列的Memory，都是基于MemoryBlock来实现的。而外部Memory直接通过FileProcess来实现。
+```python
+class BasicBlockMemory(Memory):
+    """
+    BasicBlockMemory is a basic implemention of the Memory class, which takes in a list of blocks and links them to the memory object. These are editable by the agent via the core memory functions.
+
+    Attributes:
+        memory (Dict[str, Block]): Mapping from memory block section to memory block.
+
+    Methods:
+        core_memory_append: Append to the contents of core memory.
+        core_memory_replace: Replace the contents of core memory.
+    """
+
+    def __init__(self, blocks: List[Block] = []):
+        """
+        Initialize the BasicBlockMemory object with a list of pre-defined blocks.
+
+        Args:
+            blocks (List[Block]): List of blocks to be linked to the memory object.
+        """
+        super().__init__(blocks=blocks)
+```
+
+**调度**
+&emsp;&emsp;agent 的核心调度器，其中 内存调度（memory hierarchy 的 orchestrator） 主要体现在 “重建上下文窗口” 的逻辑，也就是把 Memory Blocks（主内存）、消息历史 和 归档/摘要 拼接起来，送进 LLM。
+```python
+# letta/agents/letta_agent.py
+
+class LettaAgent:
+    ...
+
+    async def step(...):
+        # 每次 agent 前进一轮，都会检查/更新上下文
+        ...
+        await self.rebuild_context_window()
+        ...
+
+    async def rebuild_context_window(self):
+        """
+        这里是核心的内存调度逻辑：
+        1. 从数据库/存储里取出 agent 的 memory blocks（主内存块）
+        2. 加载最近的对话消息（短期记忆）
+        3. 检查上下文 token 使用量
+            - 如果超过阈值，调用 summarizer 做摘要/驱逐
+        4. 把这些拼接成 prompt，交给模型调用
+        """
+        blocks = await self.get_attached_blocks()
+        messages = await self.load_recent_messages()
+
+        # 判断 token 是否超限
+        if self.exceeds_context_limit(blocks, messages):
+            summarized = await self.summarizer.summarize(messages)
+            messages = summarized
+
+        # 构造最终的上下文
+        self.context = self.compose_context(blocks, messages)
+
+```
+
+**摘要**
+&emsp;&emsp;当上下文压力过大时，会通过LLM对内存进行摘要或驱逐，具体摘要的PE如下：
+```python
+WORD_LIMIT = 100
+SYSTEM = f"""Your job is to summarize a history of previous messages in a conversation between an AI persona and a human.
+The conversation you are given is a from a fixed context window and may not be complete.
+Messages sent by the AI are marked with the 'assistant' role.
+The AI 'assistant' can also make calls to tools, whose outputs can be seen in messages with the 'tool' role.
+Things the AI says in the message content are considered inner monologue and are not seen by the user.
+The only AI messages seen by the user are from when the AI uses 'send_message'.
+Messages the user sends are in the 'user' role.
+The 'user' role is also used for important system events, such as login events and heartbeat events (heartbeats run the AI's program without user action, allowing the AI to act without prompting from the user sending them a message).
+Summarize what happened in the conversation from the perspective of the AI (use the first person from the perspective of the AI).
+Keep your summary less than {WORD_LIMIT} words, do NOT exceed this word limit.
+Only output the summary, do NOT include anything else in your output."""
+```
+
+**共享内存**
+&emsp;&emsp;共享内存的实现比较简单就是将内存块的id添加到agent的block_ids中即可。
+```python
+# create a shared memory block
+shared_block = client.blocks.create(
+    label="organization",
+    description="Shared information between all agents within the organization.",
+    value="Nothing here yet, we should update this over time."
+)
+
+# create a supervisor agent
+supervisor_agent = client.agents.create(
+    model="anthropic/claude-3-5-sonnet-20241022",
+    embedding="openai/text-embedding-3-small",
+    # blocks created for this agent
+    memory_blocks=[{"label": "persona", "value": "I am a supervisor"}],
+    # pre-existing shared block that is "attached" to this agent
+    block_ids=[shared_block.id],
+)
+
+# create a worker agent
+worker_agent = client.agents.create(
+    model="openai/gpt-4.1-mini",
+    embedding="openai/text-embedding-3-small",
+    # blocks created for this agent
+    memory_blocks=[{"label": "persona", "value": "I am a worker"}],
+    # pre-existing shared block that is "attached" to this agent
+    block_ids=[shared_block.id],
+)
+```
+### 2.2.2 队列管理器
+&emsp;&emsp;MemGPT的队列管理器（queue manager） 对应的就是 对话消息队列 / buffer 的管理逻辑——也就是让 agent 的上下文只保留一部分最近的消息，把溢出的内容清理、归档或摘要。这个机制跟 MemGPT 论文里的 FIFO 队列 + 内存压力控制 是一一对应的。
+1. 消息存储。所有对话消息存到数据库里（Postgres/SQLite，表结构在 messages 表），而 agent 每次运行时不会直接加载全部，而是取最近一段窗口。
+2. 上下文重建时检查队列。从数据库里取最新的 N 条消息（相当于队尾元素）。如果 token 超限，调用 summarizer 对旧消息做摘要，然后替换队首部分（保持队列容量不爆炸）。
+```python
+async def _rebuild_context_window(
+    self, summarizer: Summarizer, in_context_messages: List[Message], letta_message_db_queue: List[Message]
+) -> None:
+    new_letta_messages = await self.message_manager.create_many_messages_async(letta_message_db_queue, actor=self.actor)
+
+    # TODO: Make this more general and configurable, less brittle
+    new_in_context_messages, updated = await summarizer.summarize(
+        in_context_messages=in_context_messages, new_letta_messages=new_letta_messages
+    )
+
+    await self.agent_manager.update_message_ids_async(
+        agent_id=self.agent_id, message_ids=[m.id for m in new_in_context_messages], actor=self.actor
+    )
+```
+3. 驱逐/摘要策略。当消息数量或 token 数超过阈值时，触发 partial evict buffer summarization，把旧消息合并成一条 “总结消息”，再继续放回队首。
+```python
+async def _partial_evict_buffer_summarization(
+        self,
+        in_context_messages: List[Message],
+        new_letta_messages: List[Message],
+        force: bool = False,
+        clear: bool = False,
+    ) -> Tuple[List[Message], bool]:
+        """Summarization as implemented in the original MemGPT loop, but using message count instead of token count.
+        Evict a partial amount of messages, and replace message[1] with a recursive summary.
+
+        Note that this can't be made sync, because we're waiting on the summary to inject it into the context window,
+        unlike the version that writes it to a block.
+
+        Unless force is True, don't summarize.
+        Ignore clear, we don't use it.
+        """
+        all_in_context_messages = in_context_messages + new_letta_messages
+
+        if not force:
+            logger.debug("Not forcing summarization, returning in-context messages as is.")
+            return all_in_context_messages, False
+
+        # First step: determine how many messages to retain
+        total_message_count = len(all_in_context_messages)
+        assert self.partial_evict_summarizer_percentage >= 0.0 and self.partial_evict_summarizer_percentage <= 1.0
+        target_message_start = round((1.0 - self.partial_evict_summarizer_percentage) * total_message_count)
+        logger.info(f"Target message count: {total_message_count}->{(total_message_count - target_message_start)}")
+
+        # The summary message we'll insert is role 'user' (vs 'assistant', 'tool', or 'system')
+        # We are going to put it at index 1 (index 0 is the system message)
+        # That means that index 2 needs to be role 'assistant', so walk up the list starting at
+        # the target_message_count and find the first assistant message
+        for i in range(target_message_start, total_message_count):
+            if all_in_context_messages[i].role == MessageRole.assistant:
+                assistant_message_index = i
+                break
+        else:
+            raise ValueError(f"No assistant message found from indices {target_message_start} to {total_message_count}")
+
+        # The sequence to summarize is index 1 -> assistant_message_index
+        messages_to_summarize = all_in_context_messages[1:assistant_message_index]
+        logger.info(f"Eviction indices: {1}->{assistant_message_index}(/{total_message_count})")
+
+        # Dynamically get the LLMConfig from the summarizer agent
+        # Pretty cringe code here that we need the agent for this but we don't use it
+        agent_state = await self.agent_manager.get_agent_by_id_async(agent_id=self.agent_id, actor=self.actor)
+
+        # TODO if we do this via the "agent", then we can more easily allow toggling on the memory block version
+        summary_message_str = await simple_summary(
+            messages=messages_to_summarize,
+            llm_config=agent_state.llm_config,
+            actor=self.actor,
+            include_ack=True,
+        )
+```
+
+### 2.2.3 函数执行器
+&emsp;&emsp;MemGPT的函数执行器是每个Agent的基础能力，在处理LLM的响应时进行函数调用。函数的具体执行是抛到了不同的Exector里面。
+```python
+@trace_method
+    async def _handle_ai_response()
+        #省略一些检查和参数
+        # 2.  Execute the tool (or synthesize an error result if disallowed)
+        tool_rule_violated = tool_call_name not in valid_tool_names and not is_approval
+        if tool_rule_violated:
+            tool_execution_result = _build_rule_violation_result(tool_call_name, valid_tool_names, tool_rules_solver)
+        else:
+            # Track tool execution time
+            tool_start_time = get_utc_timestamp_ns()
+            tool_execution_result = await self._execute_tool(
+                tool_name=tool_call_name,
+                tool_args=tool_args,
+                agent_state=agent_state,
+                agent_step_span=agent_step_span,
+                step_id=step_id,
+            )
+```
+
+### 2.2.4 控制流与函数链
+&emsp;&emsp;MemGPT的控制流与函数链是支撑Agent具备“可编程对话逻辑”的关键。核心由 step() 驱动,每次调用 agent.step() 就是一次事件循环。基本流程为:LLM输出 → 调度器解析 → 执行器执行 → 队列更新 → 下一轮继续。伪代码为：
+```python
+# letta/agents/letta_agent.py
+
+async def step(self, user_input=None):
+    # 1. 构建上下文
+    await self.rebuild_context_window()
+
+    # 2. 调用模型
+    model_output = await self.model.generate(self.context, user_input)
+
+    # 3. 根据输出类型决定控制流
+    if model_output.function_call:
+        response = await self.execute_function_call(model_output.function_call)
+    else:
+        response = model_output.text
+
+    # 4. 更新队列（短期记忆）
+    await self.message_queue.enqueue(response)
+
+    return response
+
+```
+
 ## 2.3 要点总结
+- 内存层次（Memory Hierarchy）：Main Context Memory，External Memory和Archive / Summarized Memory；
+- 内存调度：高频访问内容留在上下文，低频内容丢到外部存储；
+- 队列管理：管理 输入消息流 与 函数调用结果，确保 LLM 每次看到的上下文是“最有用”的子集。
