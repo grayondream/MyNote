@@ -217,8 +217,8 @@ else:
   - 事件触发推理：用户消息、系统警告、定时任务等事件均会触发 LLM 推理，事件经解析后转为文本追加到主上下文；
   - 多函数顺序执行：通过 “request heartbeat=true” 标志，支持 LLM 在返回用户响应前，连续调用多个函数（如多页文档检索、多跳键值对查询），提升复杂任务处理能力。
 
-## 2.2 源码分析
-### 2.2.1 内存层次结构 — 主内存 / 归档 / 检索层
+### 2.2 源码分析
+#### 2.2.1 内存层次结构 — 主内存 / 归档 / 检索层
 &emsp;&emsp;Memory hierarchy（论文里的主内存 / 外部存储分层）是通过 Memory Blocks + Archival Memory 来实现的：
 - 核心上下文（主内存）由 memory blocks 组成，每个 block 都是可编辑、可共享的小单元，在 `client.blocks.create()` 与 agent 的 `block_ids` 字段绑定后，会被拼接进 agent 的 `in-context prompt` 中。
 ```python
@@ -362,7 +362,7 @@ worker_agent = client.agents.create(
     block_ids=[shared_block.id],
 )
 ```
-### 2.2.2 队列管理器
+#### 2.2.2 队列管理器
 &emsp;&emsp;MemGPT的队列管理器（queue manager） 对应的就是 对话消息队列 / buffer 的管理逻辑——也就是让 agent 的上下文只保留一部分最近的消息，把溢出的内容清理、归档或摘要。这个机制跟 MemGPT 论文里的 FIFO 队列 + 内存压力控制 是一一对应的。
 1. 消息存储。所有对话消息存到数据库里（Postgres/SQLite，表结构在 messages 表），而 agent 每次运行时不会直接加载全部，而是取最近一段窗口。
 2. 上下文重建时检查队列。从数据库里取最新的 N 条消息（相当于队尾元素）。如果 token 超限，调用 summarizer 对旧消息做摘要，然后替换队首部分（保持队列容量不爆炸）。
@@ -439,7 +439,7 @@ async def _partial_evict_buffer_summarization(
         )
 ```
 
-### 2.2.3 函数执行器
+##### 2.2.3 函数执行器
 &emsp;&emsp;MemGPT的函数执行器是每个Agent的基础能力，在处理LLM的响应时进行函数调用。函数的具体执行是抛到了不同的Exector里面。
 ```python
 @trace_method
@@ -486,7 +486,7 @@ async def step(self, user_input=None):
 
 ```
 
-## 2.3 要点总结
+### 2.3 要点总结
 - 内存层次（Memory Hierarchy）：Main Context Memory，External Memory和Archive / Summarized Memory；
 - 内存调度：高频访问内容留在上下文，低频内容丢到外部存储；
 - 队列管理：管理 输入消息流 与 函数调用结果，确保 LLM 每次看到的上下文是“最有用”的子集。
