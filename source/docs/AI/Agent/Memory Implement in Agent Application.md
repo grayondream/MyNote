@@ -490,3 +490,282 @@ async def step(self, user_input=None):
 - 内存层次（Memory Hierarchy）：Main Context Memory，External Memory和Archive / Summarized Memory；
 - 内存调度：高频访问内容留在上下文，低频内容丢到外部存储；
 - 队列管理：管理 输入消息流 与 函数调用结果，确保 LLM 每次看到的上下文是“最有用”的子集。
+
+## 3 A-Mem: Agentic Memory for LLM Agents
+>论文地址：[A-Mem: Agentic Memory for LLM Agents](https://arxiv.org/pdf/2502.12110)
+>代码地址：[https://github.com/agiresearch/A-mem](https://github.com/agiresearch/A-mem)
+
+### 3.1 A-Mem
+&emsp;&emsp;当前大型语言模型（LLM）智能体虽能借助外部工具处理复杂任务，但需记忆系统利用历史经验实现长期交互。现有记忆系统存在两大关键局限：
+- 结构僵化：依赖预定义存储结构、工作流中的存储节点和检索时机（如 MemGPT 的缓存架构、MemoryBank 的固定更新机制），即使引入图数据库（如 Mem0），也受限于预设模式，无法随知识演化建立创新关联。
+- 适应性差：面对开放域、多步骤推理等复杂任务时，固定结构难以灵活组织知识，导致长期交互效果差、跨场景泛化能力弱。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/a-mem-architecture.png)
+
+&emsp;&emsp;A-Mem（Agentic Memory）—— 一种基于 Zettelkasten（卡片盒笔记法）的动态智能体化记忆系统，实现无需预设操作的记忆组织与进化。A-Mem 灵感源于 Zettelkasten 的知识网络构建思路，以 “原子笔记 + 动态链接 + 持续进化” 为核心，具体包含 4 个关键组件：
+- **笔记构建（Note Construction）：结构化记忆表示**：
+  - 为每个新交互生成多维度原子笔记，捕捉显性信息与隐性语义，单个笔记\(m_i\)的结构为：
+    \(m_i=\{c_i, t_i, K_i, G_i, X_i, e_i, L_i\}\)，该设计确保每个笔记是 “自包含知识单元”，同时通过多模态属性（文本 + 向量）支持精细检索与链接。
+    - \(c_i\)：原始交互内容；\(t_i\)：时间戳；
+    - \(K_i\)（关键词）、\(G_i\)（标签）、\(X_i\)（上下文描述）：由 LLM 基于模板生成，提炼核心概念与语义；
+    - \(e_i\)：文本编码器（如 all-minilm-l6-v2）生成的稠密向量，用于相似度匹配；
+    - \(L_i\)：关联记忆的链接集合。
+- **链接生成（Link Generation）：自主建立记忆关联**。新笔记加入时，无需预设规则，自动与历史记忆建立语义链接，此过程兼顾效率（嵌入筛选降维）与语义深度（LLM 捕捉隐性关联，如因果、概念关联），实现记忆网络的 “有机生长”。
+  - 相似度筛选：计算新笔记嵌入\(e_n\)与所有历史笔记嵌入\(e_j\)的余弦相似度，筛选 top-k 相关记忆\(\mathcal{M}_{near}^n\)；
+  - LLM 决策链接：通过 LLM 分析 top-k 记忆与新笔记的共享属性（关键词、上下文），判断是否建立链接，并更新\(L_i\)（链接集合）
+- **记忆进化（Memory Evolution）：动态更新历史记忆**。新笔记不仅建立新链接，还会触发历史记忆的属性迭代，模拟人类学习的 “知识更新” 过程：
+   - 对 top-k 相关历史记忆\(m_j\)，LLM 分析新笔记与\(m_j\)的语义关联，动态更新\(m_j\)的上下文描述\(X_j\)、关键词\(K_j\)、标签\(G_j\)；
+   - 进化后的记忆\(m_j^*\)替换原记忆，使整个记忆网络随新经验持续优化，逐步形成高阶知识模式。
+- **相关记忆检索（Retrieve Relative Memory）：上下文感知召回**
+  - 生成查询嵌入\(e_q\)；
+  - 计算\(e_q\)与所有记忆嵌入的余弦相似度，召回 top-k 记忆\(\mathcal{M}_{retrieved}\)；
+  - 召回的记忆不仅包含直接相关项，还会通过\(L_i\)关联 “同链接集群” 的记忆，提供更完整的历史上下文。
+
+
+### 3.2 源码分析
+#### 3.2.1 笔记构建
+&emsp;&emsp;笔记（MemoryNote）的构建流程围绕AgenticMemorySystem的add_note方法展开，包含从初始化笔记、提取元数据到存储和进化触发的完整链路。
+&emsp;&emsp;**初始化笔记对象**。笔记通过`AgenticMemorySystem`进行管理，将用户输入的内容和可选参数（如标签、时间戳）封装为MemoryNote实例，生成唯一 ID。
+```python
+self.memory_system = AgenticMemorySystem(
+            model_name='all-MiniLM-L6-v2',
+            llm_backend="openai",
+            llm_model="gpt-4o-mini"
+        )
+
+def add_note(self, content: str, time: str = None, **kwargs) -> str:
+        """Add a new memory note"""
+        # Create MemoryNote without llm_controller
+        if time is not None:
+            kwargs['timestamp'] = time
+        note = MemoryNote(content=content, **kwargs)
+```
+
+&emsp;&emsp;公式\(m_i=\{c_i, t_i, K_i, G_i, X_i, e_i, L_i\}\)描述了单个记忆单元的结构化组成，其中每个参数对应记忆的特定属性。在代码中，这一结构通过MemoryNote类的定义直接体现，该类的属性与公式参数一一对应。
+```python
+class MemoryNote:
+    """A memory note that represents a single unit of information in the memory system.
+    
+    This class encapsulates all metadata associated with a memory, including:
+    - Core content and identifiers
+    - Temporal information (creation and access times)
+    - Semantic metadata (keywords, context, tags)
+    - Relationship data (links to other memories)
+    - Usage statistics (retrieval count)
+    - Evolution tracking (history of changes)
+    """
+    
+    def __init__(self, 
+                 content: str,
+                 id: Optional[str] = None,
+                 keywords: Optional[List[str]] = None,
+                 links: Optional[Dict] = None,
+                 retrieval_count: Optional[int] = None,
+                 timestamp: Optional[str] = None,
+                 last_accessed: Optional[str] = None,
+                 context: Optional[str] = None,
+                 evolution_history: Optional[List] = None,
+                 category: Optional[str] = None,
+                 tags: Optional[List[str]] = None):
+        """Initialize a new memory note with its associated metadata.
+        
+        Args:
+            content (str): The main text content of the memory
+            id (Optional[str]): Unique identifier for the memory. If None, a UUID will be generated
+            keywords (Optional[List[str]]): Key terms extracted from the content
+            links (Optional[Dict]): References to related memories
+            retrieval_count (Optional[int]): Number of times this memory has been accessed
+            timestamp (Optional[str]): Creation time in format YYYYMMDDHHMM
+            last_accessed (Optional[str]): Last access time in format YYYYMMDDHHMM
+            context (Optional[str]): The broader context or domain of the memory
+            evolution_history (Optional[List]): Record of how the memory has evolved
+            category (Optional[str]): Classification category
+            tags (Optional[List[str]]): Additional classification tags
+        """
+        # Core content and ID
+        self.content = content
+        self.id = id or str(uuid.uuid4())
+        
+        # Semantic metadata
+        self.keywords = keywords or []
+        self.links = links or []
+        self.context = context or "General"
+        self.category = category or "Uncategorized"
+        self.tags = tags or []
+        
+        # Temporal information
+        current_time = datetime.now().strftime("%Y%m%d%H%M")
+        self.timestamp = timestamp or current_time
+        self.last_accessed = last_accessed or current_time
+        
+        # Usage and evolution data
+        self.retrieval_count = retrieval_count or 0
+        self.evolution_history = evolution_history or []
+```
+
+| 公式参数 | 含义 | 代码中对应的属性 | 说明 |
+|---------|------|----------------|------|
+| \(c_i\) | 原始交互内容 | `self.content` | 直接存储用户输入的原始文本内容 |
+| \(t_i\) | 时间戳 | `self.timestamp` | 记录笔记创建时间，默认使用当前时间（格式：`%Y%m%d%H%M`） |
+| \(K_i\) | 关键词 | `self.keywords` | 由LLM分析内容后提取的核心概念（如`analyze_content`方法生成） |
+| \(G_i\) | 标签 | `self.tags` | 用于分类的标签（如“工作”“个人”等，由LLM生成） |
+| \(X_i\) | 上下文描述 | `self.context` | 对内容的语义概括，帮助理解笔记的背景和意义 |
+| \(L_i\) | 关联记忆的链接集合 | `self.links` | 存储与当前笔记相关的其他记忆ID，形成记忆网络 |
+| \(e_i\) | 稠密向量 | 由`ChromaRetriever`生成 | 代码中未直接存储在`MemoryNote`中，而是在存储到向量数据库时，通过`SentenceTransformer`模型将`content`转换为向量（对应检索时的嵌入） |
+
+&emsp;&emsp;**提取元数据**。笔记内容通过 LLM 提取关键词、标签、上下文描述等元数据，同时生成文本嵌入用于相似度匹配。其核心内容就是一段PE。
+```python
+def analyze_content(self, content: str) -> Dict:            
+    prompt = """Generate a structured analysis of the following content by:
+        1. Identifying the most salient keywords (focus on nouns, verbs, and key concepts)
+        2. Extracting core themes and contextual elements
+        3. Creating relevant categorical tags
+
+        Format the response as a JSON object:
+        {
+            "keywords": [
+                // several specific, distinct keywords that capture key concepts and terminology
+                // Order from most to least important
+                // Don't include keywords that are the name of the speaker or time
+                // At least three keywords, but don't be too redundant.
+            ],
+            "context": 
+                // one sentence summarizing:
+                // - Main topic/domain
+                // - Key arguments/points
+                // - Intended audience/purpose
+            ,
+            "tags": [
+                // several broad categories/themes for classification
+                // Include domain, format, and type tags
+                // At least three tags, but don't be too redundant.
+            ]
+        }
+
+        Content for analysis:
+        """ + content
+```
+
+&emsp;&emsp;**关联历史记忆与进化分析**。结合历史记忆判断新笔记是否需要进化（如建立关联、更新标签）。具体是在`add_note`时：
+```python
+# 在add_note中调用process_memory处理新笔记
+evo_label, note = self.process_memory(note)
+```
+
+&emsp;&emsp;**记忆存储与检索**。笔记的元数据和嵌入向量存储在向量数据库中，支持基于内容的快速检索。这一步也是在`add_note`时完成的。
+```python
+self.retriever.add_document(note.content, metadata, note.id)
+```
+
+#### 3.2.2 链接生成
+&emsp;&emsp;链接生成（Link Generation）的核心逻辑体现在`AgenticMemorySystem`的`process_memory`方法中（该方法在`add_note`流程中被调用），负责新笔记与历史记忆的关联建立。这一步主要也是LLM驱动的，其核心就是连接生成的PE和输出结构化格式，输出内容会将历史记忆连接起来。
+```python
+response_format={"type": "json_schema", "json_schema": {
+                "name": "response",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "should_evolve": {
+                            "type": "boolean"
+                        },
+                        "actions": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            }
+                        },
+                        "suggested_connections": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            }
+                        },
+                        "new_context_neighborhood": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            }
+                        },
+                        "tags_to_update": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            }
+                        },
+                        "new_tags_neighborhood": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    },
+                    "required": ["should_evolve", "actions", "suggested_connections", 
+                                "tags_to_update", "new_context_neighborhood", "new_tags_neighborhood"],
+                    "additionalProperties": False
+                },
+                "strict": True
+            }}
+```
+
+#### 3.2.3 记忆进化
+&emsp;&emsp;新笔记加入后，系统自动更新相关历史记忆的元数据（如上下文、关键词、标签），使记忆网络随新经验动态优化。记忆金华依赖连接生成，因为连接生成的PE中包含了记忆进化的信息，该输出也会决定是否进行进化。同时该输出中也有指明后续操作方向的信息。
+```python
+for action in actions:
+    if action == "strengthen":
+        suggest_connections = response_json["suggested_connections"]
+        new_tags = response_json["tags_to_update"]
+        note.links.extend(suggest_connections)
+        note.tags = new_tags
+    elif action == "update_neighbor":
+        new_context_neighborhood = response_json["new_context_neighborhood"]
+        new_tags_neighborhood = response_json["new_tags_neighborhood"]
+        noteslist = list(self.memories.values())
+        notes_id = list(self.memories.keys())
+    //省略部分代码
+```
+
+&emsp;&emsp;而进化的核心代码就是下面这段：
+```python
+for i in range(min(len(indices), len(new_tags_neighborhood))):
+    # Skip if we don't have enough neighbors
+    if i >= len(indices):
+        continue
+        
+    tag = new_tags_neighborhood[i]
+    if i < len(new_context_neighborhood):
+        context = new_context_neighborhood[i]
+    else:
+        # Since indices are just numbers now, we need to find the memory
+        # In memory list using its index number
+        if i < len(noteslist):
+            context = noteslist[i].context
+        else:
+            continue
+            
+    # Get index from the indices list
+    if i < len(indices):
+        memorytmp_idx = indices[i]
+        # Make sure the index is valid
+        if memorytmp_idx < len(noteslist):
+            notetmp = noteslist[memorytmp_idx]
+            notetmp.tags = tag
+            notetmp.context = context
+            # Make sure the index is valid
+            if memorytmp_idx < len(notes_id):
+                self.memories[notes_id[memorytmp_idx]] = notetmp
+```
+#### 3.2.4 相关记忆检索
+&emsp;&emsp;相关记忆检索（Retrieve Relative Memory）是 A-Mem 系统中根据查询内容高效召回相关记忆的核心流程，主要通过向量相似度匹配结合记忆网络的关联关系实现。相关记忆检索分为向量匹配和关联扩展两个阶段，对应论文中 “上下文感知召回” 的设计：
+- **向量匹配**：通过`ChromaRetriever.search`实现，核心是将查询文本和记忆内容转换为稠密向量（$e_q$和$e_i$），计算余弦相似度，召回 top-k 最相似的记忆。
+- **关联扩展**：返回直接相似的记忆，还通过记忆网络的关联关系（L_i）召回间接相关的记忆，避免 “检索孤岛”，提供更完整的上下文。
+  - 收集初始检索结果的 ID 及其links中记录的关联记忆 ID，形成扩展集合（expanded_ids）。
+  - 对扩展集合中的所有记忆重新计算与查询的相似度，按相似度排序后返回更全面的结果
+
+### 3.3 总结
+- 动态自主组织：摆脱固定存储结构的束缚，支持知识网络的自生长与演化；
+- 类人知识更新：记忆不再“写入即静态”，而是随新经验动态进化，模拟人类学习；
+- 全链路检索：结合向量相似度与链接传播，支持局部语义网络的整体回忆；
+- 开放域泛化：结构灵活，适用于多任务、多场景的长期交互。
