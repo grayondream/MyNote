@@ -201,4 +201,6 @@ def partition_past_key_values(self, past_key_states, past_value_states, hh_score
     non_heavy_hitter_key_states = torch.masked_select(past_key_states, ~mask_bottom).reshape(...)  # 需要压缩
     return (heavy_hitter_key_states, ...), (non_heavy_hitter_key_states, ...)
 ```
-## 4 Selective Context / “Compressing Context to Enhance Inference Efficiency”
+## 4 ZSMerge: Zero-Shot KV Cache Compression for Memory-Efficient Long-Context LLMs
+>论文地址:https://arxiv.org/pdf/2503.10714?
+>代码地址:[https://github.com/SusCom-Lab/ZSMerge](https://github.com/SusCom-Lab/ZSMerge)
