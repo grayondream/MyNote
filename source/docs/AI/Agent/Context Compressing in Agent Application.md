@@ -58,8 +58,63 @@ decoder_outputs = self.icae(inputs_embeds=decoder_input_embeddings)
 >代码：[https://github.com/snu-mllab/context-memory  ](https://github.com/snu-mllab/context-memory  )
 
 ### 2.1 模型
+&emsp;&emsp;现有LLM交互中面临几个问题：
+- 在在线交互（对话、个性化、多任务学习等）中，语言模型的上下文随着时间持续累积。Transformer 的 self-attention 机制对完整上下文（context）的 key/value (KV) 缓存与计算开销随着时间线性或更坏地增长，导致内存使用大、延迟高、吞吐低。
+- 现有的上下文压缩方法大多是针对固定长度 context（prompt / 演示集）设计的，不太适合上下文随着时间不断新增、需要动态处理的情形。
 
-![](https://github.com/snu-mllab/Context-Memory/blob/main/image/main.png  )
+&emsp;&emsp;论文提出了一种叫 Compressed Context Memory (CCM) 的机制，用来在 inference 时动态压缩累积的 context KV，节省资源，同时尽量保持性能。
+![](https://github.com/snu-mllab/Context-Memory/blob/main/image/main.png?raw=true)
+
+&emsp;&emsp;CCM提出动态压缩上下文内存框架，通过持续压缩积累的 KV 对，在有限内存中支持在线推理，核心包含 3 大模块：
+- 上下文压缩机制：基于⟨COMP⟩token 的 KV 压缩
+  - 压缩对象：直接压缩注意力 KV 对（而非 token 嵌入），兼容 Transformer 层内并行性；
+  - 专用压缩 token：引入⟨COMP⟩token，训练模型将当前新增上下文\(c(t)\)与历史压缩内存\(Mem(t-1)\)的信息，压缩到⟨COMP⟩token 的 KV 对中，得到压缩特征\(h(t) \in \mathbb{R}^{2 \times L \times d}\)（L为模型层数，d为隐藏层维度）；
+  - 压缩过程：\(h(t) = g_{comp}(Mem(t-1), c(t))\)，仅需前向计算，无需递归。
+- 动态内存更新，设计可微、可并行的内存更新函数\(g_{update}\)，适配不同场景：
+  - CCM-concat：将新的 h(t) 直接连接到旧的 memory 中，memory 随时间增长。
+  - CCM-merge：将新的 h(t) 与旧 memory 按加权平均合并（例如算术平均或指数移动平均），memory 保持固定大小。
+- 高效训练：并行化 + 条件 LoRA
+  - 并行化训练：递归压缩过程 “展开” 为单轮并行前向计算，避免递归导致的训练耗时与梯度传播误差，训练速度比 RMT/AutoCompressor 快 7 倍；
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/cmm_KV_PARALLEL.png)
+  - 条件 LoRA:为了训练压缩模块，引入一个 conditional LoRA adapter，只在 ⟨COMP⟩ token 上作用，不修改原模型的主参数 θ，而新增一些低秩参数 ∆θ 用来学习压缩操作。这样避免 overfitting 模型在没有 context 的情况下也能“猜”输出的问题。
+
+&emsp;&emsp;推理阶段：
+- 在实际用的时候，随着新 context 的到来，不断用压缩函数更新 memory，并在生成响应时只用 memory + 当前输入，而不是整个历史 context。这样 attention 的计算成本和内存成本都大幅下降。
+arXiv
+- 在 streaming 的设置里，还结合 sliding window（最近的上下文窗口）与压缩 oldest tokens 的操作来控制 KV cache 的大小。
 
 ### 2.2 源码分析
-润色下
+&emsp;&emsp;在注意力机制中通过 sum_mask 和 sum_attn_mask 实现键值对的动态合并与压缩。
+```python
+# 合并压缩键值对（用于动态更新内存）
+if sum_attn_mask is not None:
+    sum_attn_mask = sum_attn_mask.to(key_states.dtype)
+    # 计算压缩后的键值平均值
+    key_comp_avg = torch.matmul(sum_attn_mask.unsqueeze(1), key_states)
+    value_comp_avg = torch.matmul(sum_attn_mask.unsqueeze(1), value_states)
+    # 用掩码控制原始键值与压缩键值的融合
+    no_sum_mask = (1 - sum_mask).to(key_states.dtype).unsqueeze(1).unsqueeze(-1)
+    key_states = no_sum_mask * key_states + key_comp_avg  # 动态更新key内存
+    value_states = no_sum_mask * value_states + value_comp_avg  # 动态更新value内存
+```
+
+&emsp;&emsp;在注意力层中，q_proj、k_proj、v_proj、o_proj 均使用 LinearMask，并在 forward 中传入 comp_mask 控制 LoRA 的条件激活：
+```python
+class LinearMask(nn.Linear):
+    """Linear function with compression mask as an argument. 
+       The mask is used for conditional LoRA at src/peft_custom/lora.py-Linear()-forward().
+    """
+
+    def forward(self, input: Tensor, comp_mask=None) -> Tensor:
+        return F.linear(input, self.weight, self.bias)
+
+
+self.q_proj = LinearMask(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = LinearMask(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.v_proj = LinearMask(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.o_proj = LinearMask(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.rotary_emb = LlamaRotaryEmbedding(self.head_dim,
+                                               max_position_embeddings=self.max_position_embeddings)
+```
+
+## 3 
