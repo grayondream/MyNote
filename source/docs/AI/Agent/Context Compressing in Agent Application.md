@@ -117,4 +117,88 @@ self.q_proj = LinearMask(self.hidden_size, self.num_heads * self.head_dim, bias=
                                                max_position_embeddings=self.max_position_embeddings)
 ```
 
-## 3 
+## 3 LoCoCo: Dropping In Convolutions for Long Context Compression
+>论文地址：[https://arxiv.org/pdf/2406.05317](https://arxiv.org/pdf/2406.05317)
+>代码地址：[https://github.com/VITA-Group/LoCoCo](https://github.com/VITA-Group/LoCoCo)
+
+### 3.1 模型
+&emsp;&emsp;大型语言模型（LLMs）在文本生成、代码合成、问答等任务中表现优异，但处理长上下文序列时面临KV 缓存内存瓶颈：Transformer 的注意力计算需缓存键（Key）和值（Value），其大小随上下文长度线性增长，易耗尽 GPU 内存。现有方法存在明显缺陷：
+- StreamingLLM：通过 “注意力 sink” 和局部窗口限制 receptive field，会丢失中间上下文（“lost in the middle”），无法利用全序列信息；
+- H₂O：基于注意力分数启发式丢弃 KV 对，难以扩展到训练上下文长度以外的序列；
+- LongLoRA：需修改预训练 LLM 架构，且在小上下文场景下性能受损；
+- 注意力近似方法（如稀疏注意力、低秩近似）：无法缓解推理阶段的 KV 缓存爆炸问题。
+
+&emsp;&emsp;LoCoCo 的核心目标是用固定大小 KV 缓存实现长上下文高效处理，兼顾推理与微调阶段，且支持 “即插即用”（无需修改原有 LLM 架构），核心设计包括三部分：
+- 数据驱动的自适应 KV 融合:区别于传统 “启发式丢弃 KV 对”，LoCoCo 通过1D 卷积核动态计算混合权重，融合历史 KV 缓存与新输入 token，最小化上下文信息丢失，保证注意力建模准确性。
+- 分段注意力与卷积压缩：
+  - 分段注意力（Segment-Level Attention）:将长序列划分为长度为 B 的段，逐段处理：
+    - 每段生成当前的 Q、K、V；
+    - 注意力计算时结合历史 KV 缓存与当前段 KV；
+    - 若累计 KV 长度超过固定缓存大小 M，触发卷积压缩。
+  - 卷积 token 压缩器,通过 1D 卷积层生成融合权重:
+    - 输入：历史 KV 缓存（维度 d×M）与当前段 KV（维度 d×B）拼接，共 2d×(M+B) 维度；
+    - 卷积层输出 M×(M+B) 维度的权重矩阵 W，经归一化后得到历史 KV 的权重\(\tilde{w}_{i,j}\)和当前 KV 的权重\(w_{i,j}\)；
+    - 融合更新：\(\tilde{k}_i = \sum_j w_{i,j}k_j + \sum_j \tilde{w}_{i,j}\tilde{k}_j\)（V 的更新同理），最终缓存大小保持为 M。
+- 即插即用集成:
+  - 推理阶段：在预训练 LLM 的注意力层顶部插入卷积压缩器，仅用少量校准数据微调压缩器，预训练权重不变，可随时移除压缩器切换回全序列模式；
+  - 微调阶段：结合位置插值（positional interpolation）扩展上下文，插入卷积压缩器并添加 LoRA 适配器，仅微调压缩器、LoRA 及嵌入 / 归一化层，无需全量微调。
+
+### 3.2 源码分析
+&emsp;&emsp;通过卷积层动态学习融合权重，结合残差权重实现自适应融合。
+- 卷积压缩器定义：
+```python
+layers = []
+hidden_size, in_size = self.mem_compress * args.expand, dim_kv  # dim_kv = 2*head_dim（K+V）
+for i in range(args.n_convlayer):
+    if i != 0:
+        in_size = hidden_size
+    if i == args.n_convlayer-1:
+        hidden_size = self.mem_compress  # 最终输出mem_compress个权重
+    # 1D卷积层（论文中的核心组件，用于学习融合权重）
+    layers.append(nn.Conv1d(
+        in_channels=in_size, 
+        out_channels=hidden_size, 
+        kernel_size=args.kernel_size, 
+        padding=int((args.kernel_size-1)//2)  # 保持序列长度
+    ))
+    if args.hidden_act is not None:
+        layers.append(ACT2FN[args.hidden_act])  # 非线性激活（如ReLU）
+self.layers = nn.Sequential(*layers)  # 卷积网络用于生成融合权重
+```
+- 自适应权重融合（结合卷积权重与残差权重）：
+```python
+# 卷积网络生成权重（数据驱动部分）
+x = torch.cat([non_heavy_hitter_key_states, non_heavy_hitter_value_states], dim=-1)  # 拼接K和V（2d通道）
+x = rearrange(x, 'b h s d -> (b h) d s', b=bsz, h=n_head)  # 适配Conv1d输入格式
+x = self.layers(x)  # 卷积计算权重
+x = nn.functional.softmax(x, dim=-1)  # 归一化（论文公式7）
+weight = rearrange(x, '(b h) m s -> b h m s', b=bsz)  # 恢复维度
+
+# 融合残差权重（确保重要信息不丢失）
+residual_weight = self.make_residual_weight(non_heavy_hitter_hh_scores)  # 基于注意力分数的残差权重
+weight = residual_weight * (1-self.normalizer) + weight * self.normalizer  # 自适应融合（论文未明确但代码新增的稳定机制）
+```
+
+&emsp;&emsp;模块化设计`memory_saver`，通过独立接口处理 KV 缓存，不侵入原模型结构。
+&emsp;&emsp;通过固定缓存大小、划分重令牌与非重令牌，实现低内存开销的长序列处理。
+- 固定缓存大小控制
+```python
+self.mem_size = args.mem_size  # 总缓存大小（固定值，如512）
+self.mem_compress = int(args.mem_size * (1-args.hh_keep_rate))  # 可压缩部分大小
+self.keep_hh_size = self.mem_size - self.mem_compress  # 保留的重令牌大小
+```
+- 重令牌保留 + 非重令牌压缩（降低计算开销）
+```python
+def partition_past_key_values(self, past_key_states, past_value_states, hh_scores):
+    # 1. 划分重令牌（heavy hitter）：保留注意力分数高的token
+    _, hh_idxs = torch.topk(hh_scores[..., :-self.local_len], self.keep_hh_size-self.local_len, dim=-1)
+    mask_bottom = zeros.scatter(-1, hh_idxs, True)  # 重令牌掩码
+    if self.local_len > 0:
+        mask_bottom[:, :, -self.local_len:] = True  # 额外保留最近的local_len个token（局部性保障）
+    
+    # 2. 分离重令牌KV和非重令牌KV
+    heavy_hitter_key_states = torch.masked_select(past_key_states, mask_bottom).reshape(...)  # 直接保留，不压缩
+    non_heavy_hitter_key_states = torch.masked_select(past_key_states, ~mask_bottom).reshape(...)  # 需要压缩
+    return (heavy_hitter_key_states, ...), (non_heavy_hitter_key_states, ...)
+```
+## 4 Selective Context / “Compressing Context to Enhance Inference Efficiency”
