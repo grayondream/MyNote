@@ -8,7 +8,7 @@
    :caption: 图形渲染内容
 
    图像处理/index
-   渲染g/index
+   渲染/index
    
 
  
