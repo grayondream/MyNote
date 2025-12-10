@@ -7,8 +7,7 @@
    :maxdepth: 1
    :caption: 图形渲染内容
 
-   图像处理/index
-   渲染g/index
+   Vulkan学习——渲染3D模型
    
 
  
