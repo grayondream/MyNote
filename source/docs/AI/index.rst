@@ -6,5 +6,6 @@ Ai
    :caption: Ai
 
    Agent/index
-   AI Infra/index
+   高性能计算/index
+   大模型/index
    

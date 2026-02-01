@@ -1,9 +1,9 @@
-Ai Infra
+高性能计算
 ======================
 
 .. toctree::
    :maxdepth: 1
-   :caption: Ai Infra
+   :caption: 高性能计算
 
    Nvidia显卡架构
    
