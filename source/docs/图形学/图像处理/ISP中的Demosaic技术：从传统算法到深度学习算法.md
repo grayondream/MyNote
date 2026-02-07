@@ -16,6 +16,7 @@
 
 ### 1.2 Demosaic技术
 &emsp;&emsp;Demosaic的核心是从单通道数据中估计出缺失的颜色通道信息，是一个欠采样重建问题。设全分辨率彩色图像为\(S=(R, G, B)\)，其对应的拜耳模式采样数据为\(z_{S}=(z_{R}, z_{G}, z_{B})\)，则去马赛克问题包含两个相互关联的插值任务：一是梅花形网格插值，即补全绿色通道中缺失的半数像素；二是矩形网格插值，即补全红、蓝通道中缺失的四分之三像素。尽管这两类插值问题均可通过双线性插值、边缘导向插值等经典图像插值技术解决，但去马赛克的核心挑战在于**联合利用通道内与通道间的相关性**，从而降低图像重建误差。
+![](https://upload.wikimedia.org/wikipedia/commons/thumb/6/6d/Colorful_spring_garden_Bayer_%2B_RGB.png/250px-Colorful_spring_garden_Bayer_%2B_RGB.png)
 **空间域统计**
 &emsp;&emsp;已有多项研究通过实验方法对颜色通道间的相关性进行建模，相关研究涵盖小波域与空间域等不同维度。这些研究的核心结论可归纳为**恒色调假设**，该假设也是绝大多数去马赛克算法的理论基础。在色彩科学中，色调是感知色彩的三大属性之一，另外两个属性为明度和饱和度(色调通常可由颜色分量的比值定义)。在恒色调假设中，颜色通道间的相关性通过色差或色比函数的平滑性来表征。尽管这一启发式假设在相关文献中被广泛应用，但需注意的是，恒色调假设的有效性高度依赖于数据集特性。
 
@@ -107,8 +108,15 @@ $$
 #### 1.3.5 主观评价
 
 &emsp;&emsp;Demosaic算法的主观评价是以人类视觉感知特性为核心、遵循标准化测试规范的综合体验验收，是算法落地各类实际场景的最终判定标准，其通过专业组与普通组结合的双盲测试形式，在标准校色显示和中性光照环境下，对覆盖人像、风景、纹理等Demosaic典型挑战场景的测试图进行评价，核心围绕伪影可见度、色彩还原感知、细节视觉表现三大关键维度并结合整体观感做加权评分，重点关注摩尔纹、拉链伪影等各类伪影的视觉干扰性、色彩贴合现实场景的自然度与一致性、发丝/边缘等高频细节的可分辨性与清晰性，而非单纯对应客观量化指标，最终以贴合人眼真实观察体验、无视觉不适且适配实际使用场景为评价核心，弥补客观指标无法覆盖的人类视觉非线性感知特性偏差。
+- 模糊：图像的高频信息被削弱，导致细节损失。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/image_process_algo_isp_digit_image_blur.png)
+- 拉链效应：在边缘区域出现交替的亮暗条纹，类似拉链的形状。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/image_process_algo_isp_digit_image_zipper.png)
+- 伪彩色：图像在 Demosaic 过程中，由于缺少对颜色信息的处理，导致颜色通道之间存在伪影。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/image_process_algo_isp_digit_image_false_color.jpg)
+- 混叠：当 Demosaic 过程中，由于采样点与相邻像素的颜色值差异较大，导致混叠现象的出现。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/image_process_algo_isp_digit_image_aliaing.jpg)
 
-![](https://upload.wikimedia.org/wikipedia/commons/thumb/6/6d/Colorful_spring_garden_Bayer_%2B_RGB.png/250px-Colorful_spring_garden_Bayer_%2B_RGB.png)
 
 ## 2 传统Demosaic算法
 ## 3 深度学习Demosaic算法
