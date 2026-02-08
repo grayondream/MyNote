@@ -280,11 +280,54 @@ $$
 
 &emsp;&emsp;样条插值Demosaicing的优势在于其能够更好地保持图像的边缘连续性，减少伪影，同时提供较高的插值精度。然而，其计算复杂度较高，尤其是在处理大尺寸图像时，可能需要更多的计算资源和时间。此外，样条插值对噪声较为敏感，可能需要结合预处理步骤以提高鲁棒性。总体而言，样条插值Demosaicing适用于对图像质量要求较高且计算资源允许的场景。
 
-#### 2.1.3 简单的实验
+#### 2.1.3 总结
 &emsp;&emsp;仅仅使用OpenCV自带的双线性插值Demosaic算法进行实验，能够清晰的看到明显的拉链和伪色问题。
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/image_process_algo_isp_digit_image_other_bilinear_ea.png)
 
-### 2.2 边缘导向算法
+&emsp;&emsp;采用插值方法实现Demosaic的核心原理具有一致性，本质上都是通过对图像中缺失的色彩像素进行合理估算，还原出完整的彩色图像。但在实际工程应用中，需综合考量多方面因素以提升Demosaic的效果，确保还原图像的色彩准确性和视觉一致性，例如色度、色相的均衡性，此外还会从不同的色彩维度切入优化，比如CYMK色彩空间等角度，结合不同色彩模型的特性调整插值策略，适配各类实际应用场景的需求。
+
+### 2.2 边缘判别算法
+#### 2.2.1 绿通道分离的自适应梯度法
+&emsp;&emsp;论文：[Method of color interpolation in a single sensor
+color camera using green channel separation](https://www.researchgate.net/profile/Philip-Ogunbona/publication/3948721_Method_of_color_interpolation_in_a_single_sensor_color_camera_using_green_channel_separation/links/00b4952a7ad73c8852000000/Method-of-color-interpolation-in-a-single-sensor-color-camera-using-green-channel-separation.pdf?_tp=eyJjb250ZXh0Ijp7ImZpcnN0UGFnZSI6InB1YmxpY2F0aW9uIiwicGFnZSI6InB1YmxpY2F0aW9uIn19)
+
+&emsp;&emsp;算法针对单传感器彩色相机Bayer阵列下，因不同色彩通道像素串扰引发的绿平面插值块效应、细节区域伪色扩散问题设计，核心思想是**保留原始绿像素数据的前提下，将绿通道拆分为与红、蓝通道分别高相关的双平面，利用通道间相关性实现精准插值，同时结合梯度选择与拉普拉斯校正，避免边缘平滑与噪声恶化**，从根源上解决跨通道串扰带来的图像伪影问题。
+
+1. **Bayer阵列串扰根源**：Bayer阵列中绿像素分为与红像素相邻的$G_r$和与蓝像素相邻的$G_b$，部分色彩下$G_r$与$G_b$值差异显著，叠加像素水平邻域的响应串扰，红、蓝通道的插值误差会直接导致插值图像出现块效应和伪色扩散，这也是传统单绿平面插值方法的核心缺陷。
+2. **通道相关性利用原理**：红通道与$G_r$、蓝通道与$G_b$存在天然高相关性，将绿通道拆分为偏红的$G_R$平面和偏蓝的$G_B$平面后，可分别作为红、蓝通道插值的参考，大幅降低跨通道插值的误差传递，同时避免修改或丢弃原始绿像素数据，防止场景信息丢失。
+3. **梯度选择与校正原理**：插值时优先选择梯度最小的水平/垂直方向，避免跨边缘插值导致的图像锐度丢失；同时通过红/蓝通道的二阶拉普拉斯梯度对绿像素插值基础值做校正，匹配色彩通道的变化趋势。
+    - 绿像素基础插值值为选定梯度方向上两个绿像素的平均值：$$G_{avg }=\frac{G_{h o}+G_{h 1}}{2}$$
+    - 红通道二阶拉普拉斯梯度校正值（加权1/4以匹配绿通道相对偏移）：$$\delta=\left(2 R_{0}-R_{-1}-R_{+1}\right) \frac{1}{4}$$
+    - 蓝通道对$G_B$平面的校正公式与红通道原理一致，校正时需判断红/绿、蓝/绿通道梯度变化方向，梯度符号相反时将校正值从基础插值值中减去，符号相同时则相加。
+4. **最终绿通道融合原理**：将插值后的$G_R$、$G_B$平面取平均得到最终绿通道，兼顾红、蓝通道的相关性特征，公式为：$$G_{final} = \frac{G_R+G_B}{2}$$
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/image_process_algo_isp_digit_image_color_interpolation_split_channel_cat.png)
+
+&emsp;&emsp;算法全程保留原始绿像素数据，分为**绿通道双平面构建**、**双绿平面独立插值**、**红/蓝通道关联插值**、**RGB通道最终融合**四个步骤，流程清晰且可与其他插值方案兼容：
+1. **绿通道双平面构建**：采用中值滤波器，先以4个$G_r$值和1个$G_b$值替换原始$G_b$，生成偏红的$G_R$平面；再交换$G_r$与$G_b$的角色重复中值滤波操作，生成偏蓝的$G_B$平面，原始绿像素会完整保留在$G_R$或$G_B$平面中。
+2. **双绿平面独立插值**：采用带二阶拉普拉斯校正的双线性插值，分别对$G_R$、$G_B$平面补全缺失像素；先计算垂直梯度$\Delta v$和水平梯度$\Delta h$，选择梯度更小的方向插值，若待插值区域无对应红/蓝像素参考，则直接取绿像素平均值作为插值结果。
+3. **红、蓝通道关联插值**：利用$G_R-R$、$G_B-B$的高相关性，以插值后的$G_R$平面边缘信息为参考完成红通道插值，以$G_B$平面边缘信息为参考完成蓝通道插值，实现噪声有效抑制。
+4. **RGB通道最终融合**：将插值后的红、蓝通道，与$G_R$、$G_B$平面的平均值进行融合，得到最终的彩色插值图像，即$RGB=(R, \frac{G_R+G_B}{2}, B)$。
+
+&emsp;&emsp;优点：
+1. **伪影抑制效果显著**：在McBeth色卡和自然图像测试中，绿通道伪色值平均降低54%，有效解决了块效应和细边缘区域的伪色扩散问题，契合人眼对绿通道高敏感度的视觉特性，且平滑区域和细边缘区域均能实现良好的伪色抑制。
+2. **噪声抑制能力突出**：相比带边缘检测的双线性插值，绿通道可视噪声降低42.1%~64.8%，红、蓝通道也实现0.7%~3.78%、1.75%~3.17%的噪声抑制，且噪声抑制过程中不会影响图像结构的边缘锐度。
+3. **原始数据无损失**：绿通道分离和插值全程不修改、不丢弃原始绿像素数据，避免了传统方法过度平滑导致的场景信息丢失，保留了图像的原始细节特征。
+4. **兼容性与通用性强**：绿通道分离的核心方法可与其他带边缘检测、模式识别或绿平面校正的插值方案结合，无需对原有插值框架做大幅修改，适配性较高。
+5. **边缘与细结构保留完好**：通过梯度方向选择避免跨边缘插值，结合色彩通道的梯度校正，有效保留了图像的细结构和边缘锐度，解决了传统低通滤波方法移除细结构的问题。
+
+&emsp;&emsp;缺点：
+1. **计算量略有增加**：相比传统单绿平面插值，新增了中值滤波、双绿平面梯度计算、双平面独立插值和融合等步骤，对硬件算力有轻微要求，在低算力嵌入式设备上的实时性会受一定影响。
+2. **部分区域插值精度受限**：在Bayer阵列的蓝通道行中，因无红像素参考，无法对$G_R$平面做二阶拉普拉斯梯度校正，只能采用平均值插值，该区域的绿通道插值精度略有下降。
+3. **红、蓝通道优化效果不均衡**：算法对绿通道的伪影和噪声抑制效果大幅优于红、蓝通道，红、蓝通道的噪声抑制幅度较小，对红、蓝通道的细节噪声优化仍有提升空间。
+4. **需结合后续色彩处理**：实验中未对图像进行伽马校正和色彩校正，仅验证了插值方案的性能，实际工程应用中需结合后续的色彩校正、伽马校正步骤，才能实现最佳视觉效果。
+
+#### 2.2.2 Adam-Hamilton梯度自适应插值
+&emsp;&emsp;论文：[Self-similarity driven color demosaicking](http://dev.ipol.im/~morel/Dossier_MVA_2010_Cours_Transparents_Documents/Cours_9_Document_demosaicking.pdf)
+
+#### 2.2.3 自适应相似度选边插值法
+&emsp;&emsp;论文[Adaptive Homogeneity - Directed Demosaicing Algorithm](https://www.photoactivity.com/Pagine/Articoli/006NewDCRaw/hirakawa03adaptive.pdf)
+
 
 ### 2.3 频域方法
 
@@ -298,4 +341,12 @@ $$
 - [ISP-Guide](https://github.com/mikeroyal/ISP-Guide)
 - [Color filter array](https://en.wikipedia.org/wiki/Color_filter_array)
 - [Demosaicing](https://en.wikipedia.org/wiki/Demosaicing  )
-- 
+- [样条插值](https://zh.wikipedia.org/wiki/%E6%A0%B7%E6%9D%A1%E6%8F%92%E5%80%BC)
+- [From photosites to pixels (iv) – the demosaicing process](https://pixelcraft.photo.blog/2023/09/06/from-photosites-to-pixels-iv-the-demosaicing-process/)
+- [Image Demosaicing: Bilinear Interpolation VS High-Quality Linear Interpolation](https://medium.com/swlh/image-demosaicing-bilinear-interpolation-vs-high-quality-linear-interpolation-5fd2268c4c7a)
+- [RAW Bayer pixel formats](https://www.1stvision.com/cameras/IDS/IDS-manuals/en/basics-raw-bayer-pixel-formats.html)
+- [Malvar-He-Cutler Linear Image Demosaicking](https://www.ipol.im/pub/art/2011/g_mhcd/article.pdf)
+- [Method of color interpolation in a single sensor
+color camera using green channel separation](https://www.researchgate.net/profile/Philip-Ogunbona/publication/3948721_Method_of_color_interpolation_in_a_single_sensor_color_camera_using_green_channel_separation/links/00b4952a7ad73c8852000000/Method-of-color-interpolation-in-a-single-sensor-color-camera-using-green-channel-separation.pdf?_tp=eyJjb250ZXh0Ijp7ImZpcnN0UGFnZSI6InB1YmxpY2F0aW9uIiwicGFnZSI6InB1YmxpY2F0aW9uIn19)
+- [Self-similarity driven color demosaicking](http://dev.ipol.im/~morel/Dossier_MVA_2010_Cours_Transparents_Documents/Cours_9_Document_demosaicking.pdf)
+- [Adaptive Homogeneity - Directed Demosaicing Algorithm](https://www.photoactivity.com/Pagine/Articoli/006NewDCRaw/hirakawa03adaptive.pdf)
