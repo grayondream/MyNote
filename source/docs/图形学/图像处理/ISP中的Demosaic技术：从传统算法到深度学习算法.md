@@ -14,9 +14,13 @@
 
 &emsp;&emsp;多说一句，Byer Filter是最常用的采样模式，也就意味着在其他场景也存在其他类型的采样模型，比如X-Trans Filter、EXR Filter等，详细细节可以参考[Bayer_filter](https://en.wikipedia.org/wiki/Bayer_filter)。
 
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/image_process_algo_isp_digit_image_other_pattern.png)
+
 ### 1.2 Demosaic技术
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/image_process_algo_isp_digit_image_sensor_pipeline.png)
 &emsp;&emsp;Demosaic的核心是从单通道数据中估计出缺失的颜色通道信息，是一个欠采样重建问题。设全分辨率彩色图像为\(S=(R, G, B)\)，其对应的拜耳模式采样数据为\(z_{S}=(z_{R}, z_{G}, z_{B})\)，则去马赛克问题包含两个相互关联的插值任务：一是梅花形网格插值，即补全绿色通道中缺失的半数像素；二是矩形网格插值，即补全红、蓝通道中缺失的四分之三像素。尽管这两类插值问题均可通过双线性插值、边缘导向插值等经典图像插值技术解决，但去马赛克的核心挑战在于**联合利用通道内与通道间的相关性**，从而降低图像重建误差。
-![](https://upload.wikimedia.org/wikipedia/commons/thumb/6/6d/Colorful_spring_garden_Bayer_%2B_RGB.png/250px-Colorful_spring_garden_Bayer_%2B_RGB.png)
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/image_process_algo_isp_digit_image_demosaicing_cfa.png)
+
 **空间域统计**
 &emsp;&emsp;已有多项研究通过实验方法对颜色通道间的相关性进行建模，相关研究涵盖小波域与空间域等不同维度。这些研究的核心结论可归纳为**恒色调假设**，该假设也是绝大多数去马赛克算法的理论基础。在色彩科学中，色调是感知色彩的三大属性之一，另外两个属性为明度和饱和度(色调通常可由颜色分量的比值定义)。在恒色调假设中，颜色通道间的相关性通过色差或色比函数的平滑性来表征。尽管这一启发式假设在相关文献中被广泛应用，但需注意的是，恒色调假设的有效性高度依赖于数据集特性。
 
@@ -119,9 +123,179 @@ $$
 
 
 ## 2 传统Demosaic算法
+&emsp;&emsp;实际的ISP工程链路中如上面的图所示，除了Demosaic算法还包含预处理（坏点校正、白平衡）、伪影抑制、后处理（色彩校正矩阵、降噪和锐化）等流程，这里重点关注Demosaic算法本身，其他流程后续有机会再展开介绍。Demosaic算法的核心挑战在于**联合利用通道内与通道间的相关性**，从而降低图像重建误差。因此传统算法的基本思路都是从邻域空间或者频域借用信息来恢复缺失的颜色通道信息。
+&emsp;&emsp;在了解具体的实现之前，先准备一下需要的素材。素材的准备比较简单直接用opencv将一张彩色图像转换为拜耳模式的马赛克图像即可，代码如下：
+```python
+def generate_bayer_bggr(color_img):
+    """
+    从彩色图像生成BGGR格式拜尔阵列（单通道）
+    :param color_img: BGR格式彩色图像（numpy数组，uint8）
+    :return: BGGR拜尔阵列（单通道，uint8）
+    """
+    h, w = color_img.shape[:2]
+    bayer_img = np.zeros((h, w), dtype=np.uint8)
+    
+    # BGGR规则填充：
+    # B: 偶行偶列 | G: 偶行奇列 + 奇行偶列 | R: 奇行奇列
+    bayer_img[0::2, 0::2] = color_img[0::2, 0::2, 0]  # B通道（偶行偶列）
+    bayer_img[0::2, 1::2] = color_img[0::2, 1::2, 1]  # G通道（偶行奇列）
+    bayer_img[1::2, 0::2] = color_img[1::2, 0::2, 1]  # G通道（奇行偶列）
+    bayer_img[1::2, 1::2] = color_img[1::2, 1::2, 2]  # R通道（奇行奇列）
+    return bayer_img
+```
+
+&emsp;&emsp;采样的结果如下，由于有两个绿色通道，因此以RGB形式显示总体感觉图片发绿。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/image_process_algo_isp_digit_image_sample_bayer_image.png)
+
+### 2.1 基础差值算法
+#### 2.1.1 线性差值
+&emsp;&emsp;Demosaicing的核心任务：对每个像素位置，补全其缺失的另外两个颜色通道的像素值（如R位置补G、B，G位置补R/B，B位置补R、G），双线性差值和 三次插值是两种经典的基于空间域插值的Demosaicing算法，均通过利用像素的空间连续性和局部相关性来估计缺失的颜色信息。
+**双线性插值Demosaicing（Bilinear Demosaicing）**
+双线性插值核心思想是：**对每个缺失的颜色通道，取该位置周围**2×2**邻域内同色像素的加权平均值（等权时为算术平均）**，利用像素的空间连续性恢复缺失值。 该方法的核心假设：**图像中局部像素的色彩值是连续变化的**，适合平坦、无细节的图像区域。
+
+&emsp;&emsp;按像素类型分三类处理，所有插值均基于**2×2最小邻域**：
+1. 绿色（G）像素的补全（R/B位置补G）
+- R位置（如坐标(i,j)为R）的G值：取其上下左右4个G像素的**算术平均**（2×2邻域内的两个水平G+两个垂直G，等权）；
+- B位置的G值：与R位置补G逻辑完全一致，取邻域4个G像素的平均。
+2. 红色（R）像素的补全（G/B位置补R）
+- 水平/垂直对齐的G位置（如R右侧的G）：取其左右/上下两个R像素的平均；
+- B位置（无直接邻域R）：取其**2×2邻域内4个对角R像素**的算术平均。
+3. 蓝色（B）像素的补全（G/R位置补B）：与R补全逻辑**完全对称**：G位置取邻域两个B平均，R位置取4个对角B平均。
+
+- **计算复杂度**：O(W×H)（W/H为图像宽高），无复杂运算，适合硬件实时实现（如相机片上处理）；
+- **画质问题**：存在明显的**色彩模糊、细节丢失、伪影（如拉链伪影）**——因为2×2邻域无法捕捉图像的边缘/纹理方向，强行平均会抹平细节，且R/B通道插值仅用对角像素，易出现色彩错位；
+- **优势**：算法简单、耗时短，是入门级Demosaicing的基础方案。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/image_process_algo_isp_digit_image_demosaicing_bi.png)
+
+#### 2.1.2 三次插值Demosaicing（Cubic Interpolation Demosaicing）*
+&emsp;&emsp;三次插值是**双线性插值的进阶版**，核心思想是：**扩大插值邻域至**4×4**，采用**三次多项式核（Cubic Kernel）**计算邻域内同色像素的**非等权加权平均值**，权重随像素到目标位置的**空间距离**衰减，同时兼顾图像的边缘连续性**。 该方法的核心改进：突破2×2邻域的限制，通过4×4大邻域和距离加权，更精准地拟合图像的局部灰度变化，减少模糊和伪影，是平衡**画质**和**计算量**的经典方案。
+&emsp;&emsp;三次插值的权重由**三次多项式**定义，主流为**Bicubic核**（双三次核，适用于2D空间插值），核心形式为（以距离x为自变量，x为像素间的欧氏距离，取值0~3）：
+$$
+W(x) =
+\begin{cases}
+(1.5|x| - 2.5)|x|^2 + 1, & 0 \le |x| < 1 \\
+(-0.5|x| + 2.5)|x|^2 - 4|x| + 2, & 1 \le |x| < 2 \\
+0, & |x| \ge 2
+\end{cases}
+$$
+**权重规律**：目标像素与邻域像素的距离越近，权重越大；距离≥2时，权重为0（即4×4邻域外的像素无贡献），既保证插值精度，又控制计算量。
+&emsp;&emsp;核心插值步骤（以RGGB阵列为核心），整体逻辑与双线性一致（补全每个位置的缺失通道），但**邻域扩大为4×4**，且**权重由三次核计算**，分三步处理：
+1. 绿色（G）通道补全（优先级最高，因为G占50%，决定图像亮度）
+对R/B位置的G值，取其**4×4邻域内所有G像素**，计算每个G像素到目标位置的空间距离x，通过三次核得到权重W(x)，最终G值为：
+$$
+G_{target} = \frac{\sum (G_i \times W(x_i))}{\sum W(x_i)}
+$$
+（归一化权重，避免权重和不为1导致的亮度偏移）
+
+2. 红色（R）/蓝色（B）通道补全
+G通道补全后，以**已恢复的G通道**为亮度参考（利用RGB通道的**色度相关性**：R/G、B/G的比值在局部更连续），对R/B通道进行4×4邻域的三次加权插值：
+- 对G/B位置的R值，取4×4邻域内所有R像素，按三次核计算权重并加权平均；
+- 对R/G位置的B值，与R通道对称，取4×4邻域内所有B像素加权平均。
+3. 三次插值的关键优化：边缘感知（可选）
+进阶的三次插值Demosaicing会加入**边缘检测**：通过计算4×4邻域的灰度梯度（如水平/垂直/对角线梯度），判断图像的**边缘方向**（如水平边缘、垂直边缘），并**调整权重分布**——在边缘方向上增大权重，垂直边缘方向上减小权重，避免边缘被平均抹平，进一步减少拉链伪影和色彩错位。
+
+- **计算复杂度**：O(W×H×16)（4×4邻域），比双线性高，但远低于基于频域、机器学习的高阶Demosaicing，仍可实现硬件加速；
+- **画质提升**：显著减少**模糊和细节丢失**，边缘/纹理更清晰，伪影大幅降低——因为4×4邻域能捕捉更多局部信息，三次核的距离加权更贴合自然图像的像素变化规律；
+- **少量缺陷**：在强纹理/高频细节区域（如毛发、文字），仍可能出现轻微的色彩混叠，但远优于双线性；
+- **优势**：画质与计算量的平衡极佳，是消费级相机、图像处理库（如OpenCV）中最常用的Demosaicing方案之一。
+
+#### 2.1.2 样条差值
+&emsp;&emsp;样条插值（Spline Interpolation）是一类基于分段多项式的高阶插值方法，其核心思想是在已知采样点之间构建具有高阶连续性的函数，从而获得更加平滑且结构一致的重建结果。在去马赛克（Demosaicing）问题中，样条插值通常用于从彩色滤光阵列（Color Filter Array, CFA）采样数据中恢复缺失的颜色分量，相比双线性或最近邻方法，它能够更好地保持图像的边缘连续性并减少伪影。设全分辨率彩色图像为
+$$
+[
+S(x, y) = \left(R(x,y), G(x,y), B(x,y)\right)
+]
+$$
+&emsp;&emsp;CFA采样过程可视为对每个颜色通道施加掩膜函数：
+$$
+[
+z(x,y) = M_R(x,y)R(x,y) + M_G(x,y)G(x,y) + M_B(x,y)B(x,y)
+]
+$$
+&emsp;&emsp;其中：
+
+* ($M_c(x,y) \in {0,1})，(c \in {R,G,B}$)
+* 对任意像素仅有一个掩膜为1
+
+&emsp;&emsp;目标是在未知位置估计各颜色通道：
+$$
+[
+\hat{c}(x,y), \quad (x,y) \notin \Omega_c
+]
+$$
+- 其中 ($\Omega_c$) 表示通道 (c) 的已采样集合。
+
+&emsp;&emsp;样条函数是在区间 ($[x_i, x_{i+1}]$) 上定义的分段多项式，并满足函数值及其低阶导数连续。以常用的三次样条为例，每段函数可表示为：
+$$
+[
+S_i(t) = a_i + b_i t + c_i t^2 + d_i t^3, \quad t \in [0, h_i]
+]
+$$
+- 其中 $(h_i = x_{i+1} - x_i)$。
+
+约束条件包括：
+
+- **(1) 插值条件**$[ S_i(0) = f(x_i), \quad S_i(h_i) = f(x_{i+1}) ]$
+
+- **(2) 一阶连续性** $[ S_i'(h_i) = S_{i+1}'(0) ]$
+
+- **(3) 二阶连续性** $[ S_i''(h_i) = S_{i+1}''(0) ]$
+
+- **(4) 边界条件（自然样条）** $[ S''(x_0) = S''(x_n) = 0 ]$
+
+&emsp;&emsp;通过上述约束可得到一个三对角线性方程组，求解后即可确定所有多项式系数。
+&emsp;&emsp;样条插值Demosaicing的核心流程如下，对于缺失的颜色分量，可沿行或列方向构建一维样条，再扩展到二维：
+- **(1) 提取同色采样点**。例如在估计红色通道时，仅使用红色采样位置：
+$$
+[
+{(x_i, y_j), R(x_i, y_j)}
+]
+$$
+- **(2) 构建样条函数**。在固定 ($y_j$) 的情况下建立：
+$$
+[
+S_{y_j}(x)
+]
+$$
+使其满足：
+$$
+[
+S_{y_j}(x_i) = R(x_i, y_j)
+]
+$$
+- **(3) 计算缺失值**。对于未采样点 ($x^*$)：
+$$
+[
+\hat{R}(x^*, y_j) = S_{y_j}(x^*)
+]
+$$
+- **(4) 二维扩展**。可采用张量积样条（Tensor-product spline）：
+$$
+[
+S(x,y) = \sum_{i}\sum_{j} c_{ij} B_i(x) B_j(y)
+]
+$$
+- 其中 ($B_i(\cdot)$) 为样条基函数。
+
+&emsp;&emsp;样条插值Demosaicing的优势在于其能够更好地保持图像的边缘连续性，减少伪影，同时提供较高的插值精度。然而，其计算复杂度较高，尤其是在处理大尺寸图像时，可能需要更多的计算资源和时间。此外，样条插值对噪声较为敏感，可能需要结合预处理步骤以提高鲁棒性。总体而言，样条插值Demosaicing适用于对图像质量要求较高且计算资源允许的场景。
+
+#### 2.1.3 简单的实验
+&emsp;&emsp;仅仅使用OpenCV自带的双线性插值Demosaic算法进行实验，能够清晰的看到明显的拉链和伪色问题。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/image_process_algo_isp_digit_image_other_bilinear_ea.png)
+
+### 2.2 边缘导向算法
+
+### 2.3 频域方法
+
+### 2.4 迭代优化法
+
 ## 3 深度学习Demosaic算法
 
 
 ## 参考文献
 - [Bayer_filter](https://en.wikipedia.org/wiki/Bayer_filter)
+- [ISP-Guide](https://github.com/mikeroyal/ISP-Guide)
+- [Color filter array](https://en.wikipedia.org/wiki/Color_filter_array)
+- [Demosaicing](https://en.wikipedia.org/wiki/Demosaicing  )
 - 
