@@ -102,6 +102,75 @@
 
 &emsp;&emsp;Vulkan 的资源管理体系主要依托于三个底层抽象：物理内存 (Device Memory)、逻辑资源 (Buffers/Images) 以及描述符映射 (Descriptors)。
 
+---
+
+**物理内存（Device Memory）**
+
+&emsp;&emsp;物理内存是GPU可直接寻址的真实显存或主机可见内存，是Vulkan资源真正占用的存储载体。Vulkan不提供隐式内存分配，所有内存必须由应用显式申请、绑定、释放。驱动会向应用暴露多个内存堆（Memory Heap）与内存类型（Memory Type），分别对应显存容量、CPU 可访问性、缓存策略等属性。应用必须通过查询设备内存属性，选择满足使用场景的内存类型：
+- **DEVICE_LOCAL**：仅GPU 可高速访问，适合常驻 GPU 的渲染数据；
+- **HOST_VISIBLE**：CPU可映射读写，常用于上传 / 下载数据；
+- **HOST_COHERENT**：无需显式刷新缓存，保证 CPU/GPU 视图一致；
+- **HOST_CACHED**：CPU侧启用缓存，提升读效率但可能需要显式同步。
+>Vulkan 允许将多个 Buffer 和 Image 放置在同一块物理内存中（通过 Offset），从而极大减少了内存碎片的产生；而 OpenCL 的资源通常是独立的内存块。
+---
+
+**逻辑资源（Buffer / Image）**
+&emsp;&emsp;Buffer（缓冲区）与 Image（图像）是 Vulkan 对外暴露的逻辑资源对象，本身不持有内存，只描述数据的用途、结构与访问规则，需要后续绑定到具体物理内存上才能使用。
+* `Buffer`：线性数据结构（数组、结构体、SSBO），适用于通用计算；
+* `Image`：多维结构数据（2D/3D/纹理），适用于空间局部性强的访问模式；
+
+>OpenCL 的 cl_mem 对象在创建时就已经锁定了其背后的存储空间。虽然 OpenCL 2.0 引入了 SVM（共享虚拟内存），但在资源与存储的解耦灵活性上仍不及 Vulkan。
+
+---
+
+**描述符与描述符集（Descriptors & Descriptor Sets）**
+&emsp;&emsp;Shader 并不直接连接到 Buffer 或 Image。描述符是 Shader 访问外部资源的绑定接口，负责将 Buffer/Image/Sampler 等资源映射到着色器的绑定槽，实现 CPU 侧资源与 GPU 着色器的连接。
+- **描述符 (Descriptor)**： 指向资源的“句柄”或“指针”，包含资源的类型、状态（如 Image Layout）以及它所在的内存范围。
+- **描述符集 (Descriptor Sets)**： 将一组描述符打包在一起。Shader 通过绑定这些集合来访问资源。
+- **描述符集布局 (Descriptor Set Layout)**： 定义了 Shader 期望的接口模板，类似于函数签名的参数列表。
+
+>描述符集从描述符池（Descriptor Pool）中分配，池预先指定各类描述符数量上限，避免运行时超额分配。这种设计使驱动可提前规划内存布局，提升绑定效率。
+
+>在 OpenCL 中，如果要在两个不同的 Kernel 之间共享大量资源，你必须重复设置参数；而在 Vulkan 中，你只需要切换一个 Descriptor Set 即可，这极大地降低了渲染/计算管线切换时的驱动负载（Driver Overhead）。
+&emsp;&emsp;支持的资源类型包括：
+- **UNIFORM_BUFFER**：uniform 缓冲，只读、尺寸较小，适合常量参数；
+- **STORAGE_BUFFER**：存储缓冲，支持读写，适合大规模并行计算；
+- **COMBINED_IMAGE_SAMPLER**：纹理采样器，Shader 中采样贴图；
+- **STORAGE_IMAGE**：存储图像，支持像素级随机读写。
+
+---
+
+**资源访问与视图机制**
+
+&emsp;&emsp;为了提升资源使用的灵活性，Vulkan 引入了“视图（View）”机制：
+
+* `BufferView` / `ImageView` 用于定义：
+  * 数据格式（如 float4 / rgba8）
+  * 访问范围（子区域 / 子资源）
+* 同一资源可以创建多个视图，实现：
+  * 数据重解释（reinterpret）
+  * 多用途访问（如计算 + 采样）
+
+&emsp;&emsp;Vulkan的资源控制完全是显示的，相对于OpenGL的资源控制依赖驱动层的全局状态机隐式控制，OpenCL可以控制一部分资源属性，但不是全部。
+| 特性    | Vulkan        | OpenGL | OpenCL    |
+| ----- | ------------- | ------ | --------- |
+| 内存管理  | 完全显式          | 隐式     | 半显式       |
+| 资源绑定  | DescriptorSet | 全局状态机  | Kernel 参数 |
+| 数据迁移  | 手动控制          | 自动     | 半自动       |
+| 同步机制  | 显式 Barrier    | 隐式     | 事件驱动      |
+| 性能可控性 | 极高            | 低      | 中         |
+---
+
+&emsp;&emsp;Vulkan的资源管理典型流程：
+- 创建资源（Buffer/Image）→ 
+- 分配内存（DeviceMemory）→ 
+- 绑定资源与内存 →  
+- 创建 DescriptorSet 并写入资源 →  
+- 提交 GPU 使用 →  
+- 同步与回收 →  
+- 销毁资源与内存 →  
+
+
 
 ### 2.3 执行模型
 &emsp;&emsp;
