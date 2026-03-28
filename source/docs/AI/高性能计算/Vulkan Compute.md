@@ -173,8 +173,8 @@
 
 > 命令缓冲区需从 `CommandPool` 中分配，不能直接创建。
 
-- **录制（Recording）**：通过 `vkBeginCommandBuffer` 开始录制指令（如绑定管线、设置描述符、分发计算任务），过程线程安全，可在多个 CPU 核心上并行录制不同命令缓冲区；  
-- **提交（Submission）**：录制完成后通过 `vkQueueSubmit` 将缓冲区推送到 GPU 队列；  
+- **录制（Recording）**：通过 `VkBeginCommandBuffer` 开始录制指令（如绑定管线、设置描述符、分发计算任务），过程线程安全，可在多个 CPU 核心上并行录制不同命令缓冲区；  
+- **提交（Submission）**：录制完成后通过 `VkQueueSubmit` 将缓冲区推送到 GPU 队列；  
 - **与 OpenCL 对比**：OpenCL 每次 `clEnqueue` 都会产生驱动开销，频繁调用易造成 CPU 瓶颈；Vulkan 录制的命令缓冲区可多次提交（重用），且多线程录制消除了单核提交瓶颈。
 
 | 特性         | Vulkan                          | OpenCL                          |
@@ -210,7 +210,7 @@
 
 - **栅栏（Fence）**  
   - **作用域**：GPU → CPU 的单向通知；  
-  - **核心机制**：CPU 提交命令时附带 Fence，随后通过 `vkWaitForFences` 休眠，直到 GPU 执行完命令并发出信号；  
+  - **核心机制**：CPU 提交命令时附带 Fence，随后通过 `VkWaitForFences` 休眠，直到 GPU 执行完命令并发出信号；  
   - **典型场景**：帧同步（Frame Pacing），CPU 需等待 GPU 渲染完第 N 帧，才能复用第 N 帧的 CommandBuffer 与 Uniform Buffer，避免覆盖 GPU 正在读取的数据。
 
 - **信号量（Semaphore）**  
@@ -225,7 +225,7 @@
 
 - **事件（Event）**  
   - **作用域**：可由 CPU 设置、GPU 等待，或 GPU 设置、GPU 等待；  
-  - **核心机制**：将 Pipeline Barrier 拆分为两半（先 `vkCmdSetEvent`，后 `vkCmdWaitEvents`），允许 GPU 在设置与等待事件之间执行其他不相关指令，提升硬件利用率；  
+  - **核心机制**：将 Pipeline Barrier 拆分为两半（先 `VkCmdSetEvent`，后 `VkCmdWaitEvents`），允许 GPU 在设置与等待事件之间执行其他不相关指令，提升硬件利用率；  
   - **典型场景**：极致优化的细粒度调度（实际开发中为代码可维护性，更倾向于直接使用 Pipeline Barrier）。
 
 | 原语名称   | 谁发出信号 | 谁等待   | 解决的核心问题                     | 性能开销               |
@@ -253,7 +253,7 @@
 &emsp;&emsp;Vulkan 的并行层次结构与 OpenCL 高度相似，但术语不同，理解对应关系是迁移算法的关键：  
 - **着色器调用（Shader Invocation）**：执行着色器的最小单元，对应 OpenCL 的 **Work-item**；  
 - **本地工作组（Local Workgroup）**：一组同时执行、可共享内存（Shared Memory）的调用集合，对应 OpenCL 的 **Work-group**；  
-- **派发网格（Dispatch Grid）**：由多个工作组构成的三维空间，通过 `vkCmdDispatch` 定义，对应 OpenCL 的 **NDRange**。
+- **派发网格（Dispatch Grid）**：由多个工作组构成的三维空间，通过 `VkCmdDispatch` 定义，对应 OpenCL 的 **NDRange**。
 
 &emsp;&emsp;Vulkan 着色器定义了严格的内存层级与可见性规则，不同层级的访问性能与同步约束完全不同，开发者需显式管理数据在硬件各级缓存（L1/L2/显存）之间的流动：  
 - **寄存器与私有内存（Private/Function）**：访问性能极高（单时钟周期），仅对当前调用可见，无需同步；  
@@ -272,11 +272,16 @@
 - 子组内的线程可通过硬件指令直接交换数据（如 `subgroupShuffle`），无需访问内存或使用 Barrier；  
 - 与 OpenCL 对比：OpenCL 原生规范长期缺乏 Warp/Wave 级别的标准化支持（通常依赖厂商扩展），而 Vulkan 将 **Subgroup Operations** 纳入核心规范，使开发者可编写极高性能的硬件级并行代码。
 
+---
+
+**工作组**
+TODO:
+
 ## 3 Vulkan Compute 组件
 
 &emsp;&emsp;上面已经将Vulkan的模型描述了一遍，对于Vulkan的相关组件也有一个基本的理解。为了更加深入理解Vulkan Compute中不同组件（图形相关的组件不涉及），下面从Vulkan Compute例子理解Vulkan每个组件。
 
-### 3.1 Instance
+### 3.1 Instance（实例）
 &emsp;&emsp;`VkInstance`是Vulkan应用程序的逻辑入口与运行环境。虽然在抽象层面上它与 OpenCL 的 cl_context 有相似之处，但其架构职责更接近于 OpenCL 的 Platform（平台）与 Loader（加载器）的结合体。在 OpenCL 中，开发者通常需要先枚举 Platform，获取特定厂商的设备后再创建 Context；而 Vulkan Instance 直接封装了整个运行环境，它承载了应用元数据、全局状态以及开启特定硬件枚举所需的扩展插件。
 
 &emsp;&emsp;在多厂商硬件协作场景下，Vulkan 的优势尤为突出。OpenCL 若要同时调用不同厂商的硬件，通常需要维护多个独立的 Context 来管理各自的设备状态；而 Vulkan 仅需创建一个 Instance，即可通过该实例统一枚举系统中所有可见的物理设备（Physical Devices）。这种设计高度契合现代开发思路：由 Instance 维护全局资源调度与环境一致性，而不同厂商的设备则在统一的语义框架下通过显式同步进行交互。
@@ -287,9 +292,9 @@
 ```cpp
 void printInstanceExtensions() {
     uint32_t count = 0;
-    vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
+    VkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
     std::vector<VkExtensionProperties> exts(count);
-    vkEnumerateInstanceExtensionProperties(nullptr, &count, exts.data());
+    VkEnumerateInstanceExtensionProperties(nullptr, &count, exts.data());
     
     printf("\n=== Instance Extensions (%u) ===\n", count);
     for (const auto& ext : exts) {
@@ -299,9 +304,9 @@ void printInstanceExtensions() {
 
 void printInstanceLayers() {
     uint32_t count = 0;
-    vkEnumerateInstanceLayerProperties(&count, nullptr);
+    VkEnumerateInstanceLayerProperties(&count, nullptr);
     std::vector<VkLayerProperties> layers(count);
-    vkEnumerateInstanceLayerProperties(&count, layers.data());
+    VkEnumerateInstanceLayerProperties(&count, layers.data());
     
     printf("\n=== Instance Layers (%u) ===\n", count);
     for (const auto& layer : layers) {
@@ -327,7 +332,7 @@ void printInstanceLayers() {
 
 &emsp;&emsp;有一个Layer需要详细说下，就是`VK_LAYER_KHRONOS_validation`，它充当了应用程序与驱动程序之间的“校验过滤器”：一旦启用，该层会拦截所有的 Vulkan API 调用，全方位协助开发者追踪资源生命周期、校验参数合法性、诊断多线程竞争以及监控内存完整性。相比于 OpenCL 仅通过简单的错误码（Error Code）进行反馈，Vulkan 的验证层能提供详尽的诊断日志和规范引用，极大提升了底层开发的调试效率。
 
-&emsp;&emsp;Vulkan 层与扩展的启用遵循“先查询、后配置”的原则。在创建实例时完成显式开启后，其后续使用方式与 OpenCL 基本一致——即通过对应的定位接口（如 vkGetInstanceProcAddr）动态获取函数指针，随后即可像调用核心 API 一样执行扩展功能。
+&emsp;&emsp;Vulkan 层与扩展的启用遵循“先查询、后配置”的原则。在创建实例时完成显式开启后，其后续使用方式与 OpenCL 基本一致——即通过对应的定位接口（如 VkGetInstanceProcAddr）动态获取函数指针，随后即可像调用核心 API 一样执行扩展功能。
 
 &emsp;&emsp;下面就是一段启用校验层创建instance的代码：
 ```cpp
@@ -348,9 +353,9 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
 
 bool checkValidationLayerSupport() {
     uint32_t count = 0;
-    vkEnumerateInstanceLayerProperties(&count, nullptr);
+    VkEnumerateInstanceLayerProperties(&count, nullptr);
     std::vector<VkLayerProperties> layers(count);
-    vkEnumerateInstanceLayerProperties(&count, layers.data());
+    VkEnumerateInstanceLayerProperties(&count, layers.data());
     
     for (const auto& layer : layers) {
         if (strcmp(layer.layerName, "VK_LAYER_KHRONOS_validation") == 0) {
@@ -372,8 +377,8 @@ void setupDebugMessenger() {
     ci.pfnUserCallback = debugCallback;
     ci.pUserData = nullptr;
 
-    auto func = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
-        instance, "vkCreateDebugUtilsMessengerEXT");
+    auto func = (PFN_VkCreateDebugUtilsMessengerEXT)VkGetInstanceProcAddr(
+        instance, "VkCreateDebugUtilsMessengerEXT");
     if (func != nullptr) {
         func(instance, &ci, nullptr, &debugMessenger);
     }
@@ -404,7 +409,7 @@ int main(){
       ci.ppEnabledLayerNames = &validationLayer;
   }
 
-  VkResult result = vkCreateInstance(&ci, nullptr, &instance);
+  VkResult result = VkCreateInstance(&ci, nullptr, &instance);
   if (result != VK_SUCCESS) {
       throw std::runtime_error("Failed to create Vulkan instance");
   }
@@ -417,12 +422,12 @@ int main(){
 
 &emsp;&emsp;比如我实现的一个Compute代码，如果vulkan参数有问题就会有下面的错误：
 ```bash
-[Vulkan ERROR] vkCreateImage(): pCreateInfo->format (VK_FORMAT_A8_UNORM) requires the extensions VK_KHR_maintenance5.
+[Vulkan ERROR] VkCreateImage(): pCreateInfo->format (VK_FORMAT_A8_UNORM) requires the extensions VK_KHR_maintenance5.
 The Vulkan spec states: format must be a valid VkFormat value (https://docs.vulkan.org/spec/latest/chapters/resources.html#VUID-VkImageCreateInfo-format-parameter)
-[Vulkan ERROR] vkCreateImageView(): pCreateInfo->format VK_FORMAT_R8G8B8A8_UNORM is different from VkImage 0x30000000003 format (VK_FORMAT_A8_UNORM). Formats MUST be IDENTICAL unless VK_IMAGE_CREATE_MUTABLE_FORMAT BIT was set on image creation.
+[Vulkan ERROR] VkCreateImageView(): pCreateInfo->format VK_FORMAT_R8G8B8A8_UNORM is different from VkImage 0x30000000003 format (VK_FORMAT_A8_UNORM). Formats MUST be IDENTICAL unless VK_IMAGE_CREATE_MUTABLE_FORMAT BIT was set on image creation.
 ```
 
-### 3.2 设备
+### 3.2 PhysicDevice/Device（物理设备/设备）
 &emsp;&emsp;Vulkan 将硬件设备抽象为`VkPhysicalDevice`（物理设备） 与 `VkDevice`（逻辑设备），这种方式比OpenCL直接使用cl_device_id区分设备更加精细。
 
 &emsp;&emsp;VkPhysicalDevice（物理设备）对应系统中真实存在的硬件单元（如 NVIDIA RTX 4080、Intel UHD Graphics）。它是只读的实体，开发者通过它查询硬件的“底子”，包括支持的渲染特性、显存堆架构、队列族属性以及极限参数（如最大纹理尺寸）。这类似于 OpenCL 中通过 clGetDeviceInfo 获取的硬件快照。
@@ -434,16 +439,16 @@ The Vulkan spec states: format must be a valid VkFormat value (https://docs.vulk
 &emsp;&emsp;上面提到了的队列族（Queue Family） 是 Vulkan 硬件调度的核心单位，代表了一组具有相同功能特性的队列集合。不同于 OpenCL 中相对通用的 cl_command_queue 模型，Vulkan 将物理设备的底层能力显式地划分为不同的功能族，如图形族（Graphics Family）、计算族（Compute Family）及传输族（Transfer Family）。这种精细化的设计赋予了开发者极高的控制权，使其能够根据负载特征（如高吞吐计算或异步显存拷贝）匹配最优的执行路径，从而在底层实现真正的任务并行与硬件压榨。比如下面筛选Compute队列：
 ```cpp
 uint32_t qCount = 0;
-vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, nullptr);
+VkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, nullptr);
 if (qCount == 0) {
     destroyDebugMessenger();
-    vkDestroyInstance(instance, nullptr);
+    VkDestroyInstance(instance, nullptr);
     throw std::runtime_error("No queue families found");
 }
 
 std::vector<VkQueueFamilyProperties> qProps;
 qProps.resize(qCount);
-vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, qProps.data());
+VkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, qProps.data());
 
 uint32_t qIndex = 0;
 for (uint32_t i = 0; i < qCount; i++) {
@@ -458,9 +463,9 @@ for (uint32_t i = 0; i < qCount; i++) {
 ```cpp
 void printDeviceExtensions(VkPhysicalDevice dev) {
     uint32_t count = 0;
-    vkEnumerateDeviceExtensionProperties(dev, nullptr, &count, nullptr);
+    VkEnumerateDeviceExtensionProperties(dev, nullptr, &count, nullptr);
     std::vector<VkExtensionProperties> exts(count);
-    vkEnumerateDeviceExtensionProperties(dev, nullptr, &count, exts.data());
+    VkEnumerateDeviceExtensionProperties(dev, nullptr, &count, exts.data());
     
     printf("\n=== Device Extensions (%u) ===\n", count);
     for (const auto& ext : exts) {
@@ -470,9 +475,9 @@ void printDeviceExtensions(VkPhysicalDevice dev) {
 
 void printDeviceLayers(VkPhysicalDevice dev) {
     uint32_t count = 0;
-    vkEnumerateDeviceLayerProperties(dev, &count, nullptr);
+    VkEnumerateDeviceLayerProperties(dev, &count, nullptr);
     std::vector<VkLayerProperties> layers(count);
-    vkEnumerateDeviceLayerProperties(dev, &count, layers.data());
+    VkEnumerateDeviceLayerProperties(dev, &count, layers.data());
     
     printf("\n=== Device Layers (%u) ===\n", count);
     for (const auto& layer : layers) {
@@ -486,33 +491,33 @@ void printDeviceLayers(VkPhysicalDevice dev) {
 &emsp;&emsp;将上面的串起来，一个完整的创建Device的代码如下：
 ```cpp
 uint32_t count = 0;
-VkResult enumResult = vkEnumeratePhysicalDevices(instance, &count, nullptr);
+VkResult enumResult = VkEnumeratePhysicalDevices(instance, &count, nullptr);
 if (enumResult != VK_SUCCESS || count == 0) {
     destroyDebugMessenger();
-    vkDestroyInstance(instance, nullptr);
+    VkDestroyInstance(instance, nullptr);
     printf("vulkan device count: %d\n", count);
     throw std::runtime_error("No Vulkan devices found");
 }
 
 std::vector<VkPhysicalDevice> devs;
 devs.resize(count);
-vkEnumeratePhysicalDevices(instance, &count, devs.data());
+VkEnumeratePhysicalDevices(instance, &count, devs.data());
 physicalDevice = devs[0];
 
 printDeviceExtensions(physicalDevice);
 printDeviceLayers(physicalDevice);
 
 uint32_t qCount = 0;
-vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, nullptr);
+VkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, nullptr);
 if (qCount == 0) {
     destroyDebugMessenger();
-    vkDestroyInstance(instance, nullptr);
+    VkDestroyInstance(instance, nullptr);
     throw std::runtime_error("No queue families found");
 }
 
 std::vector<VkQueueFamilyProperties> qProps;
 qProps.resize(qCount);
-vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, qProps.data());
+VkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, qProps.data());
 
 uint32_t qIndex = 0;
 for (uint32_t i = 0; i < qCount; i++) {
@@ -532,23 +537,162 @@ VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
 dci.queueCreateInfoCount = 1;
 dci.pQueueCreateInfos = &qci;
 
-vkCreateDevice(physicalDevice, &dci, nullptr, &device);
+VkCreateDevice(physicalDevice, &dci, nullptr, &device);
 ```
-### 3.3 队列
+### 3.3 Queue（队列）
 &emsp;&emsp;队列（VkQueue） 是连接主机侧（Host）与设备侧（Device）的任务分发通道。在 Vulkan 中，队列并非由开发者直接创建，而是在构建逻辑设备时根据硬件能力申请、并随后提取的预置句柄。一旦获取队列句柄，开发者即可向其提交执行指令。
 
 ```cpp
-vkGetDeviceQueue(device, qIndex, 0, &queue);
+VkGetDeviceQueue(device, qIndex, 0, &queue);
 ```
 
 &emsp;&emsp;相较于 OpenCL 相对直接的命令提交模式，Vulkan 为了极度压榨 CPU 端性能并降低驱动开销，采用了“**录制-提交**”（Record-and-Submit）的工作流。开发者不再频繁调用单个命令的提交接口，而是将大量细粒度的操作（如 Kernel 分发、内存拷贝等）预先录制在命令缓冲（Command Buffer）中，随后通过一次性批量提交来显著减少内核态切换带来的系统开销。
 ```cpp
-vkBeginCommandBuffer(cmd, &bi);
-//需要执行的vk操作
-vkEndCommandBuffer(cmd);
-vkQueueSubmit(queue,1,&si,VK_NULL_HANDLE);
+VkBeginCommandBuffer(cmd, &bi);
+//需要执行的Vk操作
+VkEndCommandBuffer(cmd);
+VkQueueSubmit(queue,1,&si,VK_NULL_HANDLE);
 ```
 &emsp;&emsp;此外，正如前文所述，Vulkan 支持通过不同的队列并发执行多样化任务。为了在高度并行的环境下确保指令执行的顺序性与内存一致性，Vulkan 提供了一套严谨的显式同步原语：**Fence**（栅栏）用于同步 GPU 与 CPU 的执行进度，**Semaphore**（信号量）用于协调不同队列间的任务依赖，而 **Barrier**（屏障）则用于控制队列内部指令间的执行顺序与内存可见性。
+
+### 3.4 VkCommandPool（命令池）
+&emsp;&emsp;`VkCommandPool` 是 Vulkan 命令缓冲（Command Buffer）内存管理的基石。在 Vulkan 的显式架构下，命令缓冲并非独立分配，而必须从预设的命令池中申请。这种设计将指令录制所需的内存分配行为与具体的指令生成逻辑相解耦，使得驱动程序能够实现更高效的内存复用，有效避免了频繁申请与释放系统内存带来的性能开销。
+
+```cpp
+VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+//qIndex为选中的命令族的id
+pci.queueFamilyIndex = qIndex;
+VkCreateCommandPool(device, &pci, nullptr, &pool);
+```
+&emsp;&emsp;创建命令池时，其最核心的属性是必须与特定的**队列族（Queue Family）**相绑定。这意味着从该池中分配的所有命令缓冲都带有特定的“硬件标签”，仅能被提交至对应功能的队列中执行。这种显式的绑定机制允许驱动程序针对特定硬件引擎（如异步计算引擎 ACE）优化指令的底层存储格式。
+
+```cpp
+VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+ai.commandPool = pool;
+ai.commandBufferCount = 1;
+
+VkCommandBuffer cmd;
+VkAllocateCommandBuffers(device, &ai, &cmd);
+```
+
+&emsp;&emsp;鉴于 `VkCommandPool` 本身并非线程安全，为了最大化多核 CPU 的优势，开发者通常会采用“每线程一池（Per-thread Pool）”的策略。通过在不同的工作线程中维护独立的命令池，可以实现完全并行的指令录制，彻底消除线程间的锁竞争。此外，当批量任务执行完毕后，直接重置（Reset）整个命令池比逐个重置命令缓冲的效率更高，能以极小的代价完成内存资源的回收与重用。
+
+### 3.5 VkCommandBuffer（命令缓冲）
+&emsp;&emsp;**`VkCommandBuffer`** 是 Vulkan 中承载 GPU 指令的核心抽象。与 OpenCL 通过 `clEnqueue...` 系列接口将单条命令直接提交至执行队列的方式不同，Vulkan 将“命令录制（recording）”与“命令提交（submission）”彻底解耦：开发者需先将一组指令顺序录制到命令缓冲中，在完成录制后，再以整体形式提交至队列执行。
+
+&emsp;&emsp;每个命令缓冲严格遵循一套显式的状态机转换模型：
+
+* **Initial（初始态）**：命令缓冲刚分配后的状态。
+* **Recording（录制态）**：调用 `VkBeginCommandBuffer` 后进入，可向其中写入指令流。
+* **Executable（可执行态）**：调用 `VkEndCommandBuffer` 结束录制后进入，此时内容已固化，可被提交执行。
+* **Pending（挂起态）**：经由 `VkQueueSubmit` 提交后进入，表示 GPU 正在执行该命令缓冲；在此阶段，严禁对其进行修改或重置操作。
+
+&emsp;&emsp;在录制阶段，开发者可以插入诸如 `VkCmdDispatch`（语义上对应 OpenCL 的 `clEnqueueNDRangeKernel`）或 `VkCmdCopyBuffer` 等具体指令。Vulkan 的一项关键优势在于**命令缓冲的可复用性**：对于指令序列稳定的任务（例如逐帧执行的物理模拟或固定流程的后处理），可以一次录制、多次提交，从而显著降低 CPU 侧的调度与录制开销。
+
+```cpp
+VkCommandBuffer beginCmd() {
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = pool;
+    ai.commandBufferCount = 1;
+
+    VkCommandBuffer cmd;
+    VkAllocateCommandBuffers(device, &ai, &cmd);
+
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VkBeginCommandBuffer(cmd, &bi);
+    return cmd;
+}
+
+void endCmd(VkCommandBuffer cmd) {
+    VkEndCommandBuffer(cmd);
+
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+
+    VkQueueSubmit(queue,1,&si,VK_NULL_HANDLE);
+    VkQueueWaitIdle(queue);
+
+    VkFreeCommandBuffers(device, pool,1,&cmd);
+}
+
+int main(){
+  auto cmd = beginCmd();
+  //一些Vk操作
+  endCmd(cmd);
+  VkCmdDispatch(cmd, (mOutWidth + 15) / 16, (mOutHeight + 15) / 16, 1);
+}
+```
+
+&emsp;&emsp;为支撑高并发的渲染与计算任务，Vulkan 提供了分级的命令缓冲体系：
+* **Primary Command Buffers（主命令缓冲）**：可直接提交至队列执行，并能够调用（execute）次级命令缓冲。
+* **Secondary Command Buffers（次级命令缓冲）**：不可直接提交，但可被嵌入至主命令缓冲中执行。这一机制允许多线程并行录制不同任务片段，最终由主命令缓冲统一编排与提交，从而在复杂场景下显著提升命令生成阶段的吞吐效率。
+
+&emsp;&emsp;主次命令场景，主命令更像是调度器，比如复杂场景拆分，每个子命令处理一部分，主命令负责调度。
+```cpp
+VkCmdExecuteCommands(primaryCmd, chunkCount, chunkCmdBuffers);
+```
+
+### 3.6 ShaderModule（着色器模块）
+&emsp;&emsp;`VkShaderModule`就是Vulkan具体执行的内核代码，对应到OpenCL的kernel。需要注意的是，Vulkan不支持使用源码在线编译运行，只支持直接读取SPIR-V字节码来构建ShaderModel。`VkShaderModule`通过字节码创建成功后就可以传递给Pipeline组件运行流水线。
+
+```cpp
+auto code = readShaderFile(shaderPath);
+
+VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+mi.codeSize = code.size();
+mi.pCode = (uint32_t*)code.data();
+
+VkShaderModule mod;
+vkCreateShaderModule(device, &mi, nullptr, &mod);
+```
+
+### 3.7 PipelineLayout（管线布局）
+&emsp;&emsp;`VkPipelineLayout`（管线布局） 构成了 Vulkan 计算管线的“外部接口规范”。如果将 Shader 比作一个函数，那么管线布局就是该函数的签名，它严格规定了管线在运行时能够访问哪些资源及其组织方式。
+
+&emsp;&emsp;相较于 OpenCL 通过 clSetKernelArg 动态绑定参数的模式，Vulkan 要求开发者通过管线布局显式声明 Descriptor Sets（描述符集） 与 Push Constants（推送常量） 的拓扑结构。这种显式化设计带来了显著的工程优势：驱动程序能够基于布局信息预先优化指令流水线和内存访问路径，避免了运行时的重校验开销。
+
+```glsl
+layout(push_constant) uniform PushConstants {
+    int kernelSize;
+} pushConstants;
+
+layout(binding = 0) uniform sampler2D inputImage;
+layout(binding = 1, rgba8) uniform writeonly image2D outputImage;
+
+void main() {
+```
+&emsp;&emsp;比如上面的Shader可以通过下面的Layout描述所有的参数：
+
+```cpp
+std::array<VkDescriptorSetLayoutBinding,2> b{};
+
+b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_COMPUTE_BIT};
+b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT};
+
+VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+ci.bindingCount = 2;
+ci.pBindings = b.data();
+vkCreateDescriptorSetLayout(device, &ci, nullptr, &setLayout);
+
+VkPushConstantRange pushConstantRange{};
+pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+pushConstantRange.offset = 0;
+pushConstantRange.size = sizeof(int);
+
+VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+pi.setLayoutCount = 1;
+pi.pSetLayouts = &setLayout;
+pi.pushConstantRangeCount = 1;
+pi.pPushConstantRanges = &pushConstantRange;
+vkCreatePipelineLayout(device, &pi, nullptr, &pipelineLayout);
+```
+
+### 3.8 Pipeline（管线）
+### 3.9 Buffer/Image（缓冲区/图像）
+### 3.10 Fence/
+
+
 
 # 参考文献
 - [Vulkan High Level Shader Language Comparison](https://docs.vulkan.org/guide/latest/high_level_shader_language_comparison.html)。
