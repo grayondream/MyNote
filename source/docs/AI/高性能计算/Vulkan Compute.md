@@ -272,6 +272,283 @@
 - 子组内的线程可通过硬件指令直接交换数据（如 `subgroupShuffle`），无需访问内存或使用 Barrier；  
 - 与 OpenCL 对比：OpenCL 原生规范长期缺乏 Warp/Wave 级别的标准化支持（通常依赖厂商扩展），而 Vulkan 将 **Subgroup Operations** 纳入核心规范，使开发者可编写极高性能的硬件级并行代码。
 
+## 3 Vulkan Compute 组件
+
+&emsp;&emsp;上面已经将Vulkan的模型描述了一遍，对于Vulkan的相关组件也有一个基本的理解。为了更加深入理解Vulkan Compute中不同组件（图形相关的组件不涉及），下面从Vulkan Compute例子理解Vulkan每个组件。
+
+### 3.1 Instance
+&emsp;&emsp;`VkInstance`是Vulkan应用程序的逻辑入口与运行环境。虽然在抽象层面上它与 OpenCL 的 cl_context 有相似之处，但其架构职责更接近于 OpenCL 的 Platform（平台）与 Loader（加载器）的结合体。在 OpenCL 中，开发者通常需要先枚举 Platform，获取特定厂商的设备后再创建 Context；而 Vulkan Instance 直接封装了整个运行环境，它承载了应用元数据、全局状态以及开启特定硬件枚举所需的扩展插件。
+
+&emsp;&emsp;在多厂商硬件协作场景下，Vulkan 的优势尤为突出。OpenCL 若要同时调用不同厂商的硬件，通常需要维护多个独立的 Context 来管理各自的设备状态；而 Vulkan 仅需创建一个 Instance，即可通过该实例统一枚举系统中所有可见的物理设备（Physical Devices）。这种设计高度契合现代开发思路：由 Instance 维护全局资源调度与环境一致性，而不同厂商的设备则在统一的语义框架下通过显式同步进行交互。
+
+&emsp;&emsp;为了实现极高的灵活性与可扩展性，Vulkan 引入了 **Layer（层）**与 **Extension（扩展）**机制。Instance Layer 充当了应用与驱动之间的“可选拦截插件”，允许开发者插入钩子（如 Validation Layers）进行无侵入式的调试、性能分析或规范校验。而 Instance Extension 则是对核心 API 能力的水平延伸，用于启用与具体硬件无关的全局功能。例如，通过 VK_KHR_surface 扩展，Vulkan 能够实现跨操作系统的窗口系统集成（WSI），从而将渲染结果呈现在不同平台的显示设备上。
+
+&emsp;&emsp;可以使用下面的代码查询当前驱动支持的Instance扩展和Layer工具。
+```cpp
+void printInstanceExtensions() {
+    uint32_t count = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> exts(count);
+    vkEnumerateInstanceExtensionProperties(nullptr, &count, exts.data());
+    
+    printf("\n=== Instance Extensions (%u) ===\n", count);
+    for (const auto& ext : exts) {
+        printf("  %s (v%u)\n", ext.extensionName, ext.specVersion);
+    }
+}
+
+void printInstanceLayers() {
+    uint32_t count = 0;
+    vkEnumerateInstanceLayerProperties(&count, nullptr);
+    std::vector<VkLayerProperties> layers(count);
+    vkEnumerateInstanceLayerProperties(&count, layers.data());
+    
+    printf("\n=== Instance Layers (%u) ===\n", count);
+    for (const auto& layer : layers) {
+        printf("  %s (v%u): %s\n", 
+                layer.layerName, 
+                layer.implementationVersion,
+                layer.description);
+    }
+}
+```
+&emsp;&emsp;比如下面就是我使用的本地机器支持的一部分扩展和Layer：
+```bash
+=== Instance Extensions (21) ===
+  VK_KHR_device_group_creation (v1)
+  VK_KHR_display (v23)
+# 省略一部分
+
+=== Instance Layers (9) ===
+  VK_LAYER_FROG_gamescope_wsi_x86_64 (v1): Gamescope WSI (XWayland Bypass) Layer (x86_64)
+  VK_LAYER_MANGOHUD_overlay_x86_64 (v1): Vulkan Hud Overlay
+# 省略一部分
+```
+
+&emsp;&emsp;有一个Layer需要详细说下，就是`VK_LAYER_KHRONOS_validation`，它充当了应用程序与驱动程序之间的“校验过滤器”：一旦启用，该层会拦截所有的 Vulkan API 调用，全方位协助开发者追踪资源生命周期、校验参数合法性、诊断多线程竞争以及监控内存完整性。相比于 OpenCL 仅通过简单的错误码（Error Code）进行反馈，Vulkan 的验证层能提供详尽的诊断日志和规范引用，极大提升了底层开发的调试效率。
+
+&emsp;&emsp;Vulkan 层与扩展的启用遵循“先查询、后配置”的原则。在创建实例时完成显式开启后，其后续使用方式与 OpenCL 基本一致——即通过对应的定位接口（如 vkGetInstanceProcAddr）动态获取函数指针，随后即可像调用核心 API 一样执行扩展功能。
+
+&emsp;&emsp;下面就是一段启用校验层创建instance的代码：
+```cpp
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT type,
+    const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
+    void* pUserData) {
+    
+    const char* severityStr = "INFO";
+    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) severityStr = "ERROR";
+    else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) severityStr = "WARN";
+    
+    fprintf(stderr, "[Vulkan %s] %s\n", severityStr, pCallbackData->pMessage);
+    return VK_FALSE;
+}
+
+bool checkValidationLayerSupport() {
+    uint32_t count = 0;
+    vkEnumerateInstanceLayerProperties(&count, nullptr);
+    std::vector<VkLayerProperties> layers(count);
+    vkEnumerateInstanceLayerProperties(&count, layers.data());
+    
+    for (const auto& layer : layers) {
+        if (strcmp(layer.layerName, "VK_LAYER_KHRONOS_validation") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void setupDebugMessenger() {
+    VkDebugUtilsMessengerCreateInfoEXT ci{};
+    ci.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+    ci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+                          VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                          VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    ci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                      VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                      VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+    ci.pfnUserCallback = debugCallback;
+    ci.pUserData = nullptr;
+
+    auto func = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+        instance, "vkCreateDebugUtilsMessengerEXT");
+    if (func != nullptr) {
+        func(instance, &ci, nullptr, &debugMessenger);
+    }
+}
+
+int main(){
+  bool enableValidation = checkValidationLayerSupport();
+  if (enableValidation) {
+      printf("\n=== Enabling VK_LAYER_KHRONOS_validation ===\n");
+  } else {
+      printf("\n=== Validation layer not available ===\n");
+  }
+
+  VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+  app.apiVersion = VK_API_VERSION_1_0;
+
+  std::vector<const char*> extensions;
+  extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+
+  VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+  ci.pApplicationInfo = &app;
+  ci.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+  ci.ppEnabledExtensionNames = extensions.data();
+
+  const char* validationLayer = "VK_LAYER_KHRONOS_validation";
+  if (enableValidation) {
+      ci.enabledLayerCount = 1;
+      ci.ppEnabledLayerNames = &validationLayer;
+  }
+
+  VkResult result = vkCreateInstance(&ci, nullptr, &instance);
+  if (result != VK_SUCCESS) {
+      throw std::runtime_error("Failed to create Vulkan instance");
+  }
+
+  if (enableValidation) {
+      setupDebugMessenger();
+  }
+}
+```
+
+&emsp;&emsp;比如我实现的一个Compute代码，如果vulkan参数有问题就会有下面的错误：
+```bash
+[Vulkan ERROR] vkCreateImage(): pCreateInfo->format (VK_FORMAT_A8_UNORM) requires the extensions VK_KHR_maintenance5.
+The Vulkan spec states: format must be a valid VkFormat value (https://docs.vulkan.org/spec/latest/chapters/resources.html#VUID-VkImageCreateInfo-format-parameter)
+[Vulkan ERROR] vkCreateImageView(): pCreateInfo->format VK_FORMAT_R8G8B8A8_UNORM is different from VkImage 0x30000000003 format (VK_FORMAT_A8_UNORM). Formats MUST be IDENTICAL unless VK_IMAGE_CREATE_MUTABLE_FORMAT BIT was set on image creation.
+```
+
+### 3.2 设备
+&emsp;&emsp;Vulkan 将硬件设备抽象为`VkPhysicalDevice`（物理设备） 与 `VkDevice`（逻辑设备），这种方式比OpenCL直接使用cl_device_id区分设备更加精细。
+
+&emsp;&emsp;VkPhysicalDevice（物理设备）对应系统中真实存在的硬件单元（如 NVIDIA RTX 4080、Intel UHD Graphics）。它是只读的实体，开发者通过它查询硬件的“底子”，包括支持的渲染特性、显存堆架构、队列族属性以及极限参数（如最大纹理尺寸）。这类似于 OpenCL 中通过 clGetDeviceInfo 获取的硬件快照。
+
+&emsp;&emsp;VkDevice（逻辑设备）是开发者根据应用需求，在物理设备基础上建立的虚拟操作接口。逻辑设备是 Vulkan 核心操作的“司令部”，所有的资源创建（Buffer、Image）、管线构建以及队列提取都必须通过它完成。一个物理设备可以派生出多个逻辑设备，每个逻辑设备可以拥有不同的特征开启组合（Features）和扩展。
+
+&emsp;&emsp;在 OpenCL 中，获取设备后通常直接用于创建 Context；而在 Vulkan 中，开发者需要先选择物理设备，根据其提供的 Queue Families（队列族） 判断其是否具备图形、计算或并行迁移能力，根据需要来选择对应的设备。选定后，再显式地在逻辑设备创建时申请所需的队列数量和特定功能（如各向异性过滤、几何着色器等）。
+
+&emsp;&emsp;上面提到了的队列族（Queue Family） 是 Vulkan 硬件调度的核心单位，代表了一组具有相同功能特性的队列集合。不同于 OpenCL 中相对通用的 cl_command_queue 模型，Vulkan 将物理设备的底层能力显式地划分为不同的功能族，如图形族（Graphics Family）、计算族（Compute Family）及传输族（Transfer Family）。这种精细化的设计赋予了开发者极高的控制权，使其能够根据负载特征（如高吞吐计算或异步显存拷贝）匹配最优的执行路径，从而在底层实现真正的任务并行与硬件压榨。比如下面筛选Compute队列：
+```cpp
+uint32_t qCount = 0;
+vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, nullptr);
+if (qCount == 0) {
+    destroyDebugMessenger();
+    vkDestroyInstance(instance, nullptr);
+    throw std::runtime_error("No queue families found");
+}
+
+std::vector<VkQueueFamilyProperties> qProps;
+qProps.resize(qCount);
+vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, qProps.data());
+
+uint32_t qIndex = 0;
+for (uint32_t i = 0; i < qCount; i++) {
+    if (qProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+        qIndex = i;
+        break;
+    }
+}
+```
+
+&emsp;&emsp;另外，设备和Instance一样也支持设置对应的扩展和Layer,做法和Instance一样，只不过是用的API不同。
+```cpp
+void printDeviceExtensions(VkPhysicalDevice dev) {
+    uint32_t count = 0;
+    vkEnumerateDeviceExtensionProperties(dev, nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> exts(count);
+    vkEnumerateDeviceExtensionProperties(dev, nullptr, &count, exts.data());
+    
+    printf("\n=== Device Extensions (%u) ===\n", count);
+    for (const auto& ext : exts) {
+        printf("  %s (v%u)\n", ext.extensionName, ext.specVersion);
+    }
+}
+
+void printDeviceLayers(VkPhysicalDevice dev) {
+    uint32_t count = 0;
+    vkEnumerateDeviceLayerProperties(dev, &count, nullptr);
+    std::vector<VkLayerProperties> layers(count);
+    vkEnumerateDeviceLayerProperties(dev, &count, layers.data());
+    
+    printf("\n=== Device Layers (%u) ===\n", count);
+    for (const auto& layer : layers) {
+        printf("  %s (v%u): %s\n", 
+                layer.layerName, 
+                layer.implementationVersion,
+                layer.description);
+    }
+}
+```
+&emsp;&emsp;将上面的串起来，一个完整的创建Device的代码如下：
+```cpp
+uint32_t count = 0;
+VkResult enumResult = vkEnumeratePhysicalDevices(instance, &count, nullptr);
+if (enumResult != VK_SUCCESS || count == 0) {
+    destroyDebugMessenger();
+    vkDestroyInstance(instance, nullptr);
+    printf("vulkan device count: %d\n", count);
+    throw std::runtime_error("No Vulkan devices found");
+}
+
+std::vector<VkPhysicalDevice> devs;
+devs.resize(count);
+vkEnumeratePhysicalDevices(instance, &count, devs.data());
+physicalDevice = devs[0];
+
+printDeviceExtensions(physicalDevice);
+printDeviceLayers(physicalDevice);
+
+uint32_t qCount = 0;
+vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, nullptr);
+if (qCount == 0) {
+    destroyDebugMessenger();
+    vkDestroyInstance(instance, nullptr);
+    throw std::runtime_error("No queue families found");
+}
+
+std::vector<VkQueueFamilyProperties> qProps;
+qProps.resize(qCount);
+vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, qProps.data());
+
+uint32_t qIndex = 0;
+for (uint32_t i = 0; i < qCount; i++) {
+    if (qProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+        qIndex = i;
+        break;
+    }
+}
+
+float prio = 1.f;
+VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+qci.queueFamilyIndex = qIndex;
+qci.queueCount = 1;
+qci.pQueuePriorities = &prio;
+
+VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+dci.queueCreateInfoCount = 1;
+dci.pQueueCreateInfos = &qci;
+
+vkCreateDevice(physicalDevice, &dci, nullptr, &device);
+```
+### 3.3 队列
+&emsp;&emsp;队列（VkQueue） 是连接主机侧（Host）与设备侧（Device）的任务分发通道。在 Vulkan 中，队列并非由开发者直接创建，而是在构建逻辑设备时根据硬件能力申请、并随后提取的预置句柄。一旦获取队列句柄，开发者即可向其提交执行指令。
+
+```cpp
+vkGetDeviceQueue(device, qIndex, 0, &queue);
+```
+
+&emsp;&emsp;相较于 OpenCL 相对直接的命令提交模式，Vulkan 为了极度压榨 CPU 端性能并降低驱动开销，采用了“**录制-提交**”（Record-and-Submit）的工作流。开发者不再频繁调用单个命令的提交接口，而是将大量细粒度的操作（如 Kernel 分发、内存拷贝等）预先录制在命令缓冲（Command Buffer）中，随后通过一次性批量提交来显著减少内核态切换带来的系统开销。
+```cpp
+vkBeginCommandBuffer(cmd, &bi);
+//需要执行的vk操作
+vkEndCommandBuffer(cmd);
+vkQueueSubmit(queue,1,&si,VK_NULL_HANDLE);
+```
+&emsp;&emsp;此外，正如前文所述，Vulkan 支持通过不同的队列并发执行多样化任务。为了在高度并行的环境下确保指令执行的顺序性与内存一致性，Vulkan 提供了一套严谨的显式同步原语：**Fence**（栅栏）用于同步 GPU 与 CPU 的执行进度，**Semaphore**（信号量）用于协调不同队列间的任务依赖，而 **Barrier**（屏障）则用于控制队列内部指令间的执行顺序与内存可见性。
 
 # 参考文献
 - [Vulkan High Level Shader Language Comparison](https://docs.vulkan.org/guide/latest/high_level_shader_language_comparison.html)。
