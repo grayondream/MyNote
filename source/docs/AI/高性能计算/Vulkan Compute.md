@@ -688,9 +688,286 @@ pi.pPushConstantRanges = &pushConstantRange;
 vkCreatePipelineLayout(device, &pi, nullptr, &pipelineLayout);
 ```
 
+&emsp;&emsp;运行时的参数设置也以来`PipelineLayout`：
+```cpp
+int kernelSize = 7;
+vkCmdPushConstants(cmd, pipelineLayout,VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int), &kernelSize);
+```
+### 3.8 Buffer/Image（缓冲区/图像）
+&emsp;&emsp;Vulkan不同于OpenCl，将资源、内存和视图三个概念完全解耦。在OpenCL中，一个`cl_mem`代表了一个内存资源，这个内存资源代表了GPU侧的物理内存。而Vulkan为了给程序员更大的灵活度，将实际的资源操作过程显式的拆分为：创建资源句柄、分配物理内存和绑定、定义操作视图。
+
+&emsp;&emsp;**`VkBuffer/VkImage`**都是资源的抽象对象，只是一个资源的句柄，并不对应实际的物理内存，仅仅用于定语资源的基本属性。创建句柄时，需要指定资源的用途（如顶点缓冲区、索引缓冲区、颜色附件、深度附件等）、尺寸、格式、Usage标志（如是否用于传输、采样、渲染输出等）以及内存属性相关的提示（如是否需要CPU可见、是否可缓存等）。
+- **`VkBuffer`**：线性的字节流，用于存储结构化数据（如 SSBO、UBO）。
+- **`VkImage`**：具有特定布局（Tiling）和多维结构的资源。与 Buffer 不同，Image 的内存排列（如最优平铺模式）由驱动程序根据硬件特性决定，以优化空间局部性。
+
+&emsp;&emsp;**物理内存**（`VkDeviceMemory`）是真正对应GPU侧或CPU-GPU共享的物理存储区域，Vulkan中所有资源的实际数据都必须存储在物理内存中。分配物理内存时，需要先查询物理设备（`VkPhysicalDevice`）支持的内存类型，根据之前创建资源句柄时指定的内存属性提示，选择合适的内存类型（如设备本地内存、主机可见内存等），再调用接口分配指定大小的物理内存块。分配完成后，需将资源句柄与物理内存进行绑定，明确资源句柄对应的物理内存区域。绑定操作需要指定资源句柄、物理内存对象以及内存偏移量（当多个资源共享一块物理内存时，通过偏移量区分不同资源的存储区域），绑定成功后，资源句柄才真正拥有了可用于存储数据的物理空间。需要注意的是，一个物理内存块可以绑定多个资源句柄（只要总尺寸不超过物理内存大小，且内存类型兼容），这种方式可以提高内存利用率，减少内存碎片；而一个资源句柄只能绑定到一个物理内存块上。
+
+```cpp
+uint32_t findMemory(uint32_t typeBits, VkMemoryPropertyFlags props) {
+    if (typeBits == 0) typeBits = 1;
+    
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &mp);
+
+    for (uint32_t i=0;i<mp.memoryTypeCount;i++)
+        if ((typeBits & (1u << i)) &&
+            (mp.memoryTypes[i].propertyFlags & props) == props)
+            return i;
+
+    for (uint32_t i=0;i<mp.memoryTypeCount;i++)
+        if (typeBits & (1u << i))
+            return i;
+
+    throw std::runtime_error("No memory type");
+}
+
+void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                      VkMemoryPropertyFlags props,
+                      VkBuffer& buf, VkDeviceMemory& mem) {
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = size;
+    bi.usage = usage;
+    vkCreateBuffer(device, &bi, nullptr, &buf);
+
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device, buf, &req);
+
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = findMemory(req.memoryTypeBits, props);
+
+    vkAllocateMemory(device, &ai, nullptr, &mem);
+    vkBindBufferMemory(device, buf, mem, 0);
+}
+```
+
+```cpp
+void createImage(uint32_t w, uint32_t h,
+    VkImageUsageFlags usage,
+    VkImage& image,
+    VkDeviceMemory& mem,
+    VkImageView& view) {
+
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.extent = {w, h, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = usage;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+
+    vkCreateImage(device, &ici, nullptr, &image);
+
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(device, image, &req);
+
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = findMemory(req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    vkAllocateMemory(device, &ai, nullptr, &mem);
+    vkBindImageMemory(device, image, mem, 0);
+
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+
+    vkCreateImageView(device, &vi, nullptr, &view);
+}
+```
+
+&emsp;&emsp;**资源视图**（如`VkBufferView`、`VkImageView`）是Vulkan中用于“访问资源”的接口，定义了如何解读资源中的数据。由于资源句柄仅定义了资源的基本属性，而不同的操作（如采样、渲染、计算）可能需要以不同的方式解读资源数据（如不同的格式、维度、范围），因此需要通过视图来指定具体的访问方式。例如，一个VkImage资源可能存储了一张RGBA格式的纹理，当用于采样时，需要创建VkImageView，指定采样的格式（如保持RGBA格式）、视图类型（如2D纹理视图）、MIP层级范围等；当该图像用于作为渲染目标时，可能需要创建另一个VkImageView，指定不同的格式（如深度格式，若图像存储的是深度数据）或视图范围。资源视图的核心作用是实现“同一资源的多用途复用”，无需为不同的操作创建多个资源，只需创建不同的视图即可，进一步提升了资源利用率和灵活性。
+
+### 3.8 Descriptor
+
+&emsp;&emsp;`VkDescriptorPool`（描述符池） 与 `VkDescriptorSet`（描述符集） 共同构成了 Vulkan 资源绑定的动态管理层。在显式 API 的视角下，描述符集并非随用随取的临时变量，而是必须从预分配的“池”空间中获取的结构化资源。
+
+&emsp;&emsp;描述符池 充当了内存分配器的角色。开发者在初始化阶段需显式定义池的规模，包括可容纳的描述符集总数以及各类资源（如 SSBO、采样器等）的具体配额。这种精细的控制确保了驱动程序能够以 O(1) 的复杂度完成内存分配，彻底消除了由于内存碎片化导致的性能波动。
+```cpp
+void createDescriptors() {
+  std::array<VkDescriptorSetLayoutBinding,2> b{};
+
+  b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_COMPUTE_BIT};
+  b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT};
+
+  VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  ci.bindingCount = 2;
+  ci.pBindings = b.data();
+  vkCreateDescriptorSetLayout(device, &ci, nullptr, &setLayout);
+
+  VkPushConstantRange pushConstantRange{};
+  pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  pushConstantRange.offset = 0;
+  pushConstantRange.size = sizeof(int);
+
+  VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pi.setLayoutCount = 1;
+  pi.pSetLayouts = &setLayout;
+  pi.pushConstantRangeCount = 1;
+  pi.pPushConstantRanges = &pushConstantRange;
+  vkCreatePipelineLayout(device, &pi, nullptr, &pipelineLayout);
+
+  VkDescriptorPoolSize sizes[2] = {
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1}
+  };
+
+  VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  pci.maxSets = 1;
+  pci.poolSizeCount = 2;
+  pci.pPoolSizes = sizes;
+  vkCreateDescriptorPool(device, &pci, nullptr, &descPool);
+
+  VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  ai.descriptorPool = descPool;
+  ai.descriptorSetCount = 1;
+  ai.pSetLayouts = &setLayout;
+  vkAllocateDescriptorSets(device, &ai, &descriptorSet);
+
+  VkDescriptorImageInfo in{};
+  in.imageView = inputView;
+  in.sampler = sampler;
+  in.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+  VkDescriptorImageInfo out{};
+  out.imageView = outputView;
+  out.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+  VkWriteDescriptorSet w[2]{};
+
+  w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr, descriptorSet,0,0,1,
+          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &in};
+
+  w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr, descriptorSet,1,0,1,
+          VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &out};
+
+  vkUpdateDescriptorSets(device, 2, w, 0, nullptr);
+}
+```
+&emsp;&emsp;而 描述符集 则是布局（Layout）的具体实例化产物。它作为连接逻辑管线与物理资源的“粘合剂”，在分配完成后通过 vkUpdateDescriptorSets 写入实际的资源句柄。在处理复杂的计算任务时，开发者可以预先录制多套描述符集，并在执行期通过极其轻量的索引切换来实现资源的快速更迭，这正是 Vulkan 能够支持海量并发计算任务的工程基石。
+
 ### 3.8 Pipeline（管线）
-### 3.9 Buffer/Image（缓冲区/图像）
-### 3.10 Fence/
+&emsp;&emsp;`VkPipeline` 它封装了执行内核所需的所有状态。将 VkShaderModule 定义的计算逻辑与 VkPipelineLayout 定义的资源契约进行深层绑定，并经由驱动程序转化为 GPU 可直接执行的硬件指令流。
+
+&emsp;&emsp;计算管线的设计核心在于显式的静态化。在 OpenCL 模型下，驱动程序往往在运行时（Runtime）承担了过多的状态校验与编译开销；而 Vulkan 则要求开发者在初始化阶段完成所有重负载的“烘焙”工作。这种“一次编译，多次高效分发”的模式，使得 vkCmdDispatch 能够以接近零延迟的效率触达硬件核心。
+
+```cpp
+VkComputePipelineCreateInfo pi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+pi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+pi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+pi.stage.module = mod;
+pi.stage.pName = "main";
+pi.layout = pipelineLayout;
+
+vkCreateComputePipelines(device, VK_NULL_HANDLE,1,&pi,nullptr,&pipeline);
+```
+
+&emsp;&emsp;此外，Vulkan 通过 Pipeline Cache（管线缓存） 机制解决了底层驱动重复编译的问题。开发者可以显式地序列化管线状态并持久化存储，这不仅优化了高性能计算应用的启动能效，更确保了在不同硬件环境下计算任务执行的确定性。
+
+
+### 3.10 Fence/Semaphore/Barrier
+
+&emsp;&emsp;Vulkan 的同步机制彻底摒弃了 OpenCL 这种基于事件（Event）的相对隐性的管理方式，转而提供了一套分层级的显式原语：**Fence、Semaphore 与 Barrier**。
+
+&emsp;&emsp;**`VkFence`** 充当了 Host 与 Device 之间的桥梁。它赋予了 CPU 监测 GPU 进度的能力，是确保主循环逻辑（如每一帧的起始或资源的回收销毁）不领先于硬件执行的关键保险。
+```cpp
+VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+// 初始状态为 Signaled，方便第一帧顺利通过等待逻辑
+fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; 
+
+VkFence fence;
+vkCreateFence(device, &fenceInfo, nullptr, &fence);
+```
+
+```cpp
+// 提交时传入 fence
+vkQueueSubmit(graphicsQueue, 1, &submitInfo, fence);
+```
+
+```cpp
+// 1. 等待 GPU 完成任务（阻塞 CPU）
+vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+
+// 2. 手动重置 Fence 状态为 Unsignaled，以便下次使用
+vkResetFences(device, 1, &fence);
+```
+
+&emsp;&emsp;**`VkSemaphore`** 则聚焦于设备内部的宏观调度。通过信号量，开发者可以编排不同硬件引擎（如图形引擎与异步计算引擎）之间的协作流，实现复杂的生产者-消费者模型，而无需付出 CPU 轮询的代价。
+
+```cpp
+VkSemaphoreCreateInfo semaphoreInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+
+VkSemaphore taskCompleteSemaphore;
+vkCreateSemaphore(device, &semaphoreInfo, nullptr, &taskCompleteSemaphore);
+```
+
+```cpp
+VkSubmitInfo submitA = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+// 任务 A 完成后，将信号量设为 Signaled
+submitA.signalSemaphoreCount = 1;
+submitA.pSignalSemaphores = &taskCompleteSemaphore;
+
+vkQueueSubmit(transferQueue, 1, &submitA, VK_NULL_HANDLE);
+```
+
+```cpp
+VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT };
+
+VkSubmitInfo submitB = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+// 只有当任务 A 发出信号后，任务 B 才会开始计算
+submitB.waitSemaphoreCount = 1;
+submitB.pWaitSemaphores = &taskCompleteSemaphore;
+submitB.pWaitDstStageMask = waitStages; // 指定在哪个阶段阻塞
+
+vkQueueSubmit(computeQueue, 1, &submitB, VK_NULL_HANDLE);
+```
+
+&emsp;&emsp;而在最为细微的指令流控制层面，管线屏障（Pipeline Barrier） 则是确保计算正确性的基石。它不仅定义了指令间的先后顺序，更承担了**内存一致性（Memory Coherency）**的重任。在处理 SSBO（着色器存储缓冲）的读写交替时，显式的内存屏障能够强制刷新 L1/L2 缓存，从而在高速并发的计算环境下，彻底杜绝数据竞争（Data Race）与内存可见性问题。
+
+```cpp
+VkBufferMemoryBarrier bufferBarrier = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+bufferBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; // 之前：着色器写入
+bufferBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;  // 之后：着色器读取
+
+bufferBarrier.buffer = myBuffer;
+bufferBarrier.offset = 0;
+bufferBarrier.size = VK_WHOLE_SIZE;
+
+// 如果不涉及跨队列转移，通常设为忽略
+bufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+bufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+```
+
+```cpp
+// 1. 录制第一个计算任务
+vkCmdDispatch(commandBuffer, x, y, z);
+
+// 2. 插入屏障：确保之前的写入完成且对之后的读取可见
+vkCmdPipelineBarrier(
+    commandBuffer,
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, // 源阶段：必须等待计算阶段完成
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, // 目标阶段：阻塞后续的计算阶段
+    0,                                   // 依赖标志
+    0, nullptr,                          // 全局内存屏障
+    1, &bufferBarrier,                   // Buffer 内存屏障
+    0, nullptr                           // Image 内存屏障
+);
+
+// 3. 录制第二个计算任务
+vkCmdDispatch(commandBuffer, x, y, z);
+```
+
+| 特性 | VkFence | VkSemaphore | Pipeline Barrier |
+| :--- | :--- | :--- | :--- |
+| **同步范围** | **Host ↔ Device** (CPU-GPU) | **Queue ↔ Queue** (GPU-GPU) | **Within Queue** (GPU-GPU) |
+| **开销** | 较高（涉及内核态切换） | 中等（GPU 硬件调度） | 极低（直接映射为 GPU 指令） |
+| **主要用途** | 资源销毁、数据读取同步。 | 异步计算任务编排。 | 解决 RAW/WAR 等内存冲突。 |
+| **控制对象** | 整个提交批次（Batch）。 | 不同提交间的依赖。 | 单条或多条指令间的内存访问。 |
 
 
 
