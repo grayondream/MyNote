@@ -783,6 +783,72 @@ void createImage(uint32_t w, uint32_t h,
 
 &emsp;&emsp;**资源视图**（如`VkBufferView`、`VkImageView`）是Vulkan中用于“访问资源”的接口，定义了如何解读资源中的数据。由于资源句柄仅定义了资源的基本属性，而不同的操作（如采样、渲染、计算）可能需要以不同的方式解读资源数据（如不同的格式、维度、范围），因此需要通过视图来指定具体的访问方式。例如，一个VkImage资源可能存储了一张RGBA格式的纹理，当用于采样时，需要创建VkImageView，指定采样的格式（如保持RGBA格式）、视图类型（如2D纹理视图）、MIP层级范围等；当该图像用于作为渲染目标时，可能需要创建另一个VkImageView，指定不同的格式（如深度格式，若图像存储的是深度数据）或视图范围。资源视图的核心作用是实现“同一资源的多用途复用”，无需为不同的操作创建多个资源，只需创建不同的视图即可，进一步提升了资源利用率和灵活性。
 
+&emsp;&emsp;在 OpenCL 体系下，图像内存的排列格式（Tiling）对开发者是完全透明的。驱动程序在后台默默承担了所有的内存布局匹配与缓存刷新工作。然而，这种便捷性并非毫无代价——它建立在牺牲 CPU 调度效率、以及引入不可控的驱动层耗时（Driver Overhead）的基础之上。
+
+&emsp;&emsp;相比之下，Vulkan 引入了显式的布局转换机制。通过 VkImageMemoryBarrier，开发者不仅精准定义了任务间的执行依赖，更直接指挥 GPU 硬件根据当前工作负载（如从数据传输 TRANSFER 切换到分发计算 COMPUTE）采用最优的内存压缩算法或访问路径。
+
+&emsp;&emsp;这种“手动挡”的操作逻辑虽然增加了代码量，却彻底消除了驱动层的“黑盒”开销。它确保了高性能计算（HPC）任务能够以最契合硬件原生特性的方式运行，将每一毫秒的 GPU 时间都真正花在计算逻辑上，从而实现真正的零开销调度。
+
+```cpp
+void transitionImage(VkCommandBuffer cmd,
+  VkImage img,
+  VkImageLayout oldL,
+  VkImageLayout newL) {
+
+  VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  b.oldLayout = oldL;
+  b.newLayout = newL;
+  b.image = img;
+  b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+
+  VkPipelineStageFlags src, dst;
+
+  if (oldL == VK_IMAGE_LAYOUT_UNDEFINED && newL == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+      src = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+      dst = VK_PIPELINE_STAGE_TRANSFER_BIT;
+      b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  } else if (oldL == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newL == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+      src = VK_PIPELINE_STAGE_TRANSFER_BIT;
+      dst = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  } else if (oldL == VK_IMAGE_LAYOUT_UNDEFINED && newL == VK_IMAGE_LAYOUT_GENERAL) {
+      src = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+      dst = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      b.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  } else if (oldL == VK_IMAGE_LAYOUT_GENERAL && newL == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+      src = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      dst = VK_PIPELINE_STAGE_TRANSFER_BIT;
+      b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+      b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  } else {
+      throw std::runtime_error("bad layout");
+  }
+
+  vkCmdPipelineBarrier(cmd, src, dst, 0,
+      0,nullptr,0,nullptr,1,&b);
+}
+```
+
+```cpp
+transitionImage(cmd, inputImage,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+  VkBufferImageCopy inputCopy{};
+  inputCopy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  inputCopy.imageExtent = {mWidth, mHeight, 1};
+  vkCmdCopyBufferToImage(cmd, inputStagingBuf, inputImage,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &inputCopy);
+
+  transitionImage(cmd, inputImage,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+  transitionImage(cmd, outputImage,
+      VK_IMAGE_LAYOUT_UNDEFINED,
+      VK_IMAGE_LAYOUT_GENERAL);
+```
 ### 3.8 Descriptor
 
 &emsp;&emsp;`VkDescriptorPool`（描述符池） 与 `VkDescriptorSet`（描述符集） 共同构成了 Vulkan 资源绑定的动态管理层。在显式 API 的视角下，描述符集并非随用随取的临时变量，而是必须从预分配的“池”空间中获取的结构化资源。
