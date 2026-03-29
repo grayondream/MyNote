@@ -2,6 +2,9 @@
 
 ## 1 Vulkan
 ### 1.1 Vulkan简介
+
+![](https://pcper.com/wp-content/uploads/2015/03/d7bd-khornos-fiveapis.png)
+
 &emsp;&emsp;Vulkan 是由 Khronos 主导开发的跨平台图形与计算API，于2016年2月正式发布1.0版本，旨在解决传统图形API（如 OpenGL）在高性能、低开销、多线程支持等方面的局限性。Vulkan 的核心定位是“跨平台、显式控制、低开销的统一图形与计算API”，打破了传统图形API与计算API分离的格局，让图形渲染与并行计算能够共用一套底层资源模型与调度体系，大幅提升协同效率。
 &emsp;&emsp;Vulkan 的设计围绕“显式控制、低开销、可预测性与可扩展性”展开，其核心思想是将传统图形 API 中由驱动隐式处理的行为全部上移至应用层，从而实现对 GPU 的精细化控制。
 - **完全显式化设计**：资源管理、内存分配、同步机制与状态转换均由开发者显式控制，驱动不再进行隐式状态推导与同步；
@@ -275,9 +278,13 @@
 ---
 
 **工作组**
-TODO:
+&emsp;&emsp;Vulkan 的工作组（Workgroup）与 OpenCL 的工作组（Work-group）在逻辑上确实是完全对等的。
+
+![](https://docs.vulkan.org/tutorial/latest/_images/images/compute_space.svg)
 
 ## 3 Vulkan Compute 组件
+
+![](https://gpuopen.com/images/Vulkan-Diagram-568x1024.BKv93sCY.png)
 
 &emsp;&emsp;上面已经将Vulkan的模型描述了一遍，对于Vulkan的相关组件也有一个基本的理解。为了更加深入理解Vulkan Compute中不同组件（图形相关的组件不涉及），下面从Vulkan Compute例子理解Vulkan每个组件。
 
@@ -287,6 +294,8 @@ TODO:
 &emsp;&emsp;在多厂商硬件协作场景下，Vulkan 的优势尤为突出。OpenCL 若要同时调用不同厂商的硬件，通常需要维护多个独立的 Context 来管理各自的设备状态；而 Vulkan 仅需创建一个 Instance，即可通过该实例统一枚举系统中所有可见的物理设备（Physical Devices）。这种设计高度契合现代开发思路：由 Instance 维护全局资源调度与环境一致性，而不同厂商的设备则在统一的语义框架下通过显式同步进行交互。
 
 &emsp;&emsp;为了实现极高的灵活性与可扩展性，Vulkan 引入了 **Layer（层）**与 **Extension（扩展）**机制。Instance Layer 充当了应用与驱动之间的“可选拦截插件”，允许开发者插入钩子（如 Validation Layers）进行无侵入式的调试、性能分析或规范校验。而 Instance Extension 则是对核心 API 能力的水平延伸，用于启用与具体硬件无关的全局功能。例如，通过 VK_KHR_surface 扩展，Vulkan 能够实现跨操作系统的窗口系统集成（WSI），从而将渲染结果呈现在不同平台的显示设备上。
+
+![](https://renderdoc.org/sparse_dispatch2.png)
 
 &emsp;&emsp;可以使用下面的代码查询当前驱动支持的Instance扩展和Layer工具。
 ```cpp
@@ -628,6 +637,8 @@ int main(){
 * **Primary Command Buffers（主命令缓冲）**：可直接提交至队列执行，并能够调用（execute）次级命令缓冲。
 * **Secondary Command Buffers（次级命令缓冲）**：不可直接提交，但可被嵌入至主命令缓冲中执行。这一机制允许多线程并行录制不同任务片段，最终由主命令缓冲统一编排与提交，从而在复杂场景下显著提升命令生成阶段的吞吐效率。
 
+![](https://community.khronos.org/uploads/default/original/2X/2/21b0602898f5044c314d03299bbb703838fdb7df.png)
+
 &emsp;&emsp;主次命令场景，主命令更像是调度器，比如复杂场景拆分，每个子命令处理一部分，主命令负责调度。
 ```cpp
 VkCmdExecuteCommands(primaryCmd, chunkCount, chunkCmdBuffers);
@@ -646,6 +657,10 @@ mi.pCode = (uint32_t*)code.data();
 VkShaderModule mod;
 vkCreateShaderModule(device, &mi, nullptr, &mod);
 ```
+
+![](https://pcper.com/wp-content/uploads/2015/03/6702-khronos-vulkan-flowchart.png)
+
+![](https://pcper.com/wp-content/uploads/2015/03/1f8b-khornos-opencl-flowchart.png)
 
 ### 3.7 PipelineLayout（管线布局）
 &emsp;&emsp;`VkPipelineLayout`（管线布局） 构成了 Vulkan 计算管线的“外部接口规范”。如果将 Shader 比作一个函数，那么管线布局就是该函数的签名，它严格规定了管线在运行时能够访问哪些资源及其组织方式。
@@ -1035,8 +1050,886 @@ vkCmdDispatch(commandBuffer, x, y, z);
 | **主要用途** | 资源销毁、数据读取同步。 | 异步计算任务编排。 | 解决 RAW/WAR 等内存冲突。 |
 | **控制对象** | 整个提交批次（Batch）。 | 不同提交间的依赖。 | 单条或多条指令间的内存访问。 |
 
+## 4 OpenCL vs Vulkan
+
+&emsp;&emsp;下面是OpenCL和Vulkan Compute的流程图，从流程上看两者差异非常大。
+
+```mermaid
+flowchart TB
+
+%% ===================== OpenCL =====================
+subgraph OpenCL["OpenCL Compute Flow"]
+direction TB
+
+A1["Platform Discovery<br/>clGetPlatformIDs"]
+A2["Device Selection<br/>clGetDeviceIDs"]
+A3["Create Context<br/>clCreateContext"]
+A4["Create Command Queue<br/>clCreateCommandQueue"]
+
+A5["Create Buffer/Image<br/>clCreateBuffer"]
+A6["Write Buffer<br/>clEnqueueWriteBuffer"]
+
+A7["Create Program<br/>clCreateProgramWithSource"]
+A8["Build Program<br/>clBuildProgram"]
+A9["Create Kernel<br/>clCreateKernel"]
+
+A10["Set Kernel Args<br/>clSetKernelArg"]
+
+A11["Enqueue Kernel<br/>clEnqueueNDRangeKernel"]
+
+A12["Sync<br/>clFinish / clWaitForEvents"]
+
+A13["Read Buffer<br/>clEnqueueReadBuffer"]
+
+A14["Release<br/>clRelease*"]
+
+A1-->A2-->A3-->A4
+A4-->A5-->A6
+A3-->A7-->A8-->A9-->A10
+A6-->A11
+A10-->A11
+A11-->A12-->A13-->A14
+
+end
+
+%% ===================== Vulkan =====================
+subgraph Vulkan["Vulkan Compute Flow"]
+direction TB
+
+B1["Create Instance<br/>vkCreateInstance"]
+B2["Select Physical Device<br/>vkEnumeratePhysicalDevices"]
+B3["Create Logical Device<br/>vkCreateDevice"]
+B4["Get Queue<br/>vkGetDeviceQueue"]
+
+B5["Create Command Pool<br/>vkCreateCommandPool"]
+
+B6["Create Buffer<br/>vkCreateBuffer"]
+B7["Allocate Memory<br/>vkAllocateMemory"]
+B8["Bind Memory<br/>vkBindBufferMemory"]
+
+B9["Descriptor Set Layout<br/>vkCreateDescriptorSetLayout"]
+B10["Pipeline Layout<br/>vkCreatePipelineLayout"]
+
+B11["Shader Module<br/>vkCreateShaderModule"]
+B12["Compute Pipeline<br/>vkCreateComputePipelines"]
+
+B13["Descriptor Pool<br/>vkCreateDescriptorPool"]
+B14["Allocate Descriptor Set<br/>vkAllocateDescriptorSets"]
+B15["Update Descriptor Set<br/>vkUpdateDescriptorSets"]
+
+B16["Allocate Cmd Buffer<br/>vkAllocateCommandBuffers"]
+B17["Begin Cmd Buffer<br/>vkBeginCommandBuffer"]
+
+B18["Bind Pipeline<br/>vkCmdBindPipeline"]
+B19["Bind Descriptor<br/>vkCmdBindDescriptorSets"]
+
+B20["Pipeline Barrier<br/>vkCmdPipelineBarrier"]
+
+B21["Dispatch<br/>vkCmdDispatch"]
+
+B22["End Cmd Buffer<br/>vkEndCommandBuffer"]
+
+B23["Submit<br/>vkQueueSubmit"]
+
+B24["Wait Fence<br/>vkWaitForFences"]
+
+B25["Readback<br/>vkMapMemory"]
+
+B26["Cleanup<br/>vkDestroy*"]
+
+B1-->B2-->B3-->B4
 
 
+B3-->B6-->B7-->B8
+
+B3-->B9-->B10
+B3-->B11-->B12
+
+B3-->B13-->B14-->B15
+
+B4-->B5
+B12-->B5
+B10-->B5
+B8-->B5
+B15-->B5
+
+B5-->B16-->B17
+
+B17-->B18-->B19-->B20-->B21-->B22
+
+B22-->B23-->B24-->B25-->B26
+
+end
+
+%% ===================== Mapping =====================
+A11 <-.-> B21
+A13  <-.-> B25
+A4  <-.-> B4
+A10 <-.-> B15
+A12 <-.-> B24
+```
+
+这段润色保留了你原稿中详实的技术对比，但在语言组织上进行了“去冗余”处理，强化了工程逻辑的严谨性，并统一了专业术语。
+
+### 4.1 OpenCL 的领地：Vulkan 的局限与不擅长
+
+&emsp;&emsp;OpenCL 诞生之初便定位为**通用并行计算框架**，旨在打破硬件壁垒，实现“一次编程，到处运行”。其设计重心在于非图形领域的高性能计算（HPC）。相比之下，Vulkan 虽具备强大的 Compute 能力，但其根基源于图形渲染，计算功能（Compute Shader）在设计上与顶点、片段着色器平级，更多是为了辅助渲染管线或处理与之相关的通用任务。
+
+基于这种定位差异，OpenCL 在纯计算场景中提供了许多 Vulkan 难以企及（或实现极其复杂）的高级特性：
+
+* **动态并行（Dynamic Parallelism）**
+    * **OpenCL**：支持“设备端入队”（Device-side Enqueue）。GPU 上的 Kernel 可以直接启动新的 Kernel，无需绕回 CPU 调度，极大提升了不规则算法（如自适应网格细化、递归搜索）的效率。
+    * **Vulkan**：所有任务分发（Dispatch）必须由 CPU 发起。若要实现类似逻辑，需由 CPU 频繁监控 GPU 状态并手动提交新任务，这会引入显著的调度延迟与 CPU 开销。
+
+* **管道机制（Pipe，硬件级队列通信）**
+    * **OpenCL**：提供了硬件级的 FIFO 通道，允许不同工作组（Work-group）之间直接进行高效数据传递，无需通过缓慢的全局内存中转。
+    * **Vulkan**：缺乏原生等价机制。开发者若要模拟此类通信，必须手动维护复杂的缓冲区与同步原语（Semaphore/Barrier），不仅增加了内存带宽压力，更难以达到硬件级的交换效率。
+
+* **共享虚拟内存（SVM，Shared Virtual Memory）**
+    * **OpenCL**：允许 CPU 与 GPU 共享统一的地址空间。开发者可以直接使用指针跨设备访问数据，实现真正的“零拷贝”交互。
+    * **Vulkan**：采用独立的内存模型。CPU 与 GPU 之间的数据交互必须经历显式的内存申请、数据拷贝及描述符绑定，对于复杂的数据结构，开发负担与执行开销均较高。
+
+* **异构设备的统一调度**
+    * **OpenCL**：天生支持 CPU、GPU、DSP 及 FPGA 的统一编程。同一套代码可根据性能需求灵活部署在 openEuler 等平台的各类算力单元上。
+    * **Vulkan**：几乎完全聚焦于 GPU。若要涉及多设备协同，必须引入复杂的跨 API 互操作（Interoperability），增加了系统的碎片化风险。
+
+---
+
+### 4.2 Vulkan 的主场：OpenCL 的软肋与不足
+
+&emsp;&emsp;Vulkan 的优势在于其“显式控制”与“渲染融合”。在需要极致压榨硬件性能或计算与图形深度耦合的场景下，Vulkan 表现出压倒性的优势。
+
+* **计算与图形（Compute + Graphics）的深度融合**
+    * **Vulkan**：实现了两者的无缝衔接。计算任务产生的中间结果（如物理模拟后的顶点数据）可以直接作为图形管线的输入，无需任何内存拷贝或上下文切换。在《天涯明月刀》手游等项目中，通过 Compute Shader 驱动的地形系统，充分证明了这种统一调度对实时渲染性能的巨大提升。
+    * **OpenCL**：缺乏原生图形能力，与图形 API 交换数据通常需要昂贵的内存映射或厂商特定的扩展。
+
+* **命令预录制与低 CPU 开销**
+    * **Vulkan**：支持命令缓冲（Command Buffer）的预录制。开发者可以在初始化阶段生成复杂的指令流，运行时仅需单次提交。配合多线程并行录制能力，Vulkan 能将驱动层的 CPU 占用降至最低，非常适合对延迟极其敏感的实时应用。
+    * **OpenCL**：通常采用即时模式（Immediate Mode），驱动程序在任务提交时需承担较重的运行时调度与资源校验职责。在高频任务分发场景下，CPU 往往会成为整个系统的性能瓶颈。
+
+* **驱动级的精细控制权**
+    * **Vulkan**：提供了接近硬件底层的操作权限。
+        * **内存绑定**：开发者可根据存取频率显式指定资源在设备内存（Device Local）或主机内存（Host Visible）中的分布。
+        * **管线屏障**：通过细粒度的 `Pipeline Barrier` 控制缓存刷新，避免了 OpenCL 事件模型中可能存在的隐式同步浪费。
+        * **多队列调度**：支持将计算与渲染任务分发至不同的硬件队列（如异步计算队列），实现真正的硬件级并行。
+    * **OpenCL**：通过高层抽象简化了开发，但也屏蔽了底层细节。开发者无法根据具体硬件特性进行针对性的存储布局或同步优化，难以触及性能的上限。
+
+## 5 代码附录
+
+&emsp;&emsp;高斯滤波kernel:
+```glsl
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform PushConstants {
+    int kernelSize;
+} pushConstants;
+
+layout(binding = 0) uniform sampler2D inputImage;
+layout(binding = 1, rgba8) uniform writeonly image2D outputImage;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputImage);
+    
+    if (coord.x >= size.x || coord.y >= size.y) {
+        return;
+    }
+    
+    int kernelRadius = pushConstants.kernelSize / 2;
+    float kernel[7] = float[7](
+        0.0367, 0.1086, 0.1814, 0.2166,
+        0.1814, 0.1086, 0.0367
+    );
+    
+    vec4 sum = vec4(0.0);
+    vec2 invSize = 1.0 / vec2(size);
+    
+    for (int j = -kernelRadius; j <= kernelRadius; j++) {
+        for (int i = -kernelRadius; i <= kernelRadius; i++) {
+            vec2 uv = (vec2(coord + ivec2(i, j)) + 0.5) * invSize;
+            vec4 color = texture(inputImage, uv);
+            sum += color * kernel[i + kernelRadius] * kernel[j + kernelRadius];
+        }
+    }
+    
+    sum.a = 1.0;
+    imageStore(outputImage, coord, sum);
+}
+```
+
+&emsp;&emsp;下面是完整代码：
+```cpp
+#include "Benchmark.hpp"
+#include <vulkan/vulkan.hpp>
+#include <opencv2/opencv.hpp>
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <fstream>
+#include <array>
+#include <cstring>
+#include <cstdio>
+#include "Log.hpp"
+#include "Utils.hpp"
+
+struct alignas(16) ImageParams {
+    float contrast;
+    float brightness;
+    float saturation;
+    float sharpness;
+    float scaleFactor;
+    float padding[3];
+};
+
+static std::vector<char> readShaderFile(const std::string& filename) {
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);
+    size_t fileSize = (size_t)file.tellg();
+    std::vector<char> buffer(fileSize);
+    file.seekg(0);
+    file.read(buffer.data(), fileSize);
+    return buffer;
+}
+
+class VulkanProcessor {
+public:
+    VulkanProcessor(uint32_t width, uint32_t height)
+        : mWidth(width), mHeight(height),
+          mOutWidth(width), mOutHeight(height) {
+        fprintf(stderr, "VulkanProcessor: %ux%u\n", width, height);
+        if (width > 8192 || height > 8192) {
+            throw std::runtime_error("Image too large for Vulkan processing");
+        }
+        if (width == 0 || height == 0) {
+            throw std::runtime_error("Invalid image dimensions");
+        }
+        fprintf(stderr, "Calling initVulkan...\n");
+        initVulkan();
+        fprintf(stderr, "initVulkan done\n");
+    }
+
+    ~VulkanProcessor() { cleanup(); }
+
+    void process(const cv::Mat& input, cv::Mat& output) {
+        VkCommandBuffer cmd = beginCmd();
+
+        VkDeviceSize inputSize = mWidth * mHeight * 4;
+        VkDeviceSize outputSize = mOutWidth * mOutHeight * 4;
+
+        VkBuffer inputStagingBuf{}, outputStagingBuf{};
+        VkDeviceMemory inputStagingMem{}, outputStagingMem{};
+
+        createBuffer(inputSize,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            inputStagingBuf, inputStagingMem);
+
+        createBuffer(outputSize,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            outputStagingBuf, outputStagingMem);
+
+        void* inputData = nullptr;
+        vkMapMemory(device, inputStagingMem, 0, inputSize, 0, &inputData);
+        for (uint32_t y = 0; y < mHeight; y++) {
+            memcpy((char*)inputData + y * mWidth * 4,
+                   input.ptr(y),
+                   mWidth * 4);
+        }
+        vkUnmapMemory(device, inputStagingMem);
+
+        transitionImage(cmd, inputImage,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+        VkBufferImageCopy inputCopy{};
+        inputCopy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        inputCopy.imageExtent = {mWidth, mHeight, 1};
+        vkCmdCopyBufferToImage(cmd, inputStagingBuf, inputImage,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &inputCopy);
+
+        transitionImage(cmd, inputImage,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        transitionImage(cmd, outputImage,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_GENERAL);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+
+        int kernelSize = 7;
+        vkCmdPushConstants(cmd, pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int), &kernelSize);
+
+        vkCmdDispatch(cmd,
+            (mOutWidth + 15) / 16,
+            (mOutHeight + 15) / 16,
+            1);
+
+        transitionImage(cmd, outputImage,
+            VK_IMAGE_LAYOUT_GENERAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+        VkBufferImageCopy outputCopy{};
+        outputCopy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        outputCopy.imageExtent = {mOutWidth, mOutHeight, 1};
+        vkCmdCopyImageToBuffer(cmd, outputImage,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            outputStagingBuf, 1, &outputCopy);
+
+        endCmd(cmd);
+
+        output.create(mOutHeight, mOutWidth, CV_8UC4);
+        void* outputData = nullptr;
+        vkMapMemory(device, outputStagingMem, 0, outputSize, 0, &outputData);
+        memcpy(output.data, outputData, outputSize);
+        vkUnmapMemory(device, outputStagingMem);
+
+        vkDestroyBuffer(device, inputStagingBuf, nullptr);
+        vkFreeMemory(device, inputStagingMem, nullptr);
+        vkDestroyBuffer(device, outputStagingBuf, nullptr);
+        vkFreeMemory(device, outputStagingMem, nullptr);
+    }
+
+private:
+    uint32_t mWidth, mHeight;
+    uint32_t mOutWidth, mOutHeight;
+
+    VkInstance instance{};
+    VkPhysicalDevice physicalDevice{};
+    VkDevice device{};
+    VkQueue queue{};
+    VkCommandPool pool{};
+
+    VkImage inputImage{}, outputImage{};
+    VkDeviceMemory inputMem{}, outputMem{};
+    VkImageView inputView{}, outputView{};
+    VkSampler sampler{};
+
+    VkDescriptorSetLayout setLayout{};
+    VkDescriptorPool descPool{};
+    VkDescriptorSet descriptorSet{};
+    VkPipelineLayout pipelineLayout{};
+    VkPipeline pipeline{};
+
+    VkDebugUtilsMessengerEXT debugMessenger{};
+
+    static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
+        VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+        VkDebugUtilsMessageTypeFlagsEXT type,
+        const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
+        void* pUserData) {
+        
+        const char* severityStr = "INFO";
+        if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) severityStr = "ERROR";
+        else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) severityStr = "WARN";
+        
+        fprintf(stderr, "[Vulkan %s] %s\n", severityStr, pCallbackData->pMessage);
+        return VK_FALSE;
+    }
+
+    void printInstanceExtensions() {
+        uint32_t count = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> exts(count);
+        vkEnumerateInstanceExtensionProperties(nullptr, &count, exts.data());
+        
+        printf("\n=== Instance Extensions (%u) ===\n", count);
+        for (const auto& ext : exts) {
+            printf("  %s (v%u)\n", ext.extensionName, ext.specVersion);
+        }
+    }
+
+    void printInstanceLayers() {
+        uint32_t count = 0;
+        vkEnumerateInstanceLayerProperties(&count, nullptr);
+        std::vector<VkLayerProperties> layers(count);
+        vkEnumerateInstanceLayerProperties(&count, layers.data());
+        
+        printf("\n=== Instance Layers (%u) ===\n", count);
+        for (const auto& layer : layers) {
+            printf("  %s (v%u): %s\n", 
+                   layer.layerName, 
+                   layer.implementationVersion,
+                   layer.description);
+        }
+    }
+
+    void printDeviceExtensions(VkPhysicalDevice dev) {
+        uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(dev, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> exts(count);
+        vkEnumerateDeviceExtensionProperties(dev, nullptr, &count, exts.data());
+        
+        printf("\n=== Device Extensions (%u) ===\n", count);
+        for (const auto& ext : exts) {
+            printf("  %s (v%u)\n", ext.extensionName, ext.specVersion);
+        }
+    }
+
+    void printDeviceLayers(VkPhysicalDevice dev) {
+        uint32_t count = 0;
+        vkEnumerateDeviceLayerProperties(dev, &count, nullptr);
+        std::vector<VkLayerProperties> layers(count);
+        vkEnumerateDeviceLayerProperties(dev, &count, layers.data());
+        
+        printf("\n=== Device Layers (%u) ===\n", count);
+        for (const auto& layer : layers) {
+            printf("  %s (v%u): %s\n", 
+                   layer.layerName, 
+                   layer.implementationVersion,
+                   layer.description);
+        }
+    }
+
+    bool checkValidationLayerSupport() {
+        uint32_t count = 0;
+        vkEnumerateInstanceLayerProperties(&count, nullptr);
+        std::vector<VkLayerProperties> layers(count);
+        vkEnumerateInstanceLayerProperties(&count, layers.data());
+        
+        for (const auto& layer : layers) {
+            if (strcmp(layer.layerName, "VK_LAYER_KHRONOS_validation") == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void setupDebugMessenger() {
+        VkDebugUtilsMessengerCreateInfoEXT ci{};
+        ci.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+        ci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+                             VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                             VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        ci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                         VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                         VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+        ci.pfnUserCallback = debugCallback;
+        ci.pUserData = nullptr;
+
+        auto func = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+            instance, "vkCreateDebugUtilsMessengerEXT");
+        if (func != nullptr) {
+            func(instance, &ci, nullptr, &debugMessenger);
+        }
+    }
+
+    void destroyDebugMessenger() {
+        auto func = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+            instance, "vkDestroyDebugUtilsMessengerEXT");
+        if (func != nullptr && debugMessenger) {
+            func(instance, debugMessenger, nullptr);
+        }
+    }
+
+    // ---------------- 初始化 ----------------
+    void initVulkan() {
+        printInstanceExtensions();
+        printInstanceLayers();
+
+        bool enableValidation = checkValidationLayerSupport();
+        if (enableValidation) {
+            printf("\n=== Enabling VK_LAYER_KHRONOS_validation ===\n");
+        } else {
+            printf("\n=== Validation layer not available ===\n");
+        }
+
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        app.apiVersion = VK_API_VERSION_1_0;
+
+        std::vector<const char*> extensions;
+        extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+
+        VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        ci.pApplicationInfo = &app;
+        ci.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+        ci.ppEnabledExtensionNames = extensions.data();
+
+        const char* validationLayer = "VK_LAYER_KHRONOS_validation";
+        if (enableValidation) {
+            ci.enabledLayerCount = 1;
+            ci.ppEnabledLayerNames = &validationLayer;
+        }
+        
+        VkResult result = vkCreateInstance(&ci, nullptr, &instance);
+        if (result != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create Vulkan instance");
+        }
+
+        if (enableValidation) {
+            setupDebugMessenger();
+        }
+
+        uint32_t count = 0;
+        VkResult enumResult = vkEnumeratePhysicalDevices(instance, &count, nullptr);
+        if (enumResult != VK_SUCCESS || count == 0) {
+            destroyDebugMessenger();
+            vkDestroyInstance(instance, nullptr);
+            printf("vulkan device count: %d\n", count);
+            throw std::runtime_error("No Vulkan devices found");
+        }
+        
+        std::vector<VkPhysicalDevice> devs;
+        devs.resize(count);
+        vkEnumeratePhysicalDevices(instance, &count, devs.data());
+        physicalDevice = devs[0];
+
+        printDeviceExtensions(physicalDevice);
+        printDeviceLayers(physicalDevice);
+
+        uint32_t qCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, nullptr);
+        if (qCount == 0) {
+            destroyDebugMessenger();
+            vkDestroyInstance(instance, nullptr);
+            throw std::runtime_error("No queue families found");
+        }
+        
+        std::vector<VkQueueFamilyProperties> qProps;
+        qProps.resize(qCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, qProps.data());
+
+        uint32_t qIndex = 0;
+        for (uint32_t i = 0; i < qCount; i++) {
+            if (qProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+                qIndex = i;
+                break;
+            }
+        }
+
+        float prio = 1.f;
+        VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+        qci.queueFamilyIndex = qIndex;
+        qci.queueCount = 1;
+        qci.pQueuePriorities = &prio;
+
+        VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+        dci.queueCreateInfoCount = 1;
+        dci.pQueueCreateInfos = &qci;
+
+        vkCreateDevice(physicalDevice, &dci, nullptr, &device);
+        vkGetDeviceQueue(device, qIndex, 0, &queue);
+
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.queueFamilyIndex = qIndex;
+        vkCreateCommandPool(device, &pci, nullptr, &pool);
+
+        createImages();
+        createDescriptors();
+        createPipeline();
+    }
+
+    // ---------------- Image ----------------
+    void createImages() {
+        createImage(mWidth, mHeight,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            inputImage, inputMem, inputView);
+
+        createImage(mOutWidth, mOutHeight,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            outputImage, outputMem, outputView);
+
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = VK_FILTER_LINEAR;
+        sci.minFilter = VK_FILTER_LINEAR;
+        sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+
+        vkCreateSampler(device, &sci, nullptr, &sampler);
+    }
+
+    void createImage(uint32_t w, uint32_t h,
+        VkImageUsageFlags usage,
+        VkImage& image,
+        VkDeviceMemory& mem,
+        VkImageView& view) {
+
+        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.extent = {w, h, 1};
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = usage;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+
+        vkCreateImage(device, &ici, nullptr, &image);
+
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(device, image, &req);
+
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = findMemory(req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        vkAllocateMemory(device, &ai, nullptr, &mem);
+        vkBindImageMemory(device, image, mem, 0);
+
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = image;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+
+        vkCreateImageView(device, &vi, nullptr, &view);
+    }
+
+    // ---------------- Descriptor ----------------
+    void createDescriptors() {
+        std::array<VkDescriptorSetLayoutBinding,2> b{};
+
+        b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,
+                VK_SHADER_STAGE_COMPUTE_BIT};
+        b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,
+                VK_SHADER_STAGE_COMPUTE_BIT};
+
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        ci.bindingCount = 2;
+        ci.pBindings = b.data();
+        vkCreateDescriptorSetLayout(device, &ci, nullptr, &setLayout);
+
+        VkPushConstantRange pushConstantRange{};
+        pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pushConstantRange.offset = 0;
+        pushConstantRange.size = sizeof(int);
+
+        VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pi.setLayoutCount = 1;
+        pi.pSetLayouts = &setLayout;
+        pi.pushConstantRangeCount = 1;
+        pi.pPushConstantRanges = &pushConstantRange;
+        vkCreatePipelineLayout(device, &pi, nullptr, &pipelineLayout);
+
+        VkDescriptorPoolSize sizes[2] = {
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1}
+        };
+
+        VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pci.maxSets = 1;
+        pci.poolSizeCount = 2;
+        pci.pPoolSizes = sizes;
+        vkCreateDescriptorPool(device, &pci, nullptr, &descPool);
+
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = descPool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &setLayout;
+        vkAllocateDescriptorSets(device, &ai, &descriptorSet);
+
+        VkDescriptorImageInfo in{};
+        in.imageView = inputView;
+        in.sampler = sampler;
+        in.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkDescriptorImageInfo out{};
+        out.imageView = outputView;
+        out.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet w[2]{};
+
+        w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,
+                descriptorSet,0,0,1,
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                &in};
+
+        w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,
+                descriptorSet,1,0,1,
+                VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                &out};
+
+        vkUpdateDescriptorSets(device, 2, w, 0, nullptr);
+    }
+
+    // ---------------- Pipeline ----------------
+    void createPipeline() {
+        const auto shaderPath = "/home/rookie/workspace/codespace/ComputeExample/res/vl/upscale_sharpen.comp.spv";
+        auto code = readShaderFile(shaderPath);
+
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = code.size();
+        mi.pCode = (uint32_t*)code.data();
+
+        VkShaderModule mod;
+        vkCreateShaderModule(device, &mi, nullptr, &mod);
+
+        VkComputePipelineCreateInfo pi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pi.stage.module = mod;
+        pi.stage.pName = "main";
+        pi.layout = pipelineLayout;
+
+        vkCreateComputePipelines(device, VK_NULL_HANDLE,1,&pi,nullptr,&pipeline);
+        vkDestroyShaderModule(device, mod, nullptr);
+    }
+
+// ---------- 工具 ----------
+    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                      VkMemoryPropertyFlags props,
+                      VkBuffer& buf, VkDeviceMemory& mem) {
+
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = size;
+        bi.usage = usage;
+        vkCreateBuffer(device, &bi, nullptr, &buf);
+
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(device, buf, &req);
+
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = findMemory(req.memoryTypeBits, props);
+
+        vkAllocateMemory(device, &ai, nullptr, &mem);
+        vkBindBufferMemory(device, buf, mem, 0);
+    }
+
+    uint32_t findMemory(uint32_t typeBits, VkMemoryPropertyFlags props) {
+        if (typeBits == 0) typeBits = 1;
+        
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice, &mp);
+
+        for (uint32_t i=0;i<mp.memoryTypeCount;i++)
+            if ((typeBits & (1u << i)) &&
+                (mp.memoryTypes[i].propertyFlags & props) == props)
+                return i;
+
+        for (uint32_t i=0;i<mp.memoryTypeCount;i++)
+            if (typeBits & (1u << i))
+                return i;
+
+        throw std::runtime_error("No memory type");
+    }
+
+    void transitionImage(VkCommandBuffer cmd,
+        VkImage img,
+        VkImageLayout oldL,
+        VkImageLayout newL) {
+
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = oldL;
+        b.newLayout = newL;
+        b.image = img;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+
+        VkPipelineStageFlags src, dst;
+
+        if (oldL == VK_IMAGE_LAYOUT_UNDEFINED && newL == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+            src = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            dst = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        } else if (oldL == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newL == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            src = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            dst = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        } else if (oldL == VK_IMAGE_LAYOUT_UNDEFINED && newL == VK_IMAGE_LAYOUT_GENERAL) {
+            src = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            dst = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        } else if (oldL == VK_IMAGE_LAYOUT_GENERAL && newL == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+            src = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            dst = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        } else {
+            throw std::runtime_error("bad layout");
+        }
+
+        vkCmdPipelineBarrier(cmd, src, dst, 0,
+            0,nullptr,0,nullptr,1,&b);
+    }
+
+    VkCommandBuffer beginCmd() {
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = pool;
+        ai.commandBufferCount = 1;
+
+        VkCommandBuffer cmd;
+        vkAllocateCommandBuffers(device, &ai, &cmd);
+
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vkBeginCommandBuffer(cmd, &bi);
+        return cmd;
+    }
+
+    void endCmd(VkCommandBuffer cmd) {
+        vkEndCommandBuffer(cmd);
+
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+
+        vkQueueSubmit(queue,1,&si,VK_NULL_HANDLE);
+        vkQueueWaitIdle(queue);
+
+        vkFreeCommandBuffers(device, pool,1,&cmd);
+    }
+
+    void cleanup() {
+        vkDestroySampler(device, sampler, nullptr);
+        vkDestroyPipeline(device, pipeline, nullptr);
+        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+        vkDestroyDescriptorPool(device, descPool, nullptr);
+        vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
+
+        vkDestroyImageView(device, inputView, nullptr);
+        vkDestroyImageView(device, outputView, nullptr);
+        vkDestroyImage(device, inputImage, nullptr);
+        vkDestroyImage(device, outputImage, nullptr);
+        vkFreeMemory(device, inputMem, nullptr);
+        vkFreeMemory(device, outputMem, nullptr);
+
+        vkDestroyCommandPool(device, pool, nullptr);
+        vkDestroyDevice(device, nullptr);
+        destroyDebugMessenger();
+        vkDestroyInstance(instance, nullptr);
+    }
+};
+
+void BM_Vulkan_GaussianBlur(benchmark::State& state) {
+    try {
+        cv::Mat img = cv::imread(GetImagePath());
+        if(img.empty()){
+            throw std::runtime_error("Failed to load image");
+        }
+        
+        if(img.cols == 0 || img.rows == 0) {
+            throw std::runtime_error("Invalid image dimensions");
+        }
+        
+        cv::cvtColor(img, img, cv::COLOR_BGR2RGBA);
+
+        static VulkanProcessor* proc = new VulkanProcessor(img.cols, img.rows);
+        static cv::Mat out;
+
+        for (auto _ : state) {
+            proc->process(img, out);
+        }
+
+        cv::cvtColor(out, out, cv::COLOR_RGBA2BGR);
+        cv::imwrite("../res/output/vulkan_gaussian.jpg", out);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Vulkan error: %s\n", e.what());
+        throw;
+    }
+}
+
+```
 # 参考文献
 - [Vulkan High Level Shader Language Comparison](https://docs.vulkan.org/guide/latest/high_level_shader_language_comparison.html)。
-- 
+- [Brief guide to Vulkan layers](https://renderdoc.org/vulkan-layer-guide.html)
+- [OpenCL 与 Vulkan 计算](https://community.khronos.org/t/opencl-vs-vulkan-compute/7132/7)
+- [Vulkan 与 OpenCL 在 GPGPU 方面的比较](https://www.reddit.com/r/vulkan/comments/11lklcx/vulkan_vs_opencl_for_gpgpu/)
+- [Compute Shader](https://docs.vulkan.org/tutorial/latest/11_Compute_Shader.html)
+- [GDC 15: What Is Vulkan (glNext), SPIR-V, and OpenCL 2.1?](https://pcper.com/2015/03/gdc-15-what-is-vulkan-glnext-spir-v-and-opencl-2-1/)
