@@ -1219,7 +1219,45 @@ A12 <-.-> B24
 - **GPU**: NVIDIA GeForce RTX 3050
 - **测试方法**: 每个工作负载运行12次迭代，取统计平均值
 
-&emsp;&emsp;
+&emsp;&emsp;简单测试3x3图像模糊的性能，下面的数据Vulkan的性能波动较大（CV: 143.7%），某些迭代中出现显著延迟，因此可信度有限。
+
+| 指标 | Vulkan | OpenCL | 性能差异 |
+|------|---------|---------|----------|
+| **平均执行时间** | 0.0364 ms | 0.1027 ms | **Vulkan快2.82倍** |
+| **中位数** | 0.0310 ms | 0.0970 ms | - |
+| **标准差** | 0.0524 ms | 0.0380 ms | - |
+| **变异系数 (CV)** | 143.7% | 37.0% | - |
+| **最小值** | 0.0270 ms | 0.0270 ms | - |
+| **最大值** | 0.8320 ms | 0.3090 ms | - |
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/vulkan_opencl_Image_Blur_comparison.png)
+
+
+| 指标 | Vulkan | OpenCL | 性能差异 |
+|------|---------|---------|----------|
+| **平均执行时间** | 0.0376 ms | 3.2479 ms | **Vulkan快86.4倍** |
+| **中位数** | 0.0300 ms | 3.3200 ms | - |
+| **标准差** | 0.0295 ms | 0.7110 ms | - |
+| **变异系数 (CV)** | 78.4% | 21.9% | - |
+| **最小值** | 0.0240 ms | 0.0290 ms | - |
+| **最大值** | 0.2100 ms | 4.7130 ms | - |
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/vulkan_opencl_Compute_Heavy_comparison.png)
+
+
+| 指标 | Vulkan | OpenCL | 性能差异 |
+|------|---------|---------|----------|
+| **平均执行时间** | 67.8907 ms | 68.2659 ms | **Vulkan快1.01倍** |
+| **中位数** | 67.7985 ms | 68.1720 ms | - |
+| **标准差** | 0.2887 ms | 0.4365 ms | - |
+| **变异系数 (CV)** | 0.4% | 0.6% | - |
+| **最小值** | 67.3940 ms | 67.5210 ms | - |
+| **最大值** | 68.7710 ms | 70.7830 ms | - |
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/vulkan_opencl_Memory_Read_comparison.png)
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/vulkan_opencl_overall_comparison.png)
+
 ## 5 代码附录
 
 &emsp;&emsp;高斯滤波kernel:
