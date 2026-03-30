@@ -56,6 +56,8 @@
 * **顶层对象：`Instance`**  
   `Instance` 是 Vulkan 的全局入口，负责建立应用与底层驱动的连接，完成运行时初始化（包括扩展加载、验证层启用、物理设备枚举）。它不承担资源管理或计算执行职责，更接近“全局运行时入口”；与 OpenCL 中直接关联设备资源的 `context` 不同，Vulkan 的 `Device` 才更接近 OpenCL `context` 的角色。此外，`Instance` 无隐式状态，不绑定线程或渲染目标，通常一个应用仅需一个 `Instance` 即可。
 
+![](https://vulkan.lunarg.com/doc/view/latest/mac/images/high_level_loader.png)
+
 ---
 
 * **设备对象：`PhysicalDevice`、`Device`、`Queue`**  
@@ -80,6 +82,8 @@
   - `PipelineLayout` 定义 Shader 所需的资源接口（如 DescriptorSet 布局、Push Constant），相当于 Shader 与外部资源的“接口契约”；  
   - `ComputePipeline` 封装计算执行的完整状态（Shader + 资源布局），为不可变对象，创建成本高但执行效率高；  
   - `CommandPool` 管理命令缓冲区的内存分配，`CommandBuffer` 则负责录制具体 GPU 指令（如绑定管线、分发计算任务）。
+
+![](https://www.khronos.org/assets/uploads/apis/2024-spirv-language-ecosystem.jpg)
 
 &emsp;&emsp;Vulkan 对象的创建与销毁需**显式管理**，使用完成后必须调用对应销毁函数释放资源，否则会导致显存或系统内存泄漏。此外，对象间存在严格的层级依赖关系：所有子对象由父对象创建（如 `Device` 依赖 `Instance`，资源与管线对象依赖 `Device`，`CommandBuffer` 依赖 `CommandPool`），生命周期需遵循“先创建父对象、再创建子对象；销毁时先销毁子对象、再销毁父对象”的原则。
 
@@ -589,12 +593,16 @@ VkAllocateCommandBuffers(device, &ai, &cmd);
 ### 3.5 VkCommandBuffer（命令缓冲）
 &emsp;&emsp;**`VkCommandBuffer`** 是 Vulkan 中承载 GPU 指令的核心抽象。与 OpenCL 通过 `clEnqueue...` 系列接口将单条命令直接提交至执行队列的方式不同，Vulkan 将“命令录制（recording）”与“命令提交（submission）”彻底解耦：开发者需先将一组指令顺序录制到命令缓冲中，在完成录制后，再以整体形式提交至队列执行。
 
+![](https://docs.vulkan.org/spec/latest/_images/commandbuffer_lifecycle.svg)
+
 &emsp;&emsp;每个命令缓冲严格遵循一套显式的状态机转换模型：
 
 * **Initial（初始态）**：命令缓冲刚分配后的状态。
 * **Recording（录制态）**：调用 `VkBeginCommandBuffer` 后进入，可向其中写入指令流。
 * **Executable（可执行态）**：调用 `VkEndCommandBuffer` 结束录制后进入，此时内容已固化，可被提交执行。
 * **Pending（挂起态）**：经由 `VkQueueSubmit` 提交后进入，表示 GPU 正在执行该命令缓冲；在此阶段，严禁对其进行修改或重置操作。
+
+![](https://static.packt-cdn.com/products/9781786469809/graphics/image_05_003.jpg)
 
 &emsp;&emsp;在录制阶段，开发者可以插入诸如 `VkCmdDispatch`（语义上对应 OpenCL 的 `clEnqueueNDRangeKernel`）或 `VkCmdCopyBuffer` 等具体指令。Vulkan 的一项关键优势在于**命令缓冲的可复用性**：对于指令序列稳定的任务（例如逐帧执行的物理模拟或固定流程的后处理），可以一次录制、多次提交，从而显著降低 CPU 侧的调度与录制开销。
 
@@ -868,6 +876,8 @@ transitionImage(cmd, inputImage,
 
 &emsp;&emsp;`VkDescriptorPool`（描述符池） 与 `VkDescriptorSet`（描述符集） 共同构成了 Vulkan 资源绑定的动态管理层。在显式 API 的视角下，描述符集并非随用随取的临时变量，而是必须从预分配的“池”空间中获取的结构化资源。
 
+![](https://rawsourcecode.io/vulkan-descriptor-set-cheat-sheet/image2_pipelines_and_descriptors.svg)
+
 &emsp;&emsp;描述符池 充当了内存分配器的角色。开发者在初始化阶段需显式定义池的规模，包括可容纳的描述符集总数以及各类资源（如 SSBO、采样器等）的具体配额。这种精细的控制确保了驱动程序能够以 O(1) 的复杂度完成内存分配，彻底消除了由于内存碎片化导致的性能波动。
 ```cpp
 void createDescriptors() {
@@ -934,6 +944,8 @@ void createDescriptors() {
 
 ### 3.8 Pipeline（管线）
 &emsp;&emsp;`VkPipeline` 它封装了执行内核所需的所有状态。将 VkShaderModule 定义的计算逻辑与 VkPipelineLayout 定义的资源契约进行深层绑定，并经由驱动程序转化为 GPU 可直接执行的硬件指令流。
+
+![](https://img2023.cnblogs.com/blog/78946/202304/78946-20230417161745484-878238448.png)
 
 &emsp;&emsp;计算管线的设计核心在于显式的静态化。在 OpenCL 模型下，驱动程序往往在运行时（Runtime）承担了过多的状态校验与编译开销；而 Vulkan 则要求开发者在初始化阶段完成所有重负载的“烘焙”工作。这种“一次编译，多次高效分发”的模式，使得 vkCmdDispatch 能够以接近零延迟的效率触达硬件核心。
 
@@ -1219,40 +1231,13 @@ A12 <-.-> B24
 - **GPU**: NVIDIA GeForce RTX 3050
 - **测试方法**: 每个工作负载运行12次迭代，取统计平均值
 
-&emsp;&emsp;简单测试3x3图像模糊的性能，下面的数据Vulkan的性能波动较大（CV: 143.7%），某些迭代中出现显著延迟，因此可信度有限。
-
-| 指标 | Vulkan | OpenCL | 性能差异 |
-|------|---------|---------|----------|
-| **平均执行时间** | 0.0364 ms | 0.1027 ms | **Vulkan快2.82倍** |
-| **中位数** | 0.0310 ms | 0.0970 ms | - |
-| **标准差** | 0.0524 ms | 0.0380 ms | - |
-| **变异系数 (CV)** | 143.7% | 37.0% | - |
-| **最小值** | 0.0270 ms | 0.0270 ms | - |
-| **最大值** | 0.8320 ms | 0.3090 ms | - |
+&emsp;&emsp;简单测试3x3图像模糊、高计算场景、读写内存的性能，下面的数据Vulkan的性能波动较大（CV: 143.7%），某些迭代中出现显著延迟，因此可信度有限。
 
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/vulkan_opencl_Image_Blur_comparison.png)
 
 
-| 指标 | Vulkan | OpenCL | 性能差异 |
-|------|---------|---------|----------|
-| **平均执行时间** | 0.0376 ms | 3.2479 ms | **Vulkan快86.4倍** |
-| **中位数** | 0.0300 ms | 3.3200 ms | - |
-| **标准差** | 0.0295 ms | 0.7110 ms | - |
-| **变异系数 (CV)** | 78.4% | 21.9% | - |
-| **最小值** | 0.0240 ms | 0.0290 ms | - |
-| **最大值** | 0.2100 ms | 4.7130 ms | - |
-
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/vulkan_opencl_Compute_Heavy_comparison.png)
 
-
-| 指标 | Vulkan | OpenCL | 性能差异 |
-|------|---------|---------|----------|
-| **平均执行时间** | 67.8907 ms | 68.2659 ms | **Vulkan快1.01倍** |
-| **中位数** | 67.7985 ms | 68.1720 ms | - |
-| **标准差** | 0.2887 ms | 0.4365 ms | - |
-| **变异系数 (CV)** | 0.4% | 0.6% | - |
-| **最小值** | 67.3940 ms | 67.5210 ms | - |
-| **最大值** | 68.7710 ms | 70.7830 ms | - |
 
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/vulkan_opencl_Memory_Read_comparison.png)
 
