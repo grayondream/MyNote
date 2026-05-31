@@ -45,3 +45,12 @@ html_theme_options = {
 }
 
 mathjax_path = 'https://cdn.jsdelivr.net/npm/mathjax@2/MathJax.js?config=TeX-AMS-MML_HTMLorMML'
+
+# 注入在线 Mermaid 脚本
+html_js_files = [
+    'https://cloudflare.com'
+]
+
+# 允许在 Markdown 中无缝使用 mermaid 语法
+myst_fence_as_directive = ["mermaid"]
+
