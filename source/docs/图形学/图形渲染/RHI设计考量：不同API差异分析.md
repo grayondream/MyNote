@@ -1407,6 +1407,8 @@ public:
 
 ### 9.2 RHI 设计的关键原则
 
+![](https://docs.godotengine.org/en/stable/_images/renderers_rendering_layers.webp)
+
 &emsp;&emsp;设计跨平台 RHI 时，需要遵循以下关键原则：
 
 1. **接口形状像最显式的 API**：以 Vulkan/DX12 为基准设计接口，然后向旧 API 降级仿真。
