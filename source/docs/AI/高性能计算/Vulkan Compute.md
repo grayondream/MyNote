@@ -1955,7 +1955,7 @@ void BM_Vulkan_GaussianBlur(benchmark::State& state) {
 }
 
 ```
-# 参考文献
+## 参考文献
 - [Vulkan High Level Shader Language Comparison](https://docs.vulkan.org/guide/latest/high_level_shader_language_comparison.html)。
 - [Brief guide to Vulkan layers](https://renderdoc.org/vulkan-layer-guide.html)
 - [OpenCL 与 Vulkan 计算](https://community.khronos.org/t/opencl-vs-vulkan-compute/7132/7)
