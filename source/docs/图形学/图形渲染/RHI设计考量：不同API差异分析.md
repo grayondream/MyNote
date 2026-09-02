@@ -10,11 +10,15 @@
 
 &emsp;&emsp;理解这些差异不只是为了"选哪个 API"，更是为了理解 GPU 的工作方式本身。当你需要写一个跨引擎、跨平台的渲染抽象层（RHI）时，这些差异会直接决定抽象层的形状。RHI 的本质问题可以用一句话概括：**用什么形状的接口，才能让所有后端都不扭曲地映射到各自的本地 API？**
 
+![](https://learnopengl.com/img/getting-started/pipeline.png)
+
 &emsp;&emsp;本文先给出六大 API 的总览与定位，再从同步机制、资源、线程模型等多个维度逐项对比它们的差异，接着分析各 API 如此设计的背后考量，最后系统梳理 RHI 设计中的关键问题与工程取舍。
 
 ## 2 六大 API 总览
 
 &emsp;&emsp;现代 GPU 虽然采用统一着色器架构，图形与计算共享同一组可编程核心，但二者侧重截然不同：图形任务依赖光栅化器、纹理单元、ROP 等固定功能硬件，沿顶点→光栅化→像素着色的刚性流水线执行，对每帧实时性要求苛刻，内存访问具有较强空间局部性，线程间通信少、同步隐式；而计算任务则完全脱离固定管线，通过计算着色器或 CUDA 等自由定义线程块与共享内存，显式控制寄存器、各级缓存和全局内存的分配与访问，支持组内屏障、原子操作等丰富同步机制，精度范围更广（FP64/FP32/FP16/BF16/INT8 乃至张量核心加速的矩阵运算），且对单次延迟容忍度更高。在现代 API（Vulkan、Direct3D 12、Metal）中，二者可通过异步队列并行执行，使物理模拟、AI 推理等计算负载与图形渲染重叠，从而充分利用硬件资源、降低整体帧时间。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/render_api_dx_metal_gl_vulkan.png)
 
 | 维度 | OpenGL | OpenGL ES | Direct3D 11 | Direct3D 12 | Metal | Vulkan |
 | ---- | ------ | --------- | ----------- | ----------- | ----- | ------ |
@@ -38,21 +42,30 @@
 
 &emsp;&emsp;OpenGL 的主要优势在于 API 直观、学习曲线平缓，跨平台支持 Windows、Linux 和 macOS（尽管 macOS 已停更在 4.1），且拥有 RenderDoc 等成熟调试工具和丰富教程。但其劣势也很明显：上下文模型限制多线程命令录制，驱动内部状态跟踪与验证带来较高 CPU 开销，内存管理不透明可能导致碎片和性能波动，同时不同平台版本碎片化严重，功能支持不一致。
 
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/Linux_kernel_and_OpenGL_video_games.png)
+
 &emsp;&emsp;在设计跨平台 RHI 时，OpenGL 后端通常作为“基线”实现，用于兼容旧硬件或快速原型。RHI 需要将 OpenGL 的状态机模型映射到显式 API 的管线状态对象（PSO）模型，这可能需要维护内部状态缓存和延迟提交。由于 OpenGL 的多线程限制，RHI 可能需要将命令录制限制在主线程，或使用辅助上下文进行纹理上传等操作。
+
 ### 3.2 Vulkan
 
 &emsp;&emsp;Vulkan 是 Khronos Group 于 2016 年发布的现代图形 API，旨在提供低开销、跨平台的硬件抽象。它取代了 OpenGL 的地位，成为 Android、Linux 和 Windows 上高性能图形和计算的首选。Vulkan 采用完全显式控制模型，应用负责内存管理、资源状态同步、管线状态构建等所有细节，驱动仅执行最小验证。它支持多线程原生命令录制，命令缓冲区可在多线程上并行录制，显著提升 CPU 利用率。着色器使用 SPIR-V 二进制格式，支持离线编译和跨后端共享。资源绑定通过描述符集（Descriptor Set）实现，支持动态偏移和更新。渲染通道（Render Pass）显式定义，可优化 tile-based GPU 的加载/存储操作。同步原语包括信号量（Semaphore）、栅栏（Fence）、事件（Event）等，提供精细的同步控制。
 
 &emsp;&emsp;Vulkan 的主要优势在于高性能和低驱动开销，适合 CPU 受限的应用（如游戏引擎、实时渲染）。它具有良好的跨平台支持，覆盖 Windows、Linux、Android、Switch 等，避免平台锁定。计算与图形队列可并行执行，支持异步计算。通过扩展机制，Vulkan 支持光线追踪、网格着色器等前沿特性。然而，Vulkan 的复杂度较高，代码量远大于 OpenGL，需要管理大量样板代码（如实例、设备、队列、命令池等）。学习曲线陡峭，概念繁多（如内存类型、队列族、描述符布局），初学者难以掌握。开发时依赖验证层捕获错误，但验证层可能影响性能。不同厂商的驱动质量不一，可能导致跨平台兼容性问题。
 
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/render_api_dx_metal_gl_vulkan%E2%80%94%E2%80%94vulkan_driver.png)
+
 &emsp;&emsp;在设计跨平台 RHI 时，Vulkan 是主要目标后端之一。RHI 需要将高层抽象（如资源绑定、同步）映射到 Vulkan 的显式模型。关键挑战包括：管理内存分配（推荐使用 VMA 库）、处理资源状态转换（通过管线屏障）、构建管线状态对象（VkPipeline）、调度异步计算。RHI 通常隐藏 Vulkan 的样板代码，提供简化的资源创建和绑定接口。
+
 ### 3.3 Direct3D 11
 
 &emsp;&emsp;Direct3D 11（D3D11）是微软于 2009 年发布的图形 API，作为 DirectX 家族的一员，长期主导 Windows 和 Xbox 平台的游戏开发。它在易用性和性能之间取得了良好平衡，至今仍被广泛使用。Direct3D 11 采用驱动托管模型，内存管理、资源分配、同步等由驱动自动处理，应用只需调用 API 创建和销毁对象。它支持特性级别（Feature Level）从 9.3 到 11.1，兼容不同代 GPU。着色器使用 HLSL（High-Level Shading Language）编写，编译为 DXBC（DirectX Bytecode）。提供有限的多线程支持，通过延迟上下文（Deferred Context）可将命令录制到延迟上下文，但最终仍需主上下文执行。支持通用计算着色器，但异步计算能力有限。
 
 &emsp;&emsp;Direct3D 11 的主要优势在于易用性，API 设计直观，学习曲线平缓，适合快速开发。经过多年验证，驱动成熟稳定，兼容性好。工具链完善，Visual Studio 图形调试器、PIX 等工具支持良好。广泛支持 Windows 7 及以上系统，Xbox 360/One 向后兼容。然而，其多线程限制明显，Deferred Context 性能提升有限，且不能与 Immediate Context 并行。驱动内部状态跟踪和验证导致 CPU 开销，性能可预测性较低。内存管理不透明，应用无法控制显存分配，可能导致内存碎片和性能波动。相比 Vulkan 和 DX12，缺少光线追踪、网格着色器等新特性。
 
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/render_api_dx_metal_gl_vulkan%E2%80%94%E2%80%94dx11_driver.png)
+
 &emsp;&emsp;在设计跨平台 RHI 时，Direct3D 11 是重要后端，尤其针对 Windows 平台和旧硬件。RHI 需要将高层绑定模型映射到 D3D11 的状态机，例如将描述符集转换为常量缓冲区、纹理和采样器的单独绑定。由于 D3D11 的多线程限制，RHI 通常将命令录制限制在主线程，或使用延迟上下文进行并行录制，但需注意性能开销。
+
 ### 3.4 Direct3D 12
 
 &emsp;&emsp;Direct3D 12（D3D12）是微软于 2015 年发布的低开销图形 API，旨在提供对 GPU 硬件的完全控制，与 Vulkan 和 Metal 竞争。它要求应用显式管理资源、内存和同步，但回报是更高的性能和可预测性。Direct3D 12 采用完全显式控制模型，应用负责内存分配、资源状态管理、同步和管线状态构建。支持多线程原生命令录制，命令列表（Command List）可在多线程上并行录制，显著提升 CPU 利用率。根签名（Root Signature）定义管线使用的资源布局，支持描述符表、根描述符和根常量。管线状态对象（PSO）将所有管线状态（着色器、混合、深度模板等）打包为一个不可变对象，减少状态切换开销。显式内存管理通过堆（Heap）和放置资源（Placed Resource）管理显存，支持内存别名。计算队列与图形队列并行执行，支持异步计算和复制。
@@ -60,11 +73,14 @@
 &emsp;&emsp;Direct3D 12 的主要优势在于高性能，低驱动开销，适合 CPU 受限的应用（如 AAA 游戏、实时渲染）。支持 Windows 10 及以上和 Xbox One 系列，具有良好的跨平台能力。计算与图形队列可并行执行，支持异步计算。通过 DirectX Raytracing（DXR）和网格着色器等前沿特性，提供先进的图形功能。然而，Direct3D 12 的复杂度较高，代码量远大于 D3D11，需要管理大量样板代码（如命令队列、命令分配器、围栏等）。学习曲线陡峭，概念繁多（如堆类型、根签名、描述符堆），初学者难以掌握。开发时依赖调试层捕获错误，但调试层可能影响性能。平台限制明显，仅支持 Windows 10 及以上和 Xbox，跨平台能力有限。
 
 &emsp;&emsp;在设计跨平台 RHI 时，Direct3D 12 是主要目标后端之一，尤其针对 Windows 和 Xbox 平台。RHI 需要将高层抽象映射到 D3D12 的显式模型，关键挑战包括：管理内存分配（推荐使用 D3D12MA 库）、处理资源状态转换（通过资源屏障）、构建管线状态对象（PSO）、调度异步计算。RHI 通常隐藏 D3D12 的样板代码，提供简化的资源创建和绑定接口。
+
 ### 3.5 Metal
 
 &emsp;&emsp;Metal 是 Apple 于 2014 年发布的低开销图形和计算 API，专为 macOS、iOS、tvOS 和 watchOS 设计。它提供了对 Apple 硬件的深度优化，同时保持了相对简洁的 API 设计。Metal 采用半显式控制模型，应用负责资源创建和存储模式选择，但内存管理和同步部分由驱动自动处理（如 Hazard Tracking）。支持多线程原生命令录制，命令缓冲区（Command Buffer）可在多线程上并行录制，支持并行渲染和计算。着色器使用 Metal Shading Language（MSL），基于 C++ 语法，支持内核函数（Kernel Function）用于计算。资源堆（Heap）允许应用创建堆并在其中分配资源，支持内存别名和子分配。存储模式（Storage Mode）控制资源内存位置和 CPU 可见性（共享、私有、托管）。渲染通道（Render Pass）显式定义附件操作，优化 tile-based GPU 的加载/存储。
 
 &emsp;&emsp;Metal 的主要优势在于 Apple 生态深度集成，与 Core Animation、Core Image、ARKit 等框架无缝协作。针对 Apple 硬件（如 A 系列、M 系列芯片）深度优化，充分利用 tile-based 架构，提供卓越的性能。相比 Vulkan 和 DX12，API 设计更简洁，学习曲线较平缓。计算队列与图形队列共享内存，避免数据拷贝，实现统一计算与图形。然而，Metal 平台锁定明显，仅支持 Apple 平台，无法跨平台。生态限制较大，依赖 Apple 的工具链（Xcode）和更新周期。文档和社区规模较小，相比 Vulkan 和 DirectX 资源有限。macOS 上的 Metal 功能集略落后于 iOS（如光线追踪支持较晚）。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/render_api_dx_metal_gl_vulkan%E2%80%94%E2%80%94metal_driver.jpg)
 
 &emsp;&emsp;在设计跨平台 RHI 时，Metal 是关键后端，尤其针对 Apple 平台。RHI 需要将高层抽象映射到 Metal 的半显式模型，关键挑战包括：管理存储模式（共享、私有、托管）、处理资源状态（依赖 Hazard Tracking 或手动屏障）、构建渲染通道描述符、调度异步计算。RHI 通常隐藏 Metal 的样板代码，提供简化的资源创建和绑定接口，并利用 Apple 的框架集成（如 CAMetalLayer）。
 
@@ -112,21 +128,21 @@ heapDesc.Flags = D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
 ComPtr<ID3D12Heap> heap;
 device->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap));
 
-// 在堆内放置纹理
+// 在堆内place new纹理
 D3D12_RESOURCE_DESC texDesc = CD3DX12_RESOURCE_DESC::Texture2D(
     DXGI_FORMAT_R8G8B8A8_UNORM, 1024, 1024);
 
-D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
-device->GetCopyableFootprints(&texDesc, 0, 1, 0, &footprint, nullptr, nullptr);
+D3D12_RESOURCE_ALLOCATION_INFO allocInfo =
+    device->GetResourceAllocationInfo(0, 1, &texDesc);
 
 ComPtr<ID3D12Resource> texture;
-D3D12_RESOURCE_ALLOCATION_INFO allocInfo = {};
-allocInfo.SizeInBytes = footprint.Footprint.RowPitch * texDesc.Height;
-allocInfo.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-
 device->CreatePlacedResource(
-    heap.Get(), 0, &texDesc, D3D12_RESOURCE_STATE_COMMON,
-    nullptr, IID_PPV_ARGS(&texture));
+    heap.Get(),
+    D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, 
+    &texDesc,
+    D3D12_RESOURCE_STATE_COMMON,
+    nullptr,
+    IID_PPV_ARGS(&texture));
 ```
 
 &emsp;&emsp;放置资源的关键优势是**减少内存碎片和分配开销**。应用可以预分配一个大堆，然后将生命周期相近的资源放在同一堆中，避免频繁的驱动分配调用。
@@ -264,7 +280,7 @@ vkCmdPipelineBarrier(
 | --- | -------- | -------- |
 | **Direct3D 12** | 原生支持 | 创建放置资源时使用同一堆，通过屏障管理访问 |
 | **Metal** | 原生支持 | 使用 `makeAliasable()` 标记资源可被别名 |
-| **Vulkan** | 原生支持 | 稀疏绑定（Sparse Binding）或别名别名（Alias）扩展 |
+| **Vulkan** | 原生支持 | 稀疏绑定（Sparse Binding）或资源别名(Memory Aliasing) |
 | **OpenGL/DX11** | 不直接支持 | 驱动可能内部优化，但应用无法控制 |
 
 ```swift
@@ -347,7 +363,7 @@ enum class RHIMemoryType {
 | API | 多线程支持 | 命令录制模型 | 命令提交模型 | 资源绑定模型 |
 | --- | ---------- | ------------ | ------------ | ------------ |
 | **OpenGL** | 几乎不行 | 单上下文，单线程 | 单上下文提交 | 全局状态，单线程 |
-| **OpenGL ES** | 不行 | 单上下文，单线程 | 单上下文提交 | 全局状态，单线程 |
+| **OpenGL ES** | 几乎不行 | 单上下文，单线程 | 单上下文提交 | 全局状态，单线程 |
 | **Direct3D 11** | 有限（Deferred Context） | 延迟上下文可多线程录制 | 主上下文提交 | 全局状态，单线程 |
 | **Direct3D 12** | 原生支持 | 命令列表可多线程录制 | 命令队列提交 | 描述符堆，多线程 |
 | **Metal** | 原生支持 | 命令缓冲区可多线程录制 | 命令队列提交 | 参数缓冲区，多线程 |
@@ -368,7 +384,7 @@ glDrawArrays(GL_TRIANGLES, 0, 3);
 
 #### 5.2.2 Direct3D 11 的延迟上下文
 
-&emsp;&emsp;DX11 引入了延迟上下文（Deferred Context），允许在多线程上录制命令，但最终必须通过主上下文（Immediate Context）执行。延迟上下文录制的命令列表（Command List）可以合并到主上下文，但存在性能开销。
+&emsp;&emsp;DX11 引入了延迟上下文（Deferred Context），允许在多线程上录制命令，但最终必须通过主上下文（Immediate Context）执行。延迟上下文录制的命令列表可以提交给立即上下文执行，但存在性能开销。
 
 ```cpp
 // DX11: 延迟上下文多线程录制
@@ -419,7 +435,7 @@ commandQueue->ExecuteCommandLists(commandLists.size(), commandLists.data());
 
 #### 5.2.4 Metal 的命令缓冲区
 
-&emsp;&emsp;Metal 使用命令缓冲区（Command Buffer）模型，每个命令缓冲区可以从命令队列（Command Queue）创建，并在任意线程上录制。命令缓冲区录制完成后提交到队列，驱动会处理并发执行。
+&emsp;&emsp;Metal 使用命令缓冲区（Command Buffer）模型，每个命令缓冲区可以从命令队列创建，并在单一线程上录制；多个线程可各自创建并录制不同的命令缓冲区以实现并行。
 
 ```swift
 // Metal: 多线程命令录制
@@ -441,8 +457,9 @@ commandBuffer.commit()
 ```cpp
 // Vulkan: 多线程命令录制
 // 每个线程有自己的命令池
-VkCommandPool commandPool;
 VkCommandPoolCreateInfo poolInfo = {};
+poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; 
 poolInfo.queueFamilyIndex = graphicsQueueFamily;
 vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool);
 
@@ -485,7 +502,7 @@ vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
 | --- | -------- | -------- | -------------- |
 | **OpenGL** | 全局状态 | 否 | 单线程绑定 |
 | **Direct3D 11** | 全局状态 | 否 | 单线程绑定 |
-| **Direct3D 12** | 描述符堆 + 根签名 | 是 | 每个线程独立描述符堆 |
+| **Direct3D 12** | 描述符堆 + 根签名 | 是 | 描述符堆本身非线程安全，需每线程独立 |
 | **Metal** | 参数缓冲区 | 是 | 每个线程独立参数缓冲区 |
 | **Vulkan** | 描述符集 | 是 | 每个线程独立描述符集 |
 
@@ -495,8 +512,8 @@ vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
 
 | API | 线程间同步 | 命令列表间同步 | GPU-CPU 同步 |
 | --- | ---------- | -------------- | ------------ |
-| **OpenGL** | 驱动内部同步 | 驱动内部同步 | 隐式同步 |
-| **Direct3D 11** | 驱动内部同步 | 驱动内部同步 | 隐式同步 |
+| **OpenGL** | 不适用 | 驱动内部同步 | 隐式同步 |
+| **Direct3D 11** | 不适用 | 驱动内部同步 | 隐式同步 |
 | **Direct3D 12** | 应用显式同步 | 围栏（Fence） | 围栏（Fence） |
 | **Metal** | 驱动自动跟踪 | 事件（Event） | 事件（Event） |
 | **Vulkan** | 应用显式同步 | 信号量（Semaphore） | 栅栏（Fence） |
@@ -569,7 +586,7 @@ public:
 | **OpenGL** | 隐式（`glFinish`/`glFenceSync`） | 隐式（驱动内部） | 隐式 | 驱动自动 |
 | **Direct3D 11** | 隐式（`Map`/`Unmap`） | 隐式（驱动内部） | 隐式 | 驱动自动 |
 | **Direct3D 12** | 显式围栏（Fence） | 显式围栏（Fence） | 显式屏障 | 显式资源屏障 |
-| **Metal** | 显式事件（Event） | 显式事件（Event） | 自动跟踪 + 手动选项 | Hazard Tracking |
+| **Metal** | 显式（等待命令缓冲完成） | 显式事件（Event） | 自动跟踪 + 手动选项 | Hazard Tracking |
 | **Vulkan** | 显式栅栏（Fence） | 显式信号量（Semaphore） | 显式内存屏障 | 显式管线屏障 |
 
 ### 6.2 栅栏与围栏（Fence）
@@ -581,17 +598,18 @@ public:
 &emsp;&emsp;DX12 使用 `ID3D12Fence` 接口，支持 CPU-GPU 同步和多队列同步。围栏有一个单调递增的计数器，GPU 完成指定操作后递增计数器，CPU 可以等待计数器达到特定值。
 
 ```cpp
-// DX12: 围栏同步
 ComPtr<ID3D12Fence> fence;
 device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+uint64_t fenceValue = 0;
+
+// 在命令队列中插入围栏信号（假设命令已提交）
+commandQueue->Signal(fence.Get(), ++fenceValue);
 
 // CPU 等待 GPU 完成
 HANDLE eventHandle = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 fence->SetEventOnCompletion(fenceValue, eventHandle);
 WaitForSingleObject(eventHandle, INFINITE);
-
-// GPU-GPU 同步：在命令队列中插入围栏信号
-commandQueue->Signal(fence.Get(), fenceValue++);
+CloseHandle(eventHandle);
 ```
 
 #### 6.2.2 Metal 的事件
@@ -599,20 +617,25 @@ commandQueue->Signal(fence.Get(), fenceValue++);
 &emsp;&emsp;Metal 使用 `MTLEvent` 接口，支持 CPU-GPU 同步和多队列同步。事件可以与命令缓冲区关联，当命令缓冲区完成时触发事件。
 
 ```swift
-// Metal: 事件同步
-let event = device.makeEvent()!
-
-// CPU 等待 GPU 完成
-commandBuffer.addCompletedHandler { _ in
-    // GPU 完成回调
-}
+// CPU-GPU 同步
+let commandBuffer = commandQueue.makeCommandBuffer()!
+// 录制命令...
 commandBuffer.commit()
-commandBuffer.waitUntilCompleted()
+commandBuffer.waitUntilCompleted() // CPU 等待 GPU 完成
 
-// GPU-GPU 同步：在命令缓冲区中插入事件信号
-let encoder = commandBuffer.makeBlitCommandEncoder()!
-encoder.encodeSignalEvent(event, value: 1)
-encoder.endEncoding()
+// GPU-GPU 同步（跨命令缓冲区）
+let event = device.makeEvent()!
+let commandBuffer1 = commandQueue.makeCommandBuffer()!
+let encoder1 = commandBuffer1.makeBlitCommandEncoder()!
+encoder1.encodeSignalEvent(event, value: 1)
+encoder1.endEncoding()
+commandBuffer1.commit()
+
+let commandBuffer2 = commandQueue.makeCommandBuffer()!
+let encoder2 = commandBuffer2.makeBlitCommandEncoder()!
+encoder2.encodeWaitForEvent(event, value: 1)
+encoder2.endEncoding()
+commandBuffer2.commit()
 ```
 
 #### 6.2.3 Vulkan 的栅栏
@@ -725,15 +748,17 @@ vkCmdPipelineBarrier(
 &emsp;&emsp;Metal 使用 Hazard Tracking 机制自动检测资源访问冲突。驱动在后台跟踪资源使用状态，当检测到 Hazard 时自动插入屏障。应用也可以手动插入屏障以优化性能。
 
 ```swift
-// Metal: 手动屏障优化
-let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)!
-encoder.setRenderTarget纹理(texture, at: 0)
-encoder.endEncoding()
+// Metal: 使用 MTLFence 手动同步
+let fence = device.makeFence()!
 
-// 手动插入屏障确保纹理从写入状态转换为读取状态
-let blitEncoder = commandBuffer.makeBlitCommandEncoder()!
-blitEncoder.fill(buffer: range, value: 0)
-blitEncoder.endEncoding()
+let encoder1 = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)!
+// 渲染到纹理...
+encoder1.endEncoding()
+
+// 在第二个编码器前等待第一个编码器的写入完成
+let encoder2 = commandBuffer.makeBlitCommandEncoder()!
+encoder2.waitForFence(fence, before: .fragment) // 假设后续使用片段着色器读取
+encoder2.endEncoding()
 ```
 
 ### 6.5 资源状态转换
@@ -878,6 +903,7 @@ renderEncoder.setRenderPipelineState(pipelineState)
 ```cpp
 // Vulkan: 创建图形 PSO
 VkGraphicsPipelineCreateInfo pipelineInfo = {};
+pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
 pipelineInfo.stageCount = 2;
 pipelineInfo.pStages = shaderStages;
 pipelineInfo.pVertexInputState = &vertexInputInfo;
@@ -977,7 +1003,7 @@ deviceContext->PSSetSamplers(0, 1, &samplerState);
 // DX12: 根签名绑定
 // 创建根签名
 CD3DX12_ROOT_PARAMETER1 rootParameters[1];
-rootParameters[1].InitAsDescriptorTable(1, &descriptorRange, D3D12_SHADER_VISIBILITY_ALL);
+rootParameters[0].InitAsDescriptorTable(1, &descriptorRange, D3D12_SHADER_VISIBILITY_ALL);
 
 ComPtr<ID3D12RootSignature> rootSignature;
 // ... 创建根签名
@@ -992,11 +1018,10 @@ commandList->SetGraphicsRootDescriptorTable(0, descriptorHeap->GetGPUDescriptorH
 
 ```swift
 // Metal: 参数缓冲区绑定
-let argumentBuffer = device.makeBuffer(length: argumentBufferLength, options: .storageModeShared)!
-let encoder = argumentBuffer.makeArgumentEncoder(descriptor: argumentDescriptor)
-encoder.setArgumentBuffer(argumentBuffer, offset: 0)
-encoder.setTexture(texture, at: 0)
-encoder.setSamplerState(samplerState, at: 1)
+let argumentEncoder = device.makeArgumentEncoder(descriptor: argumentDescriptor)
+argumentEncoder.setArgumentBuffer(argumentBuffer, offset: 0)
+argumentEncoder.setTexture(texture, at: 0)
+argumentEncoder.setSamplerState(samplerState, at: 1)
 
 renderEncoder.setVertexBuffer(argumentBuffer, offset: 0, at: 0)
 renderEncoder.setFragmentBuffer(argumentBuffer, offset: 0, at: 0)
@@ -1150,7 +1175,7 @@ if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
 
 ```cpp
 // DX12: 渲染通道（通过根签名和管线状态隐式定义）
-// DX12 没有显式的渲染通道对象，但通过 PSO 和屏障管理渲染目标状态
+// DX12 通过 BeginRenderPass/EndRenderPass 提供显式渲染通道，用于声明附件的加载/存储操作和优化 tile 内存使用。
 D3D12_RENDER_PASS_RENDER_TARGET_DESC renderTarget = {};
 renderTarget.cpuDescriptor = rtvHandle;
 renderTarget.BeginningAccess.Type = D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR;
@@ -1190,6 +1215,7 @@ renderEncoder.endEncoding()
 // Vulkan: 渲染通道与帧缓冲
 // 创建渲染通道
 VkAttachmentDescription colorAttachment = {};
+colorAttachment.sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION;
 colorAttachment.format = VK_FORMAT_B8G8R8A8_UNORM;
 colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
 colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -1207,6 +1233,7 @@ subpass.colorAttachmentCount = 1;
 subpass.pColorAttachments = &colorAttachmentRef;
 
 VkRenderPassCreateInfo renderPassInfo = {};
+renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
 renderPassInfo.attachmentCount = 1;
 renderPassInfo.pAttachments = &colorAttachment;
 renderPassInfo.subpassCount = 1;
@@ -1228,10 +1255,14 @@ VkFramebuffer framebuffer;
 vkCreateFramebuffer(device, &framebufferInfo, nullptr, &framebuffer);
 
 // 渲染通道内渲染
+VkClearValue clearColor = {{{0.0f, 0.0f, 0.0f, 1.0f}}};
 VkRenderPassBeginInfo renderPassBeginInfo = {};
+renderPassBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 renderPassBeginInfo.renderPass = renderPass;
 renderPassBeginInfo.framebuffer = framebuffer;
 renderPassBeginInfo.renderArea.extent = swapchainExtent;
+renderPassBeginInfo.clearValueCount = 1;
+renderPassBeginInfo.pClearValues = &clearColor;
 
 vkCmdBeginRenderPass(commandBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
 // ... 渲染命令
@@ -1388,14 +1419,13 @@ public:
 
 ### 9.3 工程实践建议
 
-&emsp;&emsp;在实际工程中，RHI 设计需要考虑以下方面：
+&emsp;&emsp;在实际工程中，需要根据自己的场景考虑如何实现RHI，比如对于高性能场景可能薄薄的封装一层比较合适，而对于需要多平台支持的场景略微牺牲性能所有render API都对上层透明可能更好：
 
 - **内存管理**：使用子分配器（如 VMA、D3D12MA）减少显存分配次数，支持延迟删除和资源别名。
 - **多线程架构**：采用线程本地存储和任务队列，平衡各后端的线程模型差异。
 - **同步策略**：实现自动状态转换和延迟同步，减少显式同步的复杂度。
 - **管线状态缓存**：缓存编译后的 PSO，避免重复创建和编译开销。
 - **渲染通道抽象**：统一渲染通道和帧缓冲接口，支持移动端的 TBDR 优化。
-
 
 
 ### 9.4 结语
