@@ -8,11 +8,17 @@
 ### 1.1 内存处理策略
 &emsp;&emsp;当当前容器的内存不足时，```std::vector```采用```std::min(max_size(), std::max(current_cap + 1, 2 * current_cap))```（参考llvm实现），即当前使用对象个数的2倍内存来进行扩容，这也是大多是编译器容器采用的比例。但是该系数存在一个一个问题，即缓存不友好。
 &emsp;&emsp;假如第一次期望的内存大小为$k$，你们$n$次扩容的内存大小分别为（当系数为$a,a>1$）$k,a^1k,a^2k,...,a^{n - 1}k$，那么$n$次分配的内存总和为
+
 $$
+
 k+ak+a^2k+...+a^{n-1}k=\frac{a^n-1}{a-1}
+
 $$
+
 &emsp;&emsp;为了让后续中的某一次内存分配时能够利用之前已经分配的内存，那么就应该有
+
 $$k+ak+a^2k+...+a^{n-1}k=\frac{a^nk-1}{a-1} \ge a^nk$$
+
 &emsp;&emsp;即$\frac{1}{a^nk}+a\le 2$，即当$n\rightarrow \infty$时，$a\le 2$即可，但是当$a=2$时，只有$n\rightarrow$等式才成立，现实中不可能，因此$1 \lt a \lt 2$才能保证在后续内存扩增时使用到之前分配的内存。
 &emsp;&emsp;```FBVector```采用的系数为1.5，配合上```jemalloc```的```inplcae-malloc```，```FBVector```的内存策略缓存更友好。
 

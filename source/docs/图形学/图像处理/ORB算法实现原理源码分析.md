@@ -42,29 +42,29 @@ $$ORB=Oriented\quad Fast(keypoint)+Rotated\quad BRIEF(descriptor)$$
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/fastm.png)
 
 - 对于每一个一维的邻域向量中的像素值$I_{p\rightarrow x},x\in{1,...,16}$将其通过下面的规则映射到3中状态 darker than $I_p$， brighter then $I_p$或者和$I_p$相似；
+
 $$
-\begin{equation}
 S_{p\rightarrow x}\left\{
 \begin{array}{ll}
 d,I_{p\rightarrow x}&\le I_p - t\quad(darker)\\
 s,I_p-t&\lt I_{p\rightarrow x}\lt I_p+t\quad(similar)\\
 b,I_p+t&\le I_{p\rightarrow x}\quad (brighter)
 \end{array}\right.
-\end{equation}
 $$
+
 - 对于给定的$x$可以将集合$P$分为三类$P_d,P_s,P_b$，即$P_b=\{p\in P:S_{p\rightarrow x=b}\}$；
 - 定义一个布尔变量$K_p$，表示如果$p$为角点则真，否则为假（由于有训练集所以GT我们都是已知的）；
 - 使用ID3决策树分类器以$K_p$查询每个子集，以训练出正确特征点的分类器；
 	- 决策树使用熵最小化来逼近，类似交叉熵。
+
 $$
-\begin{equation}
 \begin{aligned}
 H(P)&=(c+\overline{c})log_2(c+\overline{c})-clog_2c-\overline{c}log_2\overline{c}\\
 c&=|\{p|K_p\quad is\quad true\}|（角点数量）\\
 \overline{c}&=|\{p|K_p\quad is\quad false\}|（非角点的数量）
 \end{aligned}
-\end{equation}
 $$
+
 - 递归应用熵最小化来处理所有的集合，直到熵值为0终止计算，得到的决策树就可以用来进行特征点筛选。
 
 >&emsp;&emsp;[ID3 Descision Tree](https://athena.ecs.csus.edu/~mei/177/ID3_Algorithm.pdf)
@@ -72,14 +72,13 @@ $$
 &emsp;&emsp;问题3可以用非极大值抑制来解决：
 - 针对每个点计算打分函数$V$，打分函数的输出是通过周围16个像素的差分和
 - 去除$v$值较低的点即可。
+
 $$
-\begin{equation}
 V=max\left\{
 \begin{array}{ll}
 \sum(I_s-I_p),if\quad(I_s-I_p)\gt t\\
 \sum(I_p-I_s),if\quad(I_p-I_s)\gt t
 \end{array}\right.
-\end{equation}
 $$
 
 **oFAST**
@@ -88,16 +87,27 @@ $$
 &emsp;&emsp;oFAST使用多尺度金字塔解决FAST不具备尺度不变性的问题，使用矩来确定特征点的方向，来解决其不具备旋转不变形的问题。
 &emsp;&emsp;多尺度金字塔就是将给定的图像以一个给定的尺度进行缩放，来生成多层不同尺度的图像$I_1,I_2,...,I_n$。这些图像每张图像的尺寸不同但是相邻两层图像间的宽高比例相同。然后针对多个尺度的图像应用FAST算法筛选特征点。
 &emsp;&emsp;oFAST使用强度质心（intensity centroid，强度质心假设角的强度偏离其中心，并且该向量可用于估算方向）来确定特征点的方向，即计算特征点以$r$为半径范围内的质心，特征点坐标到质心形成一个向量作为特征点的方向。矩的定义
+
 $$
+
 m_{pq}=\sum_{x,y\in r}x^p y^q I(x,y)
+
 $$
+
 &emsp;&emsp;矩的质心为（这里计算是限定的$r$的邻域内）：
+
 $$
+
 C=(\frac{m_{10}}{m_{00}},\frac{m_{01}}{m_{00}})
+
 $$
+
 &emsp;&emsp;特征点的方向为：
+
 $$
+
 \theta=atan2(m_{01},m_{10})
+
 $$
 
 &emsp;&emsp;oFast会使用Harris角点检测对筛选出的特征点进行角点度量，然后根据度量值将特征点排序，最后取出top-N得到目标特征点。
@@ -128,18 +138,21 @@ $$
 
 **steered BRIEF**
 &emsp;&emsp;rBRIEF通过将筛选的特征点旋转一定的角度再计算对应的描述子来得到旋转不变性。比如点集$S$：
+
 $$
-\begin{equation}
 S=\left(
 \begin{array}{ll}
 x_1,...,x_n\\
 y_1,...,y_n
 \end{array}\right)
-\end{equation}
 $$
+
 &emsp;&emsp;通过旋转矩阵$R_{\theta}$（这一角度并不是固定的而是预先以2π/30为增量构建的模式查找表获取的）旋转得到$S_{\theta}$然后再点集$S_{\theta}$上计算描述子：
+
 $$
+
 S_{\theta}=R_{\theta}S
+
 $$
 
 &emsp;&emsp;上述方式虽然能够得到旋转不变性但是这种方式计算得到的描述子在不同特征点之间的区分度不是很大。因此为了解决该问题，进一步采用统计学习的方式来重新选择点的集合。

@@ -29,6 +29,10 @@ language = 'zh_CN'  # 设置语言为简体中文
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
+myst_enable_extensions = [
+    "dollarmath",
+    "amsmath",
+]
 
 html_theme = 'sphinx_rtd_theme'
 html_static_path = ['_static']
@@ -44,7 +48,7 @@ html_theme_options = {
     'titles_only': False,
 }
 
-mathjax_path = 'https://cdn.jsdelivr.net/npm/mathjax@2/MathJax.js?config=TeX-AMS-MML_HTMLorMML'
+#mathjax_path = 'https://cdn.jsdelivr.net/npm/mathjax@2/MathJax.js?config=TeX-AMS-MML_HTMLorMML'
 
 # 注入在线 Mermaid 脚本
 html_js_files = [

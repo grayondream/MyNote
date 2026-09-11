@@ -122,11 +122,15 @@
 
 * 每个工作项在工作空间中的位置由其 **global ID**（全局 ID）唯一标识。全局 ID 是工作项在整个工作空间中的唯一标识，它通过计算工作项的工作组 ID（work-group ID）和局部 ID（local ID）来得到。
 * **工作项的 global ID**：每个工作项的 global ID 是由其所在的工作组 ID 和局部 ID 确定的。具体来说，假设在工作组中某个工作项的局部 ID 是 $( (s_x, s_y) )$，工作组的 ID 是 $( (w_x, w_y) )$，则该工作项的 $global ID ( (g_x, g_y) )$ 可以通过以下公式计算：
+
 $$
+
   [
   (g_x, g_y) = (w_x \times S_x + s_x, w_y \times S_y + s_y)
   ]
+
 $$
+
   其中：
 
   * $( g_x, g_y )$ 是该工作项的全局 ID。
@@ -136,20 +140,26 @@ $$
 
 * **工作组的 global ID**：根据公式，每个工作组的 global ID 可以通过其工作组 ID 和局部 ID 推算出来。
 * **局部 ID 与工作组 ID 的推算**：反过来，如果给定一个工作项的 **global ID**，我们可以通过以下公式计算其对应的 **工作组 ID**：
+
 $$
+
   [
   (w_x, w_y) = \left( \frac{g_x - s_x}{S_x}, \frac{g_y - s_y}{S_y} \right)
   ]
+
 $$
 
 &emsp;&emsp;其中，$( g_x, g_y )$ 是工作项的 global ID，$( s_x, s_y )$ 是该工作项在工作组内的局部 ID，$( S_x, S_y )$ 是工作组的大小。
 
 **工作组与工作项的数量与划分**
 &emsp;&emsp;工作空间中的工作项总数 $( G_x \times G_y )$ 必须等于工作组数量 $( \left( \frac{G_x}{S_x} \right) \times \left( \frac{G_y}{S_y} \right) )$ 与每个工作组内工作项数 $( S_x \times S_y )$ 的乘积，即：
+
 $$
+
 [
 G_x \times G_y = \left( \frac{G_x}{S_x} \right) \times \left( \frac{G_y}{S_y} \right) \times S_x \times S_y
 ]
+
 $$
 
 &emsp;&emsp;这意味着，工作空间的大小需要恰好能够分割成若干个工作组，每个工作组都包含相同数量的工作项，并且不留余项。

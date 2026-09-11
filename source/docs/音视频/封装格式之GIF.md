@@ -112,8 +112,11 @@ struct gif_block{
 - [7, 7]bit M(Global Color Table Flag)：等于1时表示全局颜色表紧跟Screen Descriptor，当为0时背景色索引无意义。
 
 &emsp;&emsp;图像像素宽高比存储的是一个```[0,255]```的值，当值为0时表示没有值，不可用，非0时的计算方式如下，也就是说支持最宽的图像比为1:4，最高的为4:1。
+
 $$
+
  Aspect Ratio = \frac{(Pixel Aspect Ratio + 15)}{64}
+
 $$
 
 &emsp;&emsp;如果有全局调色板，全局调色板的存储方式和87a相同，不再赘述。
