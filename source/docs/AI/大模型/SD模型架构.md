@@ -1,12 +1,10 @@
-# SD模型架构
+# SD模型发展历程
 
 &emsp;&emsp;自2022年Stable Diffusion开源以来，文本到图像生成领域经历了前所未有的技术爆发。作为潜在扩散模型（Latent Diffusion Model, LDM）最具代表性的实现，Stable Diffusion将高维像素空间的扩散过程迁移至计算效率更高的低维潜在空间，在保持生成质量的前提下将显存占用与计算量降低超过1000倍，首次让消费级GPU用户能够实现本地部署的文生图能力。
 
 &emsp;&emsp;SD模型发展至今也不仅仅是单一模型的成功，而是不断迭代升级，不断提升质量。时至今日几乎重塑了AI绘画的生态。为了更加清晰的理解AI绘画模型的架构，本文从架构演进、性能优化和生态落地多个维度数理SD的技术发展脉络。
 
-## 1 SD模型发展历程
-
-### 1.1 DDPM
+## 1 DDPM
 
 - 论文地址：[Denoising Diffusion Probabilistic Models](https://arxiv.org/pdf/2006.11239)
 
@@ -194,7 +192,7 @@ return x_0
 
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/ddpm_html_20260912_8b9708.html.png)
 
-### 1.2 CLIP
+## 2 CLIP
 
 - 论文地址：[Learning Transferable Visual Models From Natural Language Supervision](https://arxiv.org/pdf/2103.00020)
 
@@ -268,7 +266,7 @@ $$
 &emsp;&emsp;CLIP 之后，图文对比预训练成为多模态领域的标准范式。ALIGN 用更大规模的数据验证了“噪声图文对也能训练出好模型”；SigLIP 用 Sigmoid 损失替代 Softmax 交叉熵，在更小批次下也能有效训练；DALL·E 2 和            Stable Diffusion 使用 CLIP 的文本编码器将提示词映射为条件向量；LLaVA 等视觉语言模型将 CLIP 视觉编码器与大型语言模型对接。CLIP 的双塔架构和零样本能力，使其成为连接视觉与语言的核心基础设施。
 
 
-### 1.3 LDM / Stable Diffusion
+## 3 LDM / Stable Diffusion
 
 - 论文地址：[High-Resolution Image Synthesis with Latent Diffusion Models](https://arxiv.org/pdf/2112.10752)
 
@@ -414,7 +412,7 @@ return x_0
 
 &emsp;&emsp;LDM 的“潜在空间扩散 + 交叉注意力条件生成”范式深刻影响了后续工作。SDXL 引入双文本编码器和更大的 UNet 骨干；ControlNet 在 UNet 编码器上复制一份可训练分支，通过零卷积实现精确的空间条件控制；LoRA 通过低秩适配微调交叉注意力层的权重，使个性化生成变得轻量而高效。LDM 将扩散模型从“像素空间的高成本实验”变成了“消费级硬件上可运行的实用工具”，这是它成为生成式 AI 里程碑式工作的根本原因。
 
-### 1.4 SDXL
+## 4 SDXL
 
 - 论文地址：[SDXL: Improving Latent Diffusion Models for High-Resolution Image Synthesis](https://arxiv.org/pdf/2307.01952)
 
@@ -491,7 +489,7 @@ $$
 
 &emsp;&emsp;SDXL 之后，基于它的生态迅速扩展：SDXL Turbo 通过对抗扩散蒸馏将推理步数压缩到 1-4 步；LCM-LoRA 提供了 SDXL 的潜在一致性适配器，使少步生成更加灵活；ControlNet 和 IP-Adapter 等控制与个性化方法也迅速适配到 SDXL 架构上。SDXL 成为开源文生图社区事实上的基础模型，在 Hugging Face 上的下载量超过 200 万次，衍生出数千个社区微调版本。
 
-### 1.5 ControlNet
+## 5 ControlNet
 
 - 论文地址：[Adding Conditional Control to Text-to-Image Diffusion Models](https://arxiv.org/pdf/2302.05543)
 
@@ -618,7 +616,7 @@ $$
 
 &emsp;&emsp;ControlNet 之后，可控生成领域迅速扩展：ControlNet-XS 通过双向通信减少参数和计算开销；ControlNet++ 引入像素级循环一致性约束提升控制精度；IP-Adapter 将图像提示通过解耦的交叉注意力注入，与 ControlNet 形成互补。在应用层面，ControlNet 已经渗透到 AI 绘图的几乎所有专业工作流中——线稿上色、姿态迁移、建筑草图渲染、老照片修复、创意二维码生成——成为生成式 AI 从“随机生成”走向“精确控制”的关键基础设施。
 
-### 1.6 LoRA
+## 6 LoRA
 
 - 论文地址：[LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/pdf/2106.09685)
 
@@ -740,7 +738,7 @@ $$
 
 &emsp;&emsp;从更宏观的视角看，LoRA 与 ControlNet 共同构成了扩散模型可控生成的两大支柱：ControlNet 解决的是“空间结构控制”，LoRA 解决的是“风格与语义控制”。两者在 Stable Diffusion 工作流中经常配合使用——ControlNet 固定构图，LoRA 注入风格，文本提示提供语义引导，三者叠加形成了当前 AI 绘图领域最成熟的控制体系。
 
-### 1.7 DiT
+## 7 DiT
 
 - 论文地址：[Scalable Diffusion Models with Transformers](https://arxiv.org/pdf/2212.09748)
 
@@ -837,7 +835,7 @@ $$
 
 &emsp;&emsp;**DiT 与 LDM 的关系可以概括为：LDM 证明了“在潜空间做扩散”是对的，DiT 证明了“用 Transformer 做骨干”也是对的**。两者结合，构成了当前大规模生成模型（从图像到视频）的主流技术底座。
 
-### 1.8 Flow Matching
+## 8 Flow Matching
 
 - 论文地址：[Flow Matching for Generative Modeling](https://arxiv.org/pdf/2210.02747)
 
@@ -1036,7 +1034,7 @@ return x1
 
 &emsp;&emsp;从更宏观的视角看，Flow Matching 代表了生成模型从“加噪-去噪”范式向“路径设计”范式的一次重要转变。它告诉我们，生成模型的核心不在于噪声本身，而在于如何设计一条从简单分布到复杂分布的高效路径。这一思想正在深刻影响着下一代生成模型的设计。
 
-### 1.9 Stable Diffusion 3
+## 9 Stable Diffusion 3
 
 - 论文地址：[Scaling Rectified Flow Transformers for High-Resolution Image Synthesis](https://arxiv.org/pdf/2403.03206)
 
@@ -1107,7 +1105,7 @@ $$
 
 &emsp;&emsp;SD3 的局限在于其 MMDiT 架构虽然支持多模态，但当前主要验证的是文本-图像两种模态。论文中提到的“易于扩展到视频等模态”仍是一个需要后续工作验证的命题。此外，SD3 的 8B 模型虽然可以在 24GB 显存的消费级 GPU 上运行，但推理成本仍然显著高于 SDXL。如何在保持 MMDiT 性能优势的同时降低部署门槛，是 SD3 之后开源社区持续关注的问题。
 
-### 1.10 FLUX.1 Kontext
+## 10 FLUX.1 Kontext
 
 - 论文地址：[FLUX.1 Kontext: Flow Matching for In-Context Image Generation and Editing in Latent Space](https://arxiv.org/pdf/2506.15742)
 
@@ -1192,8 +1190,7 @@ $$
 
 &emsp;&emsp;从更宏观的视角看，FLUX.1 Kontext 代表了生成模型从“单次生成”向“迭代编辑”的转变。它证明了流匹配 Transformer 不仅可以用于从零生成图像，还可以作为一个通用的图像变换引擎，在保持上下文一致性的前提下执行任意自然语言指令指定的修改。这一方向正在被后续工作继续推进：更高分辨率的编辑、视频编辑、以及多模态编辑（同时修改图像和音频或文本）都是 Kontext 架构的自然延伸。FLUX.1 Kontext 的序列拼接范式也为多模态生成模型的设计提供了一个简洁而强大的参考模板——不需要复杂的模态专用模块，只需要将所有信息表示为 token 序列，让注意力机制自己学会如何融合。
 
-### 1.11 总结
+## 11 总结
 
 &emsp;&emsp;从 DDPM 到 FLUX.1 Kontext，模型发展大致沿着“扩散范式建立—潜空间与文本条件引入—规模化与可控性扩展—Transformer 骨干与流匹配—统一生成与编辑”的路径演进：**DDPM 奠定加噪去噪基础，CLIP 提供图文对齐，LDM/Stable Diffusion 将扩散迁入潜空间并用交叉注意力注入文本，SDXL 通过扩大 UNet、双文本编码器和微条件提升质量，ControlNet 与 LoRA 分别实现空间控制和轻量微调，DiT 用 Transformer 替代 UNet 并验证缩放规律，Flow Matching 把生成转化为可设计的概率路径并统一扩散模型，SD3 以 MMDiT 和 Rectified Flow 完成范式更新，FLUX.1 进一步优化架构，最终 FLUX.1 Kontext 以统一序列拼接将生成与编辑融合，整体趋势是从像素到潜空间、从 UNet 到 Transformer、从扩散到流匹配、从单一生成走向可控多模态统一。**
 
-##
