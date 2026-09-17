@@ -20,15 +20,79 @@
 
 ### 2.1 注意力机制
 
-#### 2.1.1 缩放点积注意力
+#### 2.1.1 点积注意力
 
-&emsp;&emsp;注意力机制是 Transformer 的核心。给定查询向量 $Q$、键向量 $K$ 和值向量 $V$，缩放点积注意力的定义为：
+&emsp;&emsp;点积注意力（Dot-Product Attention）是最常用的一类注意力机制。它通过计算 **Query** 与 **Key** 之间的点积来衡量二者相关性，再经过 Softmax 归一化得到注意力权重，最后对 **Value** 进行加权求和。给定查询矩阵 $Q \in \mathbb{R}^{n \times d_k}$、键矩阵 $K \in \mathbb{R}^{m \times d_k}$、值矩阵 $V \in \mathbb{R}^{m \times d_v}$，点积注意力的基本形式为：
 
 $$
-\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
+\mathrm{Attention}(Q,K,V)=\mathrm{softmax}(QK^\top)V
 $$
 
-&emsp;&emsp;其中 $Q \in \mathbb{R}^{n \times d_k}$、$K \in \mathbb{R}^{m \times d_k}$、$V \in \mathbb{R}^{m \times d_v}$，$n$ 是查询序列长度，$m$ 是键值序列长度，$d_k$ 是键的维度。除以 $\sqrt{d_k}$ 的目的是防止点积在维度较高时数值过大，导致 softmax 梯度消失。注意力分数矩阵的每一行经过 softmax 后，表示当前查询位置对所有键位置的关注权重，最终输出是值向量的加权和。
+&emsp;&emsp;若只看单个查询向量 $q_i$，则对每个键 $k_j$ 计算相似度：
+
+$$
+e_{ij}=q_i^\top k_j
+$$
+
+&emsp;&emsp;然后归一化：
+
+$$
+\alpha_{ij}=
+\frac{\exp(e_{ij})}{\sum_{l=1}^{m}\exp(e_{il})}
+$$
+
+&emsp;&emsp;最终输出为：
+
+$$
+o_i=\sum_{j=1}^{m}\alpha_{ij}v_j
+$$
+
+&emsp;&emsp;在实际的 Transformer 等模型中，通常使用 **缩放点积注意力**（Scaled Dot-Product Attention）：
+
+$$
+\mathrm{Attention}(Q,K,V)=
+\mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V
+$$
+
+&emsp;&emsp;其中 $\sqrt{d_k}$ 是缩放因子。当 $d_k$ 较大时，点积结果的方差会变大，Softmax 容易进入饱和区，导致梯度变小。除以 $\sqrt{d_k}$ 可以使点积分布更稳定，从而有利于训练。
+
+---
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出缩放点积注意力的 PyTorch 实现：
+
+```python
+import math
+import torch
+
+def scaled_dot_product_attention(Q, K, V, mask=None):
+    d_k = Q.size(-1)
+    scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
+
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, float("-inf"))
+
+    attn = torch.softmax(scores, dim=-1)
+    output = torch.matmul(attn, V)
+    return output, attn
+```
+
+&emsp;&emsp;点积注意力中的 Q/K/V 来自信息检索隐喻：query 是“我想找什么”，key 是“我有什么标签”，value 是“我实际内容”。但在 Transformer 里，它们只是同一个输入 $X$ 的三个线性投影，并没有显式数据库，也没有真正的键值存储。因此 QKV 是一种接口命名和直觉包装，不是注意力的数学本质。
+
+&emsp;&emsp;从维度视角看，设 $X\in\mathbb{R}^{n\times d}$，其中 $n$ 是 token 维，$d$ 是特征维。注意力先通过 $QK^\top$ 在 token 维上建立 $n\times n$ 的关系矩阵，再经过 Softmax 得到扩散权重，最后用 $AV$ 把 token 维的信息重新汇聚到特征维。也就是说，它完成的是“特征维到 token 关系，再到 token 混合，最后回到特征表示”的过程。若暂时忽略 $W_V$，有 $O=AX$，则：
+
+$$
+O_{i,c}=\sum_{j=1}^{n}A_{ij}X_{j,c}
+$$
+
+&emsp;&emsp;这意味着输出第 $i$ 个 token 的第 $c$ 个特征，是所有输入 token 同一特征通道的加权平均。所以它确实很像“沿 token 维的扩散”。加入 $W_V$ 后，再在特征维上做一次线性混合：
+
+$$
+O=AXW_V
+$$
+
+&emsp;&emsp;因此，更准确的说法是：注意力是在 token 维和特征维之间做自适应维度扩散：先算 token 间关系，再按关系混合值，最后回到特征表示。Q/K/V 是功能角色命名，不是数学本质；核心是关系矩阵 $A$ 和对 $V$ 的加权混合。
 
 #### 2.1.2 多头注意力（MHA）
 
