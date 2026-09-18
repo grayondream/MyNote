@@ -1,7 +1,5 @@
 # LLM架构演进
 
-# LLM架构演进
-
 ## 1 前言
 
 &emsp;&emsp;自 2017 年 Transformer 提出以来，大语言模型（Large Language Model, LLM）领域经历了从序列建模到通用生成的范式跃迁。Transformer 以自注意力机制替代循环与卷积，摆脱了 RNN 的串行计算瓶颈，使训练可以大规模并行，同时具备更强的长程依赖建模能力。此后，BERT 开启了 encoder-only 的理解路线，GPT 系列则沿 decoder-only 的生成路线不断放大，最终在 GPT-3、PaLM、Chinchilla、LLaMA 等模型上验证了“模型规模、数据规模与算力投入”共同驱动能力增长的Scaling Law。
@@ -96,55 +94,1082 @@ $$
 
 #### 2.1.2 多头注意力（MHA）
 
-&emsp;&emsp;单一注意力头只能学习一种“相关性模式”。为了让模型同时关注不同类型的关系——语法依赖、语义相似、位置邻近——Transformer 引入多头注意力：
+&emsp;&emsp;多头注意力（Multi-Head Attention, MHA）是 Transformer 中的核心组件。它并非只做一次注意力，而是将查询、键、值通过多组线性投影映射到多个子空间，在每个子空间中并行执行缩放点积注意力，最后将各头输出拼接并做一次线性变换。
+
+&emsp;&emsp;设输入序列表示为 $X \in \mathbb{R}^{n \times d_{model}}$，头数为 $h$。对于第 $i$ 个头，定义投影矩阵：
 
 $$
-\text{MultiHead}(Q, K, V) = \text{Concat}(\text{head}_1, \dots, \text{head}_h)W^O
+W_i^Q \in \mathbb{R}^{d_{model} \times d_k},\quad
+W_i^K \in \mathbb{R}^{d_{model} \times d_k},\quad
+W_i^V \in \mathbb{R}^{d_{model} \times d_v}
 $$
 
+&emsp;&emsp;则第 $i$ 个头的查询、键、值分别为：
+
 $$
-\text{head}_i = \text{Attention}(QW_i^Q, KW_i^K, VW_i^V)
+Q_i = XW_i^Q,\quad K_i = XW_i^K,\quad V_i = XW_i^V
 $$
+
+&emsp;&emsp;第 $i$ 个头的注意力输出为：
+
+$$
+\mathrm{head}_i = \mathrm{Attention}(Q_i, K_i, V_i)
+= \mathrm{softmax}\left(\frac{Q_iK_i^\top}{\sqrt{d_k}}\right)V_i
+$$
+
+&emsp;&emsp;将所有头的输出拼接，再经过输出投影矩阵 $W^O \in \mathbb{R}^{h d_v \times d_{model}}$，得到多头注意力的最终输出：
+
+$$
+\mathrm{MultiHead}(Q,K,V) = \mathrm{Concat}(\mathrm{head}_1, \dots, \mathrm{head}_h) W^O
+$$
+
+&emsp;&emsp;通常令 $d_k = d_v = d_{model} / h$，这样各头的计算量总和与单头注意力在相同维度下相当。每个头只处理 $d_{model}/h$ 维的子空间，因此多头注意力的优点是能在不同表示子空间中并行关注不同模式，增强表达能力且适合 GPU 并行；缺点是参数量和显存开销会随头数增加，头数过多可能造成冗余或训练不稳定，且各头输出最终仍由 $W^O$ 混合，并非完全独立。
+
+&emsp;&emsp;从维度视角看，多头注意力把特征维 $d_{model}$ 切分成 $h$ 个子空间。每个头在自己的子空间内计算 token 间关系矩阵，并沿 token 维做加权扩散，最后拼接各头结果，再通过 $W^O$ 在特征维上混合。因此，多头注意力可以理解为多个维度通道上的并行自适应扩散，它比单头注意力具有更强的表示能力，也更符合“维度扩散”的直觉。
+
+---
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出多头注意力的裸实现，不调用 `nn.MultiheadAttention`，也不调用 `F.scaled_dot_product_attention`，只使用基础张量运算和手动参数：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.d_v = d_model // num_heads
+
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+
+        self.b_q = nn.Parameter(torch.zeros(d_model))
+        self.b_k = nn.Parameter(torch.zeros(d_model))
+        self.b_v = nn.Parameter(torch.zeros(d_model))
+        self.b_o = nn.Parameter(torch.zeros(d_model))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o):
+            nn.init.xavier_uniform_(w)
+
+    def forward(self, query, key, value, mask=None):
+        batch_size = query.size(0)
+
+        Q = torch.matmul(query, self.W_q) + self.b_q
+        K = torch.matmul(key, self.W_k) + self.b_k
+        V = torch.matmul(value, self.W_v) + self.b_v
+
+        Q = Q.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        K = K.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        V = V.view(batch_size, -1, self.num_heads, self.d_v).transpose(1, 2)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1)
+        head_out = torch.matmul(attn, V)
+
+        head_out = head_out.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        output = torch.matmul(head_out, self.W_o) + self.b_o
+        return output, attn
+```
+
+&emsp;&emsp;这个实现中，$Q/K/V$ 的线性投影、分头、缩放点积注意力、拼接和输出投影全部手动完成。若输入 `query, key, value` 形状为 $(B,L,d_{model})$，则输出形状为 $(B,L,d_{model})$，`attn` 形状为 $(B,h,L,L)$。自注意力中三者来自同一输入；交叉注意力中 `query` 来自解码器，`key` 和 `value` 来自编码器。
 
 &emsp;&emsp;其中 $W_i^Q \in \mathbb{R}^{d_{\text{model}} \times d_k}$、$W_i^K \in \mathbb{R}^{d_{\text{model}} \times d_k}$、$W_i^V \in \mathbb{R}^{d_{\text{model}} \times d_v}$、$W^O \in \mathbb{R}^{h d_v \times d_{\text{model}}}$。通常取 $d_k = d_v = d_{\text{model}} / h$。MHA 是 GPT-1、GPT-2、BERT、T5 等早期模型的标配，也是 LLaMA 1 的注意力方案。
 
 #### 2.1.3 多查询注意力（MQA）
 
-&emsp;&emsp;MHA 在推理时，每个 Query 头都需要独立的 Key 头和 Value 头，KV 缓存大小与注意力头数 $h$ 成正比。MQA 将所有 Query 头共享同一组 Key 和 Value 头，KV 缓存大小降至原来的 $1/h$。MQA 由 Shazeer 于 2019 年提出，被 Falcon 系列大规模采用。代价是 Key/Value 表达能力的压缩，在超大规模模型上可能出现性能损失。
+&emsp;&emsp;多查询注意力（Multi-Query Attention, MQA）是 MHA 的一种变体，核心思想是让所有注意力头共享同一组 Key 和 Value 投影，而 Query 仍然保持多头。这样可以大幅减少推理时 KV Cache 的存储量和内存带宽需求，同时保持 Query 端的多样性。
+
+&emsp;&emsp;设输入 $X \in \mathbb{R}^{n \times d_{model}}$，头数为 $h$。MQA 中，每个头有独立的 Query 投影：
+
+$$
+W_i^Q \in \mathbb{R}^{d_{model} \times d_k}, \quad i=1,\dots,h
+$$
+
+&emsp;&emsp;但所有头共享同一组 Key 和 Value 投影：
+
+$$
+W^K \in \mathbb{R}^{d_{model} \times d_k}, \quad W^V \in \mathbb{R}^{d_{model} \times d_v}
+$$
+
+&emsp;&emsp;于是：
+
+$$
+Q_i = X W_i^Q, \quad K = X W^K, \quad V = X W^V
+$$
+
+&emsp;&emsp;第 $i$ 个头的输出为：
+
+$$
+\mathrm{head}_i = \mathrm{softmax}\left(\frac{Q_i K^\top}{\sqrt{d_k}}\right) V
+$$
+
+&emsp;&emsp;将所有头的输出拼接，再经过输出投影 $W^O$：
+
+$$
+\mathrm{MQA}(X) = \mathrm{Concat}(\mathrm{head}_1, \dots, \mathrm{head}_h) W^O
+$$
+
+&emsp;&emsp;通常令 $d_k = d_v = d_{model}/h$，因此共享的 K 和 V 只有单个头的维度。这样在自回归生成时，只需缓存一份 K 和 V，而不是每个头各缓存一份，KV Cache 大小从 $O(h \cdot n \cdot d_k)$ 降到 $O(n \cdot d_k)$，显著降低显存占用和带宽压力。MQA 的优点是推理速度快、显存占用低，适合长序列和大 batch 生成；缺点是所有头共享 K/V 会削弱表示能力，可能导致训练不稳定或效果略差于 MHA，尤其在需要细粒度多模式关注的场景中。
+
+&emsp;&emsp;从维度视角看，MQA 让 Query 在多个子空间中计算关系矩阵，但这些关系矩阵都作用在同一个 Value 上。这相当于多个查询通道并行扩散，但共享同一份被扩散的内容。相比 MHA，它牺牲了一部分 Value 端的多样性，换取了推理效率的大幅提升。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 MQA 的裸实现，只使用基础张量运算和手动参数：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class MultiQueryAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.d_v = d_model // num_heads
+
+        # Query 每个头独立
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.b_q = nn.Parameter(torch.zeros(d_model))
+
+        # Key 和 Value 所有头共享，只有一个头
+        self.W_k = nn.Parameter(torch.empty(d_model, self.d_k))
+        self.b_k = nn.Parameter(torch.zeros(self.d_k))
+        self.W_v = nn.Parameter(torch.empty(d_model, self.d_v))
+        self.b_v = nn.Parameter(torch.zeros(self.d_v))
+
+        # 输出投影
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+        self.b_o = nn.Parameter(torch.zeros(d_model))
+
+        nn.init.xavier_uniform_(self.W_q)
+        nn.init.xavier_uniform_(self.W_k)
+        nn.init.xavier_uniform_(self.W_v)
+        nn.init.xavier_uniform_(self.W_o)
+
+    def forward(self, x, mask=None):
+        batch_size, seq_len, _ = x.size()
+
+        # Query: (B, L, d_model) -> (B, h, L, d_k)
+        Q = torch.matmul(x, self.W_q) + self.b_q
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+
+        # Key, Value: 共享，形状 (B, L, d_k) -> (B, 1, L, d_k)
+        K = torch.matmul(x, self.W_k) + self.b_k
+        V = torch.matmul(x, self.W_v) + self.b_v
+        K = K.unsqueeze(1)  # (B, 1, L, d_k)
+        V = V.unsqueeze(1)  # (B, 1, L, d_v)
+
+        # 注意力分数: Q (B, h, L, d_k) 与 K (B, 1, L, d_k) 广播
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1)  # (B, h, L, L)
+        head_out = torch.matmul(attn, V)      # (B, h, L, d_v)
+
+        # 拼接并输出投影
+        head_out = head_out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        output = torch.matmul(head_out, self.W_o) + self.b_o
+        return output, attn
+```
+
+&emsp;&emsp;这个实现中，K 和 V 只有一个头，通过 `unsqueeze(1)` 后在头维度上广播到所有 Query 头。若输入形状为 $(B,L,d_{model})$，输出形状为 $(B,L,d_{model})$，`attn` 形状为 $(B,h,L,L)$。
+
+---
 
 #### 2.1.4 分组查询注意力（GQA）
 
-&emsp;&emsp;GQA 将 Query 头分组，每组共享一组 Key 和 Value 头，在 MQA 和 MHA 之间取得折中。GQA 被 LLaMA 2/3、Mistral、Qwen 2/2.5/3、Llama 4、DeepSeek 等几乎所有主流开源模型采用，成为现代 LLM 的标配。LLaMA 3.1 的 8B、70B 和 405B 全部使用 GQA；Qwen3 的密集模型也包含 GQA、SwiGLU、RoPE 以及带预归一化的 RMSNorm。
+&emsp;&emsp;分组查询注意力（Grouped-Query Attention, GQA）是 MHA 和 MQA 的折中方案。它将 Query 头分成 $G$ 组，每组共享一组 Key 和 Value 投影。当 $G=h$ 时，GQA 退化为 MHA；当 $G=1$ 时，退化为 MQA。因此 GQA 可以在推理效率和模型质量之间取得更好的平衡。
+
+&emsp;&emsp;设总 Query 头数为 $h$，分组数为 $G$，则每组包含 $h/G$ 个 Query 头。对于第 $g$ 组，定义共享的 Key 和 Value 投影：
+
+$$
+W_g^K \in \mathbb{R}^{d_{model} \times d_k}, \quad W_g^V \in \mathbb{R}^{d_{model} \times d_v}, \quad g=1,\dots,G
+$$
+
+&emsp;&emsp;该组内每个 Query 头 $i$ 有独立投影 $W_i^Q$：
+
+$$
+Q_i = X W_i^Q, \quad K_g = X W_g^K, \quad V_g = X W_g^V
+$$
+
+&emsp;&emsp;第 $i$ 个头的输出为：
+
+$$
+\mathrm{head}_i = \mathrm{softmax}\left(\frac{Q_i K_g^\top}{\sqrt{d_k}}\right) V_g
+$$
+
+&emsp;&emsp;其中 $i$ 属于第 $g$ 组。将所有头的输出拼接并经过输出投影：
+
+$$
+\mathrm{GQA}(X) = \mathrm{Concat}(\mathrm{head}_1, \dots, \mathrm{head}_h) W^O
+$$
+
+&emsp;&emsp;通常令 $d_k = d_v = d_{model}/h$，每组共享的 K/V 头数为 1。KV Cache 大小从 MHA 的 $O(h \cdot n \cdot d_k)$ 降到 $O(G \cdot n \cdot d_k)$，比 MQA 的 $O(n \cdot d_k)$ 略大，但远小于 MHA。GQA 的优点是兼顾了推理效率和表示能力，在大模型推理中广泛使用；缺点是分组数 $G$ 需要手动选择，不同任务和模型规模下最优 $G$ 可能不同，且实现比 MHA 和 MQA 稍复杂。
+
+&emsp;&emsp;从维度视角看，GQA 将 Query 头分组，每组 Query 共享一份被扩散的内容。它既保留了部分 Value 端的多样性，又减少了 KV Cache 的冗余。可以理解为在多个查询通道和少量共享内容通道之间做自适应维度扩散。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 GQA 的裸实现，只使用基础张量运算和手动参数：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, d_model, num_heads, num_kv_groups):
+        super().__init__()
+        assert d_model % num_heads == 0
+        assert num_heads % num_kv_groups == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_kv_groups = num_kv_groups
+        self.num_heads_per_group = num_heads // num_kv_groups
+        self.d_k = d_model // num_heads
+        self.d_v = d_model // num_heads
+
+        # Query 每个头独立
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.b_q = nn.Parameter(torch.zeros(d_model))
+
+        # Key 和 Value 每组共享一份
+        self.W_k = nn.Parameter(torch.empty(d_model, num_kv_groups * self.d_k))
+        self.b_k = nn.Parameter(torch.zeros(num_kv_groups * self.d_k))
+        self.W_v = nn.Parameter(torch.empty(d_model, num_kv_groups * self.d_v))
+        self.b_v = nn.Parameter(torch.zeros(num_kv_groups * self.d_v))
+
+        # 输出投影
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+        self.b_o = nn.Parameter(torch.zeros(d_model))
+
+        nn.init.xavier_uniform_(self.W_q)
+        nn.init.xavier_uniform_(self.W_k)
+        nn.init.xavier_uniform_(self.W_v)
+        nn.init.xavier_uniform_(self.W_o)
+
+    def forward(self, x, mask=None):
+        batch_size, seq_len, _ = x.size()
+
+        # Query: (B, L, d_model) -> (B, h, L, d_k)
+        Q = torch.matmul(x, self.W_q) + self.b_q
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+
+        # Key, Value: 每组一份，形状 (B, L, G, d_k) -> (B, G, L, d_k)
+        K = torch.matmul(x, self.W_k) + self.b_k
+        V = torch.matmul(x, self.W_v) + self.b_v
+        K = K.view(batch_size, seq_len, self.num_kv_groups, self.d_k).transpose(1, 2)
+        V = V.view(batch_size, seq_len, self.num_kv_groups, self.d_v).transpose(1, 2)
+
+        # 将每组 K/V 重复到组内每个 Query 头
+        # K: (B, G, L, d_k) -> (B, G, 1, L, d_k) -> (B, G, h_per_group, L, d_k) -> (B, h, L, d_k)
+        K = K.unsqueeze(2).expand(-1, -1, self.num_heads_per_group, -1, -1)
+        K = K.reshape(batch_size, self.num_heads, seq_len, self.d_k)
+        V = V.unsqueeze(2).expand(-1, -1, self.num_heads_per_group, -1, -1)
+        V = V.reshape(batch_size, self.num_heads, seq_len, self.d_v)
+
+        # 注意力分数
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1)
+        head_out = torch.matmul(attn, V)
+
+        # 拼接并输出投影
+        head_out = head_out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        output = torch.matmul(head_out, self.W_o) + self.b_o
+        return output, attn
+```
+
+&emsp;&emsp;这个实现中，Key 和 Value 按组生成，然后通过 `expand` 和 `reshape` 复制到组内每个 Query 头，使得后续注意力计算与标准多头注意力一致。若输入形状为 $(B,L,d_{model})$，输出形状为 $(B,L,d_{model})$，`attn` 形状为 $(B,h,L,L)$。当 `num_kv_groups = num_heads` 时退化为 MHA；当 `num_kv_groups = 1` 时退化为 MQA。
 
 #### 2.1.5 多头潜在注意力（MLA）
 
-&emsp;&emsp;MLA 是 DeepSeek 系列提出的压缩式注意力。它将 Key 和 Value 张量先投影到一个低维潜在空间，再投影回高维空间，存储的是低维中间态而非完整 KV 矩阵。这一设计受低秩适配启发，在保留模型捕捉丰富上下文关系能力的同时，大幅降低 KV 缓存的内存占用。MLA 还与旋转位置嵌入（RoPE）集成，在压缩 KV 的同时保持位置信息的完整性。MLA 是 DeepSeek-V3 能够以 37B 激活参数高效推理的关键技术之一，也被 Kimi K2 等模型采用。
+&emsp;&emsp;多头潜在注意力（Multi-Head Latent Attention, MLA）是 DeepSeek-V2 提出的注意力变体，核心思想是通过低秩联合压缩将 Key 和 Value 投影到一个紧凑的潜在空间，在推理时只需缓存这个潜在向量，从而大幅降低 KV Cache 的存储和带宽需求。与 MQA 和 GQA 通过共享 KV 头来压缩缓存不同，MLA 采用压缩到潜在空间的策略，将键和值联合压缩为单个低秩向量，这是 MLA 与其他压缩方法的本质区别。
+
+&emsp;&emsp;设输入隐藏状态为 $h_t \in \mathbb{R}^{d_{model}}$，MLA 首先通过下投影矩阵 $W^{DKV} \in \mathbb{R}^{d_c \times d_{model}}$ 将 $h_t$ 压缩为潜在向量：
+
+$$
+c_t^{KV} = W^{DKV} h_t, \quad c_t^{KV} \in \mathbb{R}^{d_c}
+$$
+
+&emsp;&emsp;其中 $d_c \ll n_h \cdot d_h$ 是 KV 压缩维度。然后在推理时，只需缓存 $c_t^{KV}$，而 Key 和 Value 通过上投影矩阵 $W^{UK}$ 和 $W^{UV}$ 从潜在向量重建：
+
+$$
+k_t = W^{UK} c_t^{KV}, \quad v_t = W^{UV} c_t^{KV}
+$$
+
+&emsp;&emsp;对于 Query，MLA 同样进行低秩压缩以降低训练时的激活内存：
+
+$$
+c_t^Q = W^{DQ} h_t, \quad q_t = W^{UQ} c_t^Q
+$$
+
+&emsp;&emsp;注意力计算与标准缩放点积注意力一致：
+
+$$
+o_t = \mathrm{softmax}\left(\frac{q_t k_t^\top}{\sqrt{d_h}}\right) v_t
+$$
+
+&emsp;&emsp;MLA 的优点是 KV Cache 压缩率极高，相比 MHA 可压缩 90% 以上，同时推理时内存带宽需求显著降低，在带宽受限的硬件上性能更稳定；缺点是引入了额外的投影矩阵和潜在空间维度超参数，训练时需要联合优化下投影和上投影，且重建 Key/Value 时增加了少量计算开销，整体实现比 MHA 更复杂。
+
+&emsp;&emsp;从维度视角看，MLA 将 Key 和 Value 先压缩到低维潜在空间，推理时再重建回高维。这相当于在 token 维扩散之前，先对 Value 端做了一次特征维的降维压缩，大幅减少了需要缓存和传输的数据量。Q 端同样做了低秩压缩，但 Q 不需要缓存，所以主要收益在训练激活内存上。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 MLA 的裸实现，只使用基础张量运算和手动参数：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class MultiHeadLatentAttention(nn.Module):
+    def __init__(self, d_model, num_heads, kv_latent_dim, q_latent_dim=None):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.d_v = d_model // num_heads
+        self.kv_latent_dim = kv_latent_dim
+        self.q_latent_dim = q_latent_dim if q_latent_dim is not None else d_model
+
+        # Query 低秩投影
+        self.W_dq = nn.Parameter(torch.empty(d_model, self.q_latent_dim))
+        self.W_uq = nn.Parameter(torch.empty(self.q_latent_dim, d_model))
+        self.b_q = nn.Parameter(torch.zeros(d_model))
+
+        # KV 联合低秩投影
+        self.W_dkv = nn.Parameter(torch.empty(d_model, kv_latent_dim))
+        self.W_uk = nn.Parameter(torch.empty(kv_latent_dim, d_model))
+        self.W_uv = nn.Parameter(torch.empty(kv_latent_dim, d_model))
+        self.b_k = nn.Parameter(torch.zeros(d_model))
+        self.b_v = nn.Parameter(torch.zeros(d_model))
+
+        # 输出投影
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+        self.b_o = nn.Parameter(torch.zeros(d_model))
+
+        for w in (self.W_dq, self.W_uq, self.W_dkv, self.W_uk, self.W_uv, self.W_o):
+            nn.init.xavier_uniform_(w)
+
+    def forward(self, x, mask=None):
+        batch_size, seq_len, _ = x.size()
+
+        # Query 低秩压缩与重建
+        c_q = torch.matmul(x, self.W_dq)
+        Q = torch.matmul(c_q, self.W_uq) + self.b_q
+
+        # KV 联合低秩压缩
+        c_kv = torch.matmul(x, self.W_dkv)
+
+        # 从潜在向量重建 Key 和 Value
+        K = torch.matmul(c_kv, self.W_uk) + self.b_k
+        V = torch.matmul(c_kv, self.W_uv) + self.b_v
+
+        # 分头
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        K = K.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        V = V.view(batch_size, seq_len, self.num_heads, self.d_v).transpose(1, 2)
+
+        # 注意力计算
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1)
+        head_out = torch.matmul(attn, V)
+
+        # 拼接并输出投影
+        head_out = head_out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        output = torch.matmul(head_out, self.W_o) + self.b_o
+        return output, attn
+```
+
+&emsp;&emsp;这个实现中，推理时只需缓存 `c_kv`，形状为 $(B, L, d_{kv\_latent})$，而标准 MHA 需缓存 $(B, h, L, d_k)$ 的 K 和 V。若输入形状为 $(B,L,d_{model})$，输出形状为 $(B,L,d_{model})$，`attn` 形状为 $(B,h,L,L)$。
+
+---
 
 #### 2.1.6 交叉注意力与因果掩码
 
-&emsp;&emsp;交叉注意力（Cross-Attention）中，Query 来自解码器的中间表示，Key 和 Value 来自编码器的输出。它用于 encoder-decoder 架构，使解码器在生成每个 token 时能够“查询”编码器的全部输入信息。LDM/Stable Diffusion 中，交叉注意力的 Query 来自 UNet 的中间特征，Key 和 Value 来自文本嵌入，使图像生成能够根据文本提示进行条件控制。
+&emsp;&emsp;交叉注意力（Cross-Attention）与因果掩码（Causal Mask）是 Transformer 解码器中两个紧密相关的机制。交叉注意力解决的是“查询来自哪里、键值来自哪里”的问题，而因果掩码解决的是“当前 token 能看到哪些位置”的问题。
 
-&emsp;&emsp;因果掩码（Causal Mask）用于 decoder-only 架构的自注意力。它确保位置 $i$ 只能关注位置 $\leq i$ 的 token，从而支持自回归生成。具体实现是在 softmax 之前将未来位置的注意力 logit 设为 $-\infty$，使 softmax 后的权重为零。
+&emsp;&emsp;在标准自注意力中，$Q$、$K$、$V$ 都来自同一个序列。而在交叉注意力中，Query 来自解码器的当前层输入，Key 和 Value 来自编码器的最后一层输出：
+
+$$
+Q = H_{dec} W^Q, \quad K = H_{enc} W^K, \quad V = H_{enc} W^V
+$$
+
+&emsp;&emsp;其中 $H_{dec} \in \mathbb{R}^{n_{dec} \times d}$ 是解码器隐藏状态，$H_{enc} \in \mathbb{R}^{n_{enc} \times d}$ 是编码器输出。交叉注意力使解码器能够在生成每个 token 时，从编码器的完整输出中检索最相关的信息。
+
+&emsp;&emsp;因果掩码则用于自回归生成场景。在解码器的自注意力层中，如果不加限制，每个位置会关注所有位置，包括未来的位置，这会导致信息泄露。因果掩码在注意力分数矩阵上应用上三角掩码：
+
+$$
+\mathrm{Mask}_{ij} = \begin{cases} 0 & \text{if } j \leq i \\ -\infty & \text{if } j > i \end{cases}
+$$
+
+&emsp;&emsp;将掩码加到缩放后的注意力分数上：
+
+$$
+A = \mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d_k}} + \mathrm{Mask}\right)
+$$
+
+&emsp;&emsp;由于 $e^{-\infty}=0$，未来位置的注意力权重被置零，每个位置只能关注自己和之前的位置。需要注意的是，交叉注意力层通常不使用因果掩码，因为 Key/Value 来自编码器的完整输出，本身就是对源序列的完整编码，不存在“未来信息泄露”的问题。
+
+&emsp;&emsp;交叉注意力的优点是解码器能在生成过程中动态聚焦编码器的不同部分，实现两个序列之间的对齐，在机器翻译、语音识别、多模态任务中广泛使用；缺点是需要维护两套不同来源的表示，计算和内存开销比自注意力更大，且当编码器输出很长时，交叉注意力的 $O(n_{dec} \cdot n_{enc})$ 复杂度会成为瓶颈。因果掩码的优点是实现简单、计算开销小，能有效保证自回归生成的因果性；缺点是限制了解码器自注意力层的信息流向，使模型无法利用未来上下文。
+
+&emsp;&emsp;从维度视角看，交叉注意力是在两个不同序列的 token 维之间建立关系矩阵。Query 序列的每个位置通过关系矩阵从 Key 序列的所有位置加权聚合 Value。因果掩码则是在关系矩阵上施加一个下三角约束，使 token 维的扩散只沿时间方向单向进行。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出交叉注意力与因果掩码的裸实现：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class CrossAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+        self.b_q = nn.Parameter(torch.zeros(d_model))
+        self.b_k = nn.Parameter(torch.zeros(d_model))
+        self.b_v = nn.Parameter(torch.zeros(d_model))
+        self.b_o = nn.Parameter(torch.zeros(d_model))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o):
+            nn.init.xavier_uniform_(w)
+
+    def forward(self, decoder_hidden, encoder_output, cross_mask=None, causal=True):
+        B, L_dec, _ = decoder_hidden.size()
+        L_enc = encoder_output.size(1)
+
+        # Query 来自解码器，Key/Value 来自编码器
+        Q = torch.matmul(decoder_hidden, self.W_q) + self.b_q
+        K = torch.matmul(encoder_output, self.W_k) + self.b_k
+        V = torch.matmul(encoder_output, self.W_v) + self.b_v
+
+        Q = Q.view(B, L_dec, self.num_heads, self.d_k).transpose(1, 2)
+        K = K.view(B, L_enc, self.num_heads, self.d_k).transpose(1, 2)
+        V = V.view(B, L_enc, self.num_heads, self.d_k).transpose(1, 2)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+
+        # 因果掩码：仅用于自注意力，交叉注意力通常不需要
+        if causal and L_dec == L_enc:
+            causal_mask = torch.triu(
+                torch.ones(L_dec, L_enc, device=scores.device), diagonal=1
+            ).bool()
+            scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        if cross_mask is not None:
+            scores = scores.masked_fill(cross_mask == 0, float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1)
+        head_out = torch.matmul(attn, V)
+
+        head_out = head_out.transpose(1, 2).contiguous().view(B, L_dec, self.d_model)
+        output = torch.matmul(head_out, self.W_o) + self.b_o
+        return output, attn
+```
+
+&emsp;&emsp;这个实现中，Query 来自解码器隐藏状态，Key/Value 来自编码器输出。当 `causal=True` 且解码器与编码器序列长度相同时，应用因果掩码。若 `decoder_hidden` 形状为 $(B, L_{dec}, d_{model})$，`encoder_output` 形状为 $(B, L_{enc}, d_{model})$，则输出形状为 $(B, L_{dec}, d_{model})$，`attn` 形状为 $(B, h, L_{dec}, L_{enc})$。
+
+---
 
 #### 2.1.7 FlashAttention
 
-&emsp;&emsp;FlashAttention 是一种注意力计算的显存优化实现。它通过分块计算和重计算，将注意力操作的内存访问从二次方降低到线性，避免显式存储完整的 $n \times n$ 注意力矩阵。FlashAttention 在 Falcon、LLaMA、Qwen 等模型的训练和推理中得到大规模应用，使长序列训练在合理显存下成为可能。
+&emsp;&emsp;FlashAttention 是一种 IO 感知的精确注意力算法，它不改变注意力的数学定义，而是通过优化 GPU 显存层次之间的读写来大幅提升计算效率和降低显存占用。标准注意力需要将完整的 $n \times n$ 注意力矩阵写入 GPU 高带宽内存，再读回进行 Softmax 和后续计算，这导致大量的 HBM 读写成为瓶颈。FlashAttention 的核心思想是用分块技术将 Q、K、V 分割成能装入片上 SRAM 的小块，在 SRAM 中完成计算，避免在 HBM 中存储完整的注意力矩阵。
+
+&emsp;&emsp;FlashAttention 的关键技术包括两个方面：分块和重计算。分块将 Q、K、V 按块加载到 SRAM，在块之间逐步计算 Softmax，在每个块输出之前对其归一化并累加，最后得到正确结果。由于 Softmax 的归一化需要全局信息，FlashAttention 采用在线 Softmax 算法：对每个查询块，逐块遍历 Key 块，边计算边维护当前的最大值和归一化因子，最终累积得到正确的输出。
+
+&emsp;&emsp;在线 Softmax 的核心递推公式如下。设当前已处理到第 $j$ 个 Key 块，维护运行最大值 $m_j$ 和运行归一化因子 $\ell_j$：
+
+$$
+m_j = \max(m_{j-1}, \max(K_j \text{ 块的行最大值})
+$$
+
+$$
+\ell_j = e^{m_{j-1} - m_j} \ell_{j-1} + \sum_{k \in \text{块}j} e^{s_k - m_j}
+$$
+
+&emsp;&emsp;输出累积为：
+
+$$
+O_j = e^{m_{j-1} - m_j} O_{j-1} + \sum_{k \in \text{块}j} e^{s_k - m_j} V_k
+$$
+
+&emsp;&emsp;遍历完所有 Key 块后，用 $\ell$ 归一化得到最终输出。重计算则在反向传播时不存储完整的注意力矩阵，而是重新计算需要的部分，以计算换存储。
+
+&emsp;&emsp;FlashAttention 的优点是显存占用从 $O(n^2)$ 降到 $O(n)$，速度相比标准注意力有 2-4 倍提升，且产生完全相同的数值结果，属于精确注意力而非近似方法；缺点是实现复杂度高，通常需要自定义 CUDA/Triton 内核，且在小序列长度下优势不明显，分块大小需要根据 SRAM 容量手动调优。
+
+&emsp;&emsp;从维度视角看，FlashAttention 并不改变 token 维扩散的数学形式，而是改变了这个扩散在硬件上的执行方式。标准注意力先物化完整的 $n \times n$ 关系矩阵再应用，而 FlashAttention 将关系矩阵按块流式生成和消费，使计算从内存受限转为计算受限。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 FlashAttention 核心思想（分块 + 在线 Softmax）的模拟实现，用 Python 循环模拟块处理流程，不调用任何注意力接口：
+
+```python
+import math
+import torch
+
+def flash_attention_simulated(Q, K, V, block_size=64):
+    """
+    模拟 FlashAttention 的分块 + 在线 Softmax 流程。
+    Q, K, V: (B, h, L, d)
+    """
+    B, h, L, d = Q.shape
+    O = torch.zeros_like(V)          # 输出累积
+    m = torch.full((B, h, L, 1), float('-inf'), device=Q.device)  # 运行最大值
+    l = torch.zeros((B, h, L, 1), device=Q.device)                # 运行归一化因子
+
+    num_blocks = math.ceil(L / block_size)
+
+    for j in range(num_blocks):
+        start = j * block_size
+        end = min(start + block_size, L)
+
+        K_j = K[:, :, start:end, :]   # (B, h, b, d)
+        V_j = V[:, :, start:end, :]
+
+        # 计算当前块的注意力分数
+        S_j = torch.matmul(Q, K_j.transpose(-2, -1)) / math.sqrt(d)
+
+        # 当前块的局部最大值
+        m_j = torch.max(S_j, dim=-1, keepdim=True).values
+
+        # 更新运行最大值
+        m_new = torch.maximum(m, m_j)
+
+        # 更新运行归一化因子
+        l = l * torch.exp(m - m_new) + torch.sum(
+            torch.exp(S_j - m_new), dim=-1, keepdim=True
+        )
+
+        # 累积输出
+        O = O * torch.exp(m - m_new) + torch.matmul(
+            torch.exp(S_j - m_new), V_j
+        )
+
+        m = m_new
+
+    # 最终归一化
+    O = O / l
+    return O
+```
+
+&emsp;&emsp;这个实现用循环模拟了 FlashAttention 的块间在线 Softmax 过程。实际生产中使用 `flash_attn` 库或 PyTorch 2.0 的 `F.scaled_dot_product_attention` 可获得 CUDA 加速。若输入形状为 $(B,h,L,d)$，输出形状为 $(B,h,L,d)$。
+
+---
 
 #### 2.1.8 滑动窗口注意力（SWA）
 
-&emsp;&emsp;SWA 将每个 token 的注意力范围限制在一个固定大小的窗口内：query 位置 $i$ 只关注 $[i-W, i]$ 范围内的 token，其中 $W$ 是窗口大小。Mistral 7B 的窗口大小为 4096，模型共 32 层，理论感受野可达约 131K token。SWA 带来的最直接收益是 KV 缓存大小的上界约束：当序列长度超过窗口大小时，KV 缓存不再继续增长，而是被固定在窗口大小对应的上限。配合滚动缓冲区缓存（rolling buffer cache），Mistral 7B 可以在处理任意长度序列时保持恒定的显存占用。MiMo-V2-Flash 采用 5:1 混合的滑动窗口注意力与全局注意力架构。
+&emsp;&emsp;滑动窗口注意力（Sliding Window Attention, SWA）是一种稀疏注意力机制，核心思想是限制每个 token 只关注其周围固定窗口内的邻居，而非整个序列。标准注意力的复杂度为 $O(n^2)$，当序列很长时成为瓶颈。SWA 将每个 token 的注意力范围限制在窗口大小 $w$ 内，复杂度降为 $O(n \cdot w)$，在保持局部依赖建模能力的同时大幅降低计算和内存开销。
+
+&emsp;&emsp;设窗口大小为 $w$，对于位置 $i$，其注意力范围限制为：
+
+$$
+j \in [i - w, i + w]
+$$
+
+&emsp;&emsp;对于因果生成场景（只看左侧），范围变为 $j \in [i - w, i]$。注意力分数矩阵变为带状矩阵，仅对角线附近 $w$ 个对角线内的元素非零。数学形式与标准注意力相同，但只对窗口内的位置计算：
+
+$$
+o_i = \sum_{j=i-w}^{i+w} \mathrm{softmax}\left(\frac{q_i k_j^\top}{\sqrt{d_k}}\right) v_j
+$$
+
+&emsp;&emsp;在实际模型中，即使每一层只看局部窗口，堆叠多层后信息仍可传播到更远的位置。Mistral 7B 使用窗口大小 $W=4096$，共 32 层，理论感受野可达到约 131K 个 token。Longformer 在此基础上引入了全局注意力，允许部分特殊 token（如分类 token）关注整个序列，以补充局部窗口无法覆盖的全局依赖。
+
+&emsp;&emsp;SWA 的优点是计算复杂度从 $O(n^2)$ 降到 $O(n \cdot w)$，显存占用大幅减少，且实现简单，只需在注意力分数矩阵上应用带状掩码；缺点是每个 token 只能直接看到局部窗口内的信息，全局依赖需要通过多层堆叠间接传递，可能丢失需要精确长距离建模的任务中的关键信息，窗口大小 $w$ 需要根据任务和硬件手动选择。
+
+&emsp;&emsp;从维度视角看，SWA 在 token 维扩散中引入了一个带状约束：关系矩阵只在每条对角线附近的 $w$ 个位置非零。这相当于把全局扩散变为局部扩散，牺牲了单层内的全局感受野，但通过多层堆叠来补偿。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出滑动窗口注意力的裸实现：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class SlidingWindowAttention(nn.Module):
+    def __init__(self, d_model, num_heads, window_size):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.window_size = window_size
+
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+        self.b_q = nn.Parameter(torch.zeros(d_model))
+        self.b_k = nn.Parameter(torch.zeros(d_model))
+        self.b_v = nn.Parameter(torch.zeros(d_model))
+        self.b_o = nn.Parameter(torch.zeros(d_model))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o):
+            nn.init.xavier_uniform_(w)
+
+    def _build_band_mask(self, seq_len, device):
+        """构建带状掩码：位置 i 只关注 [i-w, i+w] 范围内的位置"""
+        w = self.window_size
+        mask = torch.zeros(seq_len, seq_len, device=device)
+        for i in range(seq_len):
+            left = max(0, i - w)
+            right = min(seq_len, i + w + 1)
+            mask[i, left:right] = 1.0
+        return mask
+
+    def forward(self, x, causal=False):
+        B, L, _ = x.size()
+
+        Q = torch.matmul(x, self.W_q) + self.b_q
+        K = torch.matmul(x, self.W_k) + self.b_k
+        V = torch.matmul(x, self.W_v) + self.b_v
+
+        Q = Q.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        K = K.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        V = V.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+
+        # 构建带状掩码
+        band_mask = self._build_band_mask(L, x.device)
+        if causal:
+            causal_mask = torch.tril(torch.ones(L, L, device=x.device))
+            band_mask = band_mask * causal_mask
+
+        scores = scores.masked_fill(
+            band_mask.unsqueeze(0).unsqueeze(0) == 0, float('-inf')
+        )
+
+        attn = torch.softmax(scores, dim=-1)
+        head_out = torch.matmul(attn, V)
+
+        head_out = head_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        output = torch.matmul(head_out, self.W_o) + self.b_o
+        return output, attn
+```
+
+&emsp;&emsp;这个实现中，`_build_band_mask` 构建带状掩码，使每个位置只关注窗口内的邻居。当 `causal=True` 时，窗口只向左侧开放。若输入形状为 $(B,L,d_{model})$，输出形状为 $(B,L,d_{model})$，`attn` 形状为 $(B,h,L,L)$，但大部分权重为零，实际有效计算量为 $O(n \cdot w)$。
+
+
 
 #### 2.1.9 稀疏注意力与 DSA
 
-&emsp;&emsp;稀疏注意力通过只计算部分注意力权重来降低复杂度。GLM-5 引入 DeepSeek 同款稀疏注意力（DSA），核心思想是“先筛选、后计算”：首先由闪电索引器（Lightning Indexer）快速评估查询 token 与历史 token 的相关性并打分，然后仅选择得分最高的 Top-k 个 token 进行完整的注意力计算。在 k=2048、上下文长度 L=128K 时，计算量减少约 98%。在 GLM-5 的 744B 参数模型中，DSA 被用于处理长达 200K 的上下文，将注意力计算量降低了 1.5–2 倍，推理成本降低约 40% 至 50%。
+&emsp;&emsp;稀疏注意力（Sparse Attention）是一类通过限制注意力计算范围来降低复杂度的机制。标准自注意力的复杂度为 $O(n^2)$，每个 token 需要与序列中所有其他 token 计算关系。稀疏注意力通过为每个查询选择性地只关注部分 key，将计算量降至 $O(n \cdot k)$，其中 $k$ 是每个查询实际参与计算的 key 数量。
+
+&emsp;&emsp;传统稀疏注意力方法（如 Longformer、BigBird）通常采用“局部窗口+全局标记”的静态策略：每个 token 只关注邻近的固定窗口，同时强制所有 token 关注少量全局节点。这种方法实现简单，但存在两个问题：稀疏模式固定，无法适应不同输入的动态需求；若关键依赖超出局部窗口且未被选为全局标记，模型可能遗漏重要信息。
+
+&emsp;&emsp;DeepSeek Sparse Attention（DSA）是 DeepSeek-V3.2 引入的稀疏注意力方案，其核心创新是引入一个轻量级的 **闪电索引器（Lightning Indexer）** 来动态预测 token 重要性，再据此进行 Top-k 选择。DSA 的核心思想是“先选择，再计算”：先用低精度、低维度的投影快速为每个查询打分，选出最相关的 $k$ 个 key，再仅对这 $k$ 个 key 做完整的注意力计算。
+
+&emsp;&emsp;设隐藏状态为 $h_t$，Indexer 首先用低维投影生成索引查询和索引键：
+
+$$
+q_t^{idx} = W^{q,idx} h_t, \quad k_t^{idx} = W^{k,idx} h_t
+$$
+
+&emsp;&emsp;索引分数的计算与标准注意力类似，但使用 ReLU 替代 Softmax，并在多个索引头上做加权求和：
+
+$$
+s_{t,j} = \sum_{m=1}^{H_{idx}} w_m \cdot \mathrm{ReLU}\left(\frac{(q_t^{idx})_m^\top (k_j^{idx})_m}{\sqrt{d_{idx}}}\right)
+$$
+
+&emsp;&emsp;其中 $w_m$ 是每个索引头的可学习权重，$H_{idx}$ 是索引头数。根据这些分数，为每个查询选出 top-$k$ 个 key，然后只对这 $k$ 个 key 计算完整的缩放点积注意力：
+
+$$
+o_t = \mathrm{softmax}\left(\frac{q_t k_{C_t}^\top}{\sqrt{d_k}}\right) v_{C_t}
+$$
+
+&emsp;&emsp;其中 $C_t$ 是查询 $t$ 选出的 $k$ 个 key 的索引集合。Indexer 的 Q/K 路径全程使用 FP8 或 FP4 低精度计算，维度远小于主注意力，因此打分开销极低。DSA 的优点是动态稀疏模式能适应输入内容，在保持模型质量的同时显著降低长序列推理的计算量，且 Indexer 的低精度设计使额外开销可控；缺点是引入了额外的 Indexer 模块和超参数（索引维度、索引头数、top-$k$），训练时需要联合优化 Indexer 和主注意力，且稀疏模式的不规则性给连续批处理和分页注意力等推理优化带来了挑战。
+
+&emsp;&emsp;从维度视角看，DSA 在 token 维扩散之前增加了一个“路由”阶段：Indexer 先粗略判断哪些位置的 Value 值得关注，再将完整的扩散计算限制在这个子集上。它不改变扩散的数学形式，而是改变了参与扩散的 token 集合。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 DSA 核心思想（Lightning Indexer + Top-k 稀疏注意力）的裸实现：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class DeepSeekSparseAttention(nn.Module):
+    def __init__(self, d_model, num_heads, num_idx_heads=4, top_k=64):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.num_idx_heads = num_idx_heads
+        self.top_k = top_k
+
+        # 主注意力投影
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+
+        # Lightning Indexer: 低维低精度投影
+        idx_dim = self.d_k // 4
+        self.idx_dim = idx_dim
+        self.W_qi = nn.Parameter(torch.empty(d_model, num_idx_heads * idx_dim))
+        self.W_ki = nn.Parameter(torch.empty(d_model, num_idx_heads * idx_dim))
+        self.idx_weights = nn.Parameter(torch.ones(num_idx_heads))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o, self.W_qi, self.W_ki):
+            nn.init.xavier_uniform_(w)
+
+    def forward(self, x, causal=True):
+        B, L, _ = x.size()
+
+        # --- Indexer 打分 ---
+        q_idx = torch.matmul(x, self.W_qi)
+        k_idx = torch.matmul(x, self.W_ki)
+        q_idx = q_idx.view(B, L, self.num_idx_heads, self.idx_dim).transpose(1, 2)
+        k_idx = k_idx.view(B, L, self.num_idx_heads, self.idx_dim).transpose(1, 2)
+
+        idx_scores = torch.matmul(q_idx, k_idx.transpose(-2, -1)) / math.sqrt(self.idx_dim)
+        idx_scores = torch.relu(idx_scores)
+        # 多头加权求和
+        idx_scores = (idx_scores * self.idx_weights.view(1, -1, 1, 1)).sum(dim=1)  # (B, L, L)
+
+        # --- Top-k 选择 ---
+        k = min(self.top_k, L)
+        if causal:
+            # 因果掩码：只允许关注当前位置及之前
+            causal_mask = torch.tril(torch.ones(L, L, device=x.device)).bool()
+            idx_scores = idx_scores.masked_fill(~causal_mask.unsqueeze(0), float('-inf'))
+
+        topk_indices = idx_scores.topk(k, dim=-1).indices  # (B, L, k)
+
+        # --- 主注意力（仅对 top-k 计算）---
+        Q = torch.matmul(x, self.W_q).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        K = torch.matmul(x, self.W_k).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        V = torch.matmul(x, self.W_v).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+        # 收集 top-k 的 K 和 V
+        # topk_indices: (B, L, k) -> 扩展为 (B, num_heads, L, k)
+        gather_idx = topk_indices.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
+        K_gathered = K.gather(2, gather_idx)  # (B, h, L, k, d_k)
+        V_gathered = V.gather(2, gather_idx)
+
+        # 计算注意力
+        scores = torch.matmul(Q.unsqueeze(3), K_gathered.transpose(-2, -1)).squeeze(3)
+        scores = scores / math.sqrt(self.d_k)
+        attn = torch.softmax(scores, dim=-1)  # (B, h, L, k)
+
+        head_out = torch.matmul(attn.unsqueeze(-2), V_gathered).squeeze(-2)  # (B, h, L, d_k)
+
+        head_out = head_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        output = torch.matmul(head_out, self.W_o)
+        return output, attn
+```
+
+&emsp;&emsp;这个实现中，Indexer 用低维投影快速打分，再取 top-$k$ 索引，主注意力只对选出的 $k$ 个 key 计算。若输入形状为 $(B,L,d_{model})$，输出形状为 $(B,L,d_{model})$，`attn` 形状为 $(B,h,L,k)$。
+
+---
 
 #### 2.1.10 混合注意力 CSA / HCA
 
-&emsp;&emsp;DeepSeek-V4 设计 hybrid attention 架构，CSA（压缩稀疏注意力）和 HCA（重度压缩注意力）交替叠加。CSA 使用低压缩池配合重叠窗口，加上 Lightning Indexer 对查询与池中条目进行评分，在核心注意力之前收集每个查询的 Top-k 块；HCA 使用高压缩池配合非重叠窗口，不使用索引器，每个池化条目都参与注意力计算。三种注意力类型共享同一骨干：共享 K=V 多查询注意力、部分 RoPE、逐头可学习注意力汇聚、分组低秩输出投影。CSA 还保留了共享滑动窗口 K=V 分支，以保持局部细粒度依赖。
+&emsp;&emsp;混合注意力（Hybrid Attention）是 DeepSeek-V4 提出的注意力架构，由两个互补的组件构成：**压缩稀疏注意力（Compressed Sparse Attention, CSA）** 和 **重度压缩注意力（Heavily Compressed Attention, HCA）** 。其核心思想是沿序列维度对 KV Cache 进行压缩，同时结合稀疏选择或全量注意力，在百万级上下文场景下将注意力算力降到可接受的水平。
+
+&emsp;&emsp;CSA 的做法是先将每 $m$ 个相邻 token 的 KV 压缩成一个压缩条目，然后用 Lightning Indexer 为每个查询选出 top-$k$ 个最相关的压缩条目做注意力。压缩比 $m$ 通常取 4，即每 4 个 token 压缩为 1 个条目，这样 KV Cache 序列长度降为原来的 $1/4$。压缩不是简单平均，而是用可学习的 softmax 权重加位置偏置做加权求和，并且采用重叠压缩来避免硬切边界处的信息断裂：一组用前 $m$ 个 token，另一组用后 $m$ 个 token，两个压缩结果拼接后得到最终的压缩条目。
+
+&emsp;&emsp;设第 $g$ 组的 token 集合为 $\{t_1, \dots, t_m\}$，压缩条目为：
+
+$$
+c_g = \sum_{i=1}^{m} \alpha_i \cdot k_{t_i}, \quad \alpha_i = \mathrm{softmax}(z_i + b_i)
+$$
+
+&emsp;&emsp;其中 $z_i$ 是可学习的投影分数，$b_i$ 是位置偏置。Value 的压缩采用同样的加权方式。压缩后的序列长度为 $L/m$，再对每个查询选出 top-$k$ 个压缩条目做注意力。
+
+&emsp;&emsp;HCA 是另一个极端：压缩比 $m'$ 拉到 128，即每 128 个 token 压缩为 1 个条目，压缩后的序列长度极短，因此不需要稀疏选择，直接做全量注意力即可。HCA 的计算量为 $O(n \times n/128) = O(n^2/128)$，相比原始 $O(n^2)$ 降低了两个数量级。CSA 以适中压缩率保留细节、靠稀疏选择省算力；HCA 以极高压缩率提供一个粗粒度但覆盖全局的视野。两者交错堆叠，使模型既能捕捉精细的局部依赖，又能维持全局感受野。
+
+&emsp;&emsp;混合注意力的优点是百万上下文下的边际成本被压到可用水平，V4-Pro 的单 token 推理 FLOPs 仅为 V3.2 的 27%，KV Cache 仅为 10%；缺点是结构复杂，压缩器需要额外的投影矩阵和 softmax 门控，CSA 还需要额外的 Indexer 打分流程，训练和推理的实现复杂度都显著高于标准注意力。
+
+&emsp;&emsp;从维度视角看，CSA 和 HCA 都是在 token 维扩散之前先对 Value 端做一次序列维的压缩，减少参与扩散的 token 数量。CSA 保留较多 token 但用稀疏选择控制计算量，HCA 直接用激进压缩减少 token 数量。两者交错使用，相当于在“精细但昂贵”和“粗略但廉价”之间做权衡。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 CSA 和 HCA 核心思想（压缩 + 稀疏/全量注意力）的裸实现：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class CompressedSparseAttention(nn.Module):
+    """CSA: 压缩 + 稀疏选择"""
+    def __init__(self, d_model, num_heads, compress_ratio=4, top_k=64):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.compress_ratio = compress_ratio
+        self.top_k = top_k
+
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+
+        # 压缩权重和偏置
+        self.W_compress = nn.Parameter(torch.empty(d_model, d_model))
+        self.b_compress = nn.Parameter(torch.zeros(d_model))
+
+        # Indexer
+        self.W_idx = nn.Parameter(torch.empty(d_model, d_model))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o, self.W_compress, self.W_idx):
+            nn.init.xavier_uniform_(w)
+
+    def _compress(self, x):
+        B, L, D = x.size()
+        m = self.compress_ratio
+        L_pad = math.ceil(L / m) * m
+        if L_pad > L:
+            x = torch.cat([x, torch.zeros(B, L_pad - L, D, device=x.device)], dim=1)
+        x = x.view(B, L_pad // m, m, D)
+        # 可学习加权压缩
+        scores = torch.matmul(x, self.W_compress) + self.b_compress
+        weights = torch.softmax(scores, dim=2)
+        compressed = (x * weights).sum(dim=2)  # (B, L//m, D)
+        return compressed
+
+    def forward(self, x, causal=True):
+        B, L, _ = x.size()
+
+        # 压缩 KV
+        x_k = self._compress(x)
+        x_v = self._compress(x)
+        L_c = x_k.size(1)
+
+        Q = torch.matmul(x, self.W_q).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        K = torch.matmul(x_k, self.W_k).view(B, L_c, self.num_heads, self.d_k).transpose(1, 2)
+        V = torch.matmul(x_v, self.W_v).view(B, L_c, self.num_heads, self.d_k).transpose(1, 2)
+
+        # Indexer 选择 top-k 压缩条目
+        idx_score = torch.matmul(x, self.W_idx)  # (B, L, D)
+        idx_score = torch.matmul(idx_score, K.mean(dim=1).transpose(-2, -1))  # (B, L, L_c)
+        k = min(self.top_k, L_c)
+        topk_idx = idx_score.topk(k, dim=-1).indices  # (B, L, k)
+
+        gather_idx = topk_idx.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
+        K_g = K.gather(2, gather_idx)
+        V_g = V.gather(2, gather_idx)
+
+        scores = torch.matmul(Q.unsqueeze(3), K_g.transpose(-2, -1)).squeeze(3) / math.sqrt(self.d_k)
+        attn = torch.softmax(scores, dim=-1)
+        head_out = torch.matmul(attn.unsqueeze(-2), V_g).squeeze(-2)
+
+        head_out = head_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        return torch.matmul(head_out, self.W_o), attn
+
+
+class HeavilyCompressedAttention(nn.Module):
+    """HCA: 重度压缩 + 全量注意力"""
+    def __init__(self, d_model, num_heads, compress_ratio=128):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.compress_ratio = compress_ratio
+
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_compress = nn.Parameter(torch.empty(d_model, d_model))
+        self.b_compress = nn.Parameter(torch.zeros(d_model))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o, self.W_compress):
+            nn.init.xavier_uniform_(w)
+
+    def _compress(self, x):
+        B, L, D = x.size()
+        m = self.compress_ratio
+        L_pad = math.ceil(L / m) * m
+        if L_pad > L:
+            x = torch.cat([x, torch.zeros(B, L_pad - L, D, device=x.device)], dim=1)
+        x = x.view(B, L_pad // m, m, D)
+        scores = torch.matmul(x, self.W_compress) + self.b_compress
+        weights = torch.softmax(scores, dim=2)
+        return (x * weights).sum(dim=2)
+
+    def forward(self, x):
+        B, L, _ = x.size()
+
+        x_k = self._compress(x)
+        x_v = self._compress(x)
+        L_c = x_k.size(1)
+
+        Q = torch.matmul(x, self.W_q).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        K = torch.matmul(x_k, self.W_k).view(B, L_c, self.num_heads, self.d_k).transpose(1, 2)
+        V = torch.matmul(x_v, self.W_v).view(B, L_c, self.num_heads, self.d_k).transpose(1, 2)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        attn = torch.softmax(scores, dim=-1)
+        head_out = torch.matmul(attn, V)
+
+        head_out = head_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        return torch.matmul(head_out, self.W_o), attn
+```
+
+&emsp;&emsp;CSA 先压缩再稀疏选择，HCA 直接重度压缩后做全量注意力。两者的压缩器结构相同，区别仅在压缩比和是否使用 Indexer。
+
+---
 
 #### 2.1.11 线性注意力
 
-&emsp;&emsp;线性注意力通过将 softmax 注意力分解为核函数形式，将计算复杂度从 $O(n^2)$ 降至 $O(n)$。Kimi K3 的 KDA（Kimi Delta Attention）即属于高效长上下文建模的线性注意力变体，以 3:1 比例混合 KDA 与 Gated MLA，并通过块级注意力残差增强跨层信息流动。
+&emsp;&emsp;线性注意力（Linear Attention）是一类通过核函数特征映射将注意力计算复杂度从 $O(n^2)$ 降到 $O(n)$ 的方法。其核心思想是将 Softmax 注意力中的相似度计算分解为可分解的核函数，利用矩阵乘法的结合律重新组织计算顺序，避免显式构造 $n \times n$ 的注意力矩阵。
+
+&emsp;&emsp;标准注意力中，Softmax 的归一化使得注意力权重无法分解：
+
+$$
+\mathrm{Attention}(Q,K,V) = \mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V
+$$
+
+&emsp;&emsp;Softmax 作用于 $QK^\top$ 的每一行，与 $V$ 的乘法无法交换顺序。线性注意力的关键观察是：如果用一个可分解的核函数 $\phi$ 替换 Softmax，使得相似度可以写成两个特征映射的内积：
+
+$$
+\mathrm{sim}(q_i, k_j) \approx \phi(q_i)^\top \phi(k_j)
+$$
+
+&emsp;&emsp;那么注意力输出可以重写为：
+
+$$
+o_i = \frac{\sum_{j=1}^{n} \phi(q_i)^\top \phi(k_j) v_j}{\sum_{j=1}^{n} \phi(q_i)^\top \phi(k_j)}
+= \frac{\phi(q_i)^\top \left(\sum_{j=1}^{n} \phi(k_j) v_j^\top\right)}{\phi(q_i)^\top \left(\sum_{j=1}^{n} \phi(k_j)\right)}
+$$
+
+&emsp;&emsp;关键变化在于：$\sum_{j=1}^{n} \phi(k_j) v_j^\top$ 是一个与查询无关的中间矩阵，可以在遍历序列时增量累积，不需要为每个查询重新计算。这样，总复杂度从 $O(n^2 d)$ 降为 $O(n d^2)$，其中 $d$ 是特征维度。当 $d \ll n$ 时，线性注意力在计算量上具有显著优势。
+
+&emsp;&emsp;常用的核函数 $\phi$ 包括：Linear Transformer 使用 $\phi(x) = \mathrm{ELU}(x) + 1$，保证输出非负；Performer 使用随机特征映射近似 Softmax 核；cosFormer 使用余弦重加权来增强局部性。选择核函数的核心约束是 $\phi$ 的输出需要保持非负，否则归一化因子可能为零或负值，导致数值不稳定。
+
+&emsp;&emsp;线性注意力的因果形式还可以写成类似 RNN 的状态更新。设状态矩阵 $S_t = \sum_{j=1}^{t} \phi(k_j) v_j^\top$ 和归一化向量 $z_t = \sum_{j=1}^{t} \phi(k_j)$，则：
+
+$$
+S_t = S_{t-1} + \phi(k_t) v_t^\top, \quad z_t = z_{t-1} + \phi(k_t)
+$$
+
+$$
+o_t = \frac{\phi(q_t)^\top S_t}{\phi(q_t)^\top z_t}
+$$
+
+&emsp;&emsp;这种循环形式使线性注意力在自回归生成时只需维护固定大小的状态 $S \in \mathbb{R}^{d_\phi \times d_v}$，而非随序列长度增长的 KV Cache，推理内存占用为常数。
+
+&emsp;&emsp;线性注意力的优点是计算复杂度从 $O(n^2)$ 降到 $O(n)$，推理时状态大小固定，不随序列增长，适合超长序列和流式生成；缺点是核函数近似会损失 Softmax 注意力的表达能力和数值稳定性，模型在需要精确长距离依赖建模的任务上可能表现不如标准注意力，且训练时并行形式与推理时循环形式之间的数值一致性需要额外注意。
+
+&emsp;&emsp;从维度视角看，线性注意力改变了 token 维扩散的计算顺序：不再先构造完整的关系矩阵再应用，而是将 Value 端的信息压缩到一个与序列长度无关的状态矩阵中，查询通过核函数特征映射从这个状态中读取信息。这相当于把“全量扩散”替换为“状态累积 + 状态读取”，以表达能力的损失换取了序列长度的线性扩展能力。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出线性注意力的裸实现，包含并行形式和循环形式：
+
+```python
+import torch
+import torch.nn as nn
+
+class LinearAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o):
+            nn.init.xavier_uniform_(w)
+
+    @staticmethod
+    def _phi(x):
+        """特征映射：ELU + 1，保证非负"""
+        return torch.nn.functional.elu(x) + 1.0
+
+    def forward(self, x, causal=True):
+        B, L, _ = x.size()
+
+        Q = torch.matmul(x, self.W_q).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        K = torch.matmul(x, self.W_k).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        V = torch.matmul(x, self.W_v).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+        # 特征映射
+        Q_phi = self._phi(Q)  # (B, h, L, d_k)
+        K_phi = self._phi(K)
+
+        if causal:
+            # 因果形式：循环累积状态
+            S = torch.zeros(B, self.num_heads, self.d_k, self.d_k, device=x.device)
+            Z = torch.zeros(B, self.num_heads, self.d_k, device=x.device)
+            outputs = []
+
+            for t in range(L):
+                # 状态更新
+                S = S + K_phi[:, :, t].unsqueeze(-1) * V[:, :, t].unsqueeze(-2)
+                Z = Z + K_phi[:, :, t]
+
+                # 读取
+                o_t = (Q_phi[:, :, t].unsqueeze(-2) @ S).squeeze(-2)
+                z_t = (Q_phi[:, :, t] * Z).sum(dim=-1, keepdim=True)
+                outputs.append(o_t / (z_t + 1e-6))
+
+            head_out = torch.stack(outputs, dim=2)  # (B, h, L, d_k)
+        else:
+            # 并行形式：先算中间矩阵，再读取
+            # S = K_phi^T @ V  (B, h, d_k, d_k)
+            S = torch.matmul(K_phi.transpose(-2, -1), V)
+            Z = K_phi.sum(dim=2)  # (B, h, d_k)
+
+            head_out = torch.matmul(Q_phi, S)  # (B, h, L, d_k)
+            z_out = (Q_phi * Z.unsqueeze(2)).sum(dim=-1, keepdim=True)  # (B, h, L, 1)
+            head_out = head_out / (z_out + 1e-6)
+
+        head_out = head_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        output = torch.matmul(head_out, self.W_o)
+        return output, None
+```
+
+&emsp;&emsp;这个实现中，`_phi` 使用 ELU+1 作为特征映射。`causal=True` 时用循环形式累积状态，`causal=False` 时用并行形式先算中间矩阵再读取。若输入形状为 $(B,L,d_{model})$，输出形状为 $(B,L,d_{model})$。循环形式的状态 $S$ 大小固定为 $(B,h,d_k,d_k)$，与序列长度无关。
 
 ---
 
@@ -152,31 +1177,835 @@ $$
 
 #### 2.2.1 Encoder-only
 
-&emsp;&emsp;Encoder-only 架构使用双向注意力，擅长理解类任务（分类、抽取式问答），但无法直接生成文本。BERT 是 encoder-only 的代表。它通过掩码语言建模学习双向表示，在 GLUE 等理解基准上取得了当时最优结果。
+&emsp;&emsp;Encoder-only 架构只保留 Transformer 的编码器部分，每个 token 可以关注序列中的所有其他 token，因此是双向注意力。它不包含自回归生成机制，通常用于理解类任务，如文本分类、序列标注、抽取式问答和句子相似度。代表性模型包括 BERT、RoBERTa、DeBERTa 等。
+
+&emsp;&emsp;设输入 token 序列经过嵌入和位置编码后得到 $X \in \mathbb{R}^{n \times d_{model}}$。Encoder-only 由 $N$ 个相同的编码层堆叠而成，每层包含两个子层：多头自注意力和前馈网络。每个子层都使用残差连接和层归一化。自注意力中 $Q,K,V$ 都来自同一输入，且不使用因果掩码，因此每个位置都能看到全序列。
+
+&emsp;&emsp;编码器层的计算可以写为：
+
+$$
+Z = \mathrm{LayerNorm}\left(X + \mathrm{MultiHead}(X,X,X)\right)
+$$
+
+$$
+Y = \mathrm{LayerNorm}\left(Z + \mathrm{FFN}(Z)\right)
+$$
+
+&emsp;&emsp;其中 $\mathrm{FFN}$ 通常是两层线性变换加激活函数：
+
+$$
+\mathrm{FFN}(z) = W_2 \cdot \sigma(W_1 z + b_1) + b_2
+$$
+
+&emsp;&emsp;Encoder-only 的输出是每个位置的上下文表示。对于分类任务，通常取第一个特殊 token 的表示或对所有位置做池化，再接入任务头。Encoder-only 的优点是双向注意力使每个 token 都能利用完整上下文，在理解类任务上表现优异，且可以并行处理整个序列，训练效率高；缺点是无法直接用于自回归生成，因为训练时看到完整序列会导致信息泄露，且推理时没有因果约束，不能逐 token 生成。
+
+&emsp;&emsp;从维度视角看，Encoder-only 在 token 维上做全连接扩散：每个 token 的关系矩阵覆盖所有位置，没有方向性约束。它适合对整段序列做一次全局信息混合，然后输出每个位置的上下文表示。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Encoder-only 的裸实现，只使用基础张量运算和手动参数：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class EncoderOnly(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads, num_layers, d_ff, max_len=512):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+
+        self.token_emb = nn.Parameter(torch.empty(vocab_size, d_model))
+        self.pos_emb = nn.Parameter(torch.empty(max_len, d_model))
+        nn.init.normal_(self.token_emb, std=0.02)
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                "W_q": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_k": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_v": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_o": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_1": nn.Parameter(torch.empty(d_model, d_ff)),
+                "b_1": nn.Parameter(torch.zeros(d_ff)),
+                "W_2": nn.Parameter(torch.empty(d_ff, d_model)),
+                "b_2": nn.Parameter(torch.zeros(d_model)),
+                "ln1_w": nn.Parameter(torch.ones(d_model)),
+                "ln1_b": nn.Parameter(torch.zeros(d_model)),
+                "ln2_w": nn.Parameter(torch.ones(d_model)),
+                "ln2_b": nn.Parameter(torch.zeros(d_model)),
+            })
+            for _ in range(num_layers)
+        ])
+
+        for layer in self.layers:
+            for name, p in layer.items():
+                if "W_" in name:
+                    nn.init.xavier_uniform_(p)
+
+    def _layer_norm(self, x, w, b):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + 1e-6) * w + b
+
+    def forward(self, input_ids):
+        B, L = input_ids.size()
+        x = self.token_emb[input_ids] + self.pos_emb[:L].unsqueeze(0)
+
+        for layer in self.layers:
+            # 自注意力
+            Q = torch.matmul(x, layer["W_q"])
+            K = torch.matmul(x, layer["W_k"])
+            V = torch.matmul(x, layer["W_v"])
+
+            Q = Q.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            K = K.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            V = V.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+            attn = torch.softmax(scores, dim=-1)
+            head_out = torch.matmul(attn, V)
+            head_out = head_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+            attn_out = torch.matmul(head_out, layer["W_o"])
+
+            # 残差 + LayerNorm
+            x = self._layer_norm(x + attn_out, layer["ln1_w"], layer["ln1_b"])
+
+            # FFN
+            ffn_out = torch.matmul(
+                torch.relu(torch.matmul(x, layer["W_1"]) + layer["b_1"]),
+                layer["W_2"]
+            ) + layer["b_2"]
+
+            x = self._layer_norm(x + ffn_out, layer["ln2_w"], layer["ln2_b"])
+
+        return x
+```
+
+&emsp;&emsp;这个实现中，每个编码层先做双向自注意力，再做前馈网络，均使用 Post-LN 结构。若输入 `input_ids` 形状为 $(B,L)$，输出形状为 $(B,L,d_{model})$。
+
+---
 
 #### 2.2.2 Decoder-only
 
-&emsp;&emsp;Decoder-only 架构使用因果注意力，擅长生成类任务，是当前 LLM 的主流范式。GPT 系列、LLaMA 系列、Mistral、Qwen、DeepSeek、Kimi、GLM 等几乎全部采用 decoder-only。其训练目标是自回归语言建模：给定前文 token 序列，预测下一个 token。Decoder-only 在自回归语言建模目标下天然支持任意任务的统一表示，且训练和推理流程最简单、最容易规模化。
+&emsp;&emsp;Decoder-only 架构只保留 Transformer 的解码器部分，每个 token 只能关注自己和之前的位置，因此是因果注意力。它通过自回归方式逐 token 生成序列，是当前大语言模型的主流架构。代表性模型包括 GPT 系列、LLaMA、Qwen、DeepSeek 等。
+
+&emsp;&emsp;设输入 token 序列经过嵌入和位置编码后得到 $X \in \mathbb{R}^{n \times d_{model}}$。Decoder-only 由 $N$ 个相同的解码层堆叠而成，每层包含两个子层：因果多头自注意力和前馈网络。与 Encoder-only 的关键区别是自注意力使用因果掩码，将未来位置的注意力分数置为 $-\infty$，确保位置 $i$ 只能关注 $j \leq i$。
+
+&emsp;&emsp;因果掩码矩阵为：
+
+$$
+M_{ij} = \begin{cases} 0 & j \leq i \\ -\infty & j > i \end{cases}
+$$
+
+&emsp;&emsp;解码器层的计算为：
+
+$$
+Z = \mathrm{LayerNorm}\left(X + \mathrm{MultiHead}(X,X,X) + M\right)
+$$
+
+$$
+Y = \mathrm{LayerNorm}\left(Z + \mathrm{FFN}(Z)\right)
+$$
+
+&emsp;&emsp;训练时，Decoder-only 仍然可以并行处理整个序列，因为因果掩码保证了每个位置只看到之前的内容。推理时，模型逐 token 生成，每次将新 token 追加到输入序列末尾，并缓存之前所有层的 Key 和 Value，避免重复计算。Decoder-only 的优点是结构统一、易于扩展，适合自回归生成，且与 KV Cache 配合后推理效率高；缺点是只能利用左侧上下文，无法像 Encoder-only 那样双向建模，且训练和推理存在一定的计算模式差异。
+
+&emsp;&emsp;从维度视角看，Decoder-only 在 token 维上做因果扩散：关系矩阵是下三角矩阵，信息只能从过去流向未来。它适合逐 token 生成，每一步的输出只依赖已生成的 token。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Decoder-only 的裸实现，包含因果掩码：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class DecoderOnly(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads, num_layers, d_ff, max_len=512):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+
+        self.token_emb = nn.Parameter(torch.empty(vocab_size, d_model))
+        self.pos_emb = nn.Parameter(torch.empty(max_len, d_model))
+        nn.init.normal_(self.token_emb, std=0.02)
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                "W_q": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_k": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_v": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_o": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_1": nn.Parameter(torch.empty(d_model, d_ff)),
+                "b_1": nn.Parameter(torch.zeros(d_ff)),
+                "W_2": nn.Parameter(torch.empty(d_ff, d_model)),
+                "b_2": nn.Parameter(torch.zeros(d_model)),
+                "ln1_w": nn.Parameter(torch.ones(d_model)),
+                "ln1_b": nn.Parameter(torch.zeros(d_model)),
+                "ln2_w": nn.Parameter(torch.ones(d_model)),
+                "ln2_b": nn.Parameter(torch.zeros(d_model)),
+            })
+            for _ in range(num_layers)
+        ])
+
+        for layer in self.layers:
+            for name, p in layer.items():
+                if "W_" in name:
+                    nn.init.xavier_uniform_(p)
+
+    def _layer_norm(self, x, w, b):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + 1e-6) * w + b
+
+    def forward(self, input_ids):
+        B, L = input_ids.size()
+        x = self.token_emb[input_ids] + self.pos_emb[:L].unsqueeze(0)
+
+        # 因果掩码
+        causal_mask = torch.triu(
+            torch.ones(L, L, device=x.device), diagonal=1
+        ).bool()
+
+        for layer in self.layers:
+            Q = torch.matmul(x, layer["W_q"])
+            K = torch.matmul(x, layer["W_k"])
+            V = torch.matmul(x, layer["W_v"])
+
+            Q = Q.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            K = K.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            V = V.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+            scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            attn = torch.softmax(scores, dim=-1)
+            head_out = torch.matmul(attn, V)
+            head_out = head_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+            attn_out = torch.matmul(head_out, layer["W_o"])
+
+            x = self._layer_norm(x + attn_out, layer["ln1_w"], layer["ln1_b"])
+
+            ffn_out = torch.matmul(
+                torch.relu(torch.matmul(x, layer["W_1"]) + layer["b_1"]),
+                layer["W_2"]
+            ) + layer["b_2"]
+
+            x = self._layer_norm(x + ffn_out, layer["ln2_w"], layer["ln2_b"])
+
+        return x
+```
+
+&emsp;&emsp;这个实现中，因果掩码在每层自注意力中应用，确保每个位置只能关注自己和之前的位置。若输入 `input_ids` 形状为 $(B,L)$，输出形状为 $(B,L,d_{model})$。实际生成时通常还会缓存每层的 K 和 V，这里为简化省略。
+
+---
 
 #### 2.2.3 Encoder-Decoder
 
-&emsp;&emsp;Encoder-Decoder 架构中，编码器双向理解输入，解码器自回归生成输出，适合序列到序列任务。原始 Transformer、T5、BART 是代表。T5 通过文本到文本框架证明，encoder-decoder 架构在统一框架下表现最优——编码器的双向注意力适合理解输入，解码器的因果注意力适合自回归生成，交叉注意力负责在两者之间传递信息。但后续的大规模通用模型几乎全部回归 decoder-only。
+&emsp;&emsp;Encoder-Decoder 架构同时包含编码器和解码器，编码器双向处理源序列，解码器自回归生成目标序列，并通过交叉注意力从编码器输出中读取信息。它适合序列到序列任务，如机器翻译、文本摘要、语音识别。代表性模型包括原始 Transformer、T5、BART 等。
+
+&emsp;&emsp;设源序列为 $X \in \mathbb{R}^{n \times d_{model}}$，目标序列为 $Y \in \mathbb{R}^{m \times d_{model}}$。编码器由 $N$ 层双向自注意力和前馈网络组成，输出 $H_{enc}$。解码器由 $N$ 层组成，每层包含三个子层：因果自注意力、交叉注意力和前馈网络。交叉注意力中，Query 来自解码器，Key 和 Value 来自编码器输出：
+
+$$
+Q = H_{dec} W^Q, \quad K = H_{enc} W^K, \quad V = H_{enc} W^V
+$$
+
+&emsp;&emsp;解码器层的计算为：
+
+$$
+Z_1 = \mathrm{LayerNorm}\left(Y + \mathrm{MaskedMultiHead}(Y,Y,Y)\right)
+$$
+
+$$
+Z_2 = \mathrm{LayerNorm}\left(Z_1 + \mathrm{CrossAttention}(Z_1, H_{enc}, H_{enc})\right)
+$$
+
+$$
+Z_3 = \mathrm{LayerNorm}\left(Z_2 + \mathrm{FFN}(Z_2)\right)
+$$
+
+&emsp;&emsp;Encoder-Decoder 的优点是编码器可以双向理解源序列，解码器通过交叉注意力动态对齐源和目标，适合输入输出长度不同、需要显式对齐的任务；缺点是结构比 Encoder-only 和 Decoder-only 更复杂，参数量和计算量更大，且交叉注意力的 $O(n_{dec} \cdot n_{enc})$ 复杂度在长序列上容易成为瓶颈。
+
+&emsp;&emsp;从维度视角看，Encoder-Decoder 包含两次 token 维扩散：编码器内部的双向扩散和解码器内部的因果扩散，以及解码器到编码器的交叉扩散。交叉扩散的关系矩阵形状为 $n_{dec} \times n_{enc}$，连接了两个不同序列的 token 维。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Encoder-Decoder 的裸实现，包含编码器、解码器和交叉注意力：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class EncoderDecoder(nn.Module):
+    def __init__(self, src_vocab, tgt_vocab, d_model, num_heads, num_layers, d_ff, max_len=512):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+
+        self.src_emb = nn.Parameter(torch.empty(src_vocab, d_model))
+        self.tgt_emb = nn.Parameter(torch.empty(tgt_vocab, d_model))
+        self.pos_emb = nn.Parameter(torch.empty(max_len, d_model))
+        nn.init.normal_(self.src_emb, std=0.02)
+        nn.init.normal_(self.tgt_emb, std=0.02)
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+        def make_layer():
+            return nn.ModuleDict({
+                "W_q": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_k": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_v": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_o": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_cq": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_ck": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_cv": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_co": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_1": nn.Parameter(torch.empty(d_model, d_ff)),
+                "b_1": nn.Parameter(torch.zeros(d_ff)),
+                "W_2": nn.Parameter(torch.empty(d_ff, d_model)),
+                "b_2": nn.Parameter(torch.zeros(d_model)),
+                "ln1_w": nn.Parameter(torch.ones(d_model)),
+                "ln1_b": nn.Parameter(torch.zeros(d_model)),
+                "ln2_w": nn.Parameter(torch.ones(d_model)),
+                "ln2_b": nn.Parameter(torch.zeros(d_model)),
+                "ln3_w": nn.Parameter(torch.ones(d_model)),
+                "ln3_b": nn.Parameter(torch.zeros(d_model)),
+            })
+
+        self.enc_layers = nn.ModuleList([make_layer() for _ in range(num_layers)])
+        self.dec_layers = nn.ModuleList([make_layer() for _ in range(num_layers)])
+
+        for layer in list(self.enc_layers) + list(self.dec_layers):
+            for name, p in layer.items():
+                if "W_" in name:
+                    nn.init.xavier_uniform_(p)
+
+    def _ln(self, x, w, b):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + 1e-6) * w + b
+
+    def _attn(self, Q, K, V, mask=None):
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask, float('-inf'))
+        attn = torch.softmax(scores, dim=-1)
+        return torch.matmul(attn, V)
+
+    def forward(self, src_ids, tgt_ids):
+        B, L_s = src_ids.size()
+        _, L_t = tgt_ids.size()
+
+        src = self.src_emb[src_ids] + self.pos_emb[:L_s].unsqueeze(0)
+        tgt = self.tgt_emb[tgt_ids] + self.pos_emb[:L_t].unsqueeze(0)
+
+        # 编码器
+        enc = src
+        for layer in self.enc_layers:
+            Q = torch.matmul(enc, layer["W_q"]).view(B, L_s, self.num_heads, self.d_k).transpose(1, 2)
+            K = torch.matmul(enc, layer["W_k"]).view(B, L_s, self.num_heads, self.d_k).transpose(1, 2)
+            V = torch.matmul(enc, layer["W_v"]).view(B, L_s, self.num_heads, self.d_k).transpose(1, 2)
+            attn_out = self._attn(Q, K, V)
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, L_s, self.d_model)
+            attn_out = torch.matmul(attn_out, layer["W_o"])
+            enc = self._ln(enc + attn_out, layer["ln1_w"], layer["ln1_b"])
+
+            ffn = torch.matmul(torch.relu(torch.matmul(enc, layer["W_1"]) + layer["b_1"]), layer["W_2"]) + layer["b_2"]
+            enc = self._ln(enc + ffn, layer["ln2_w"], layer["ln2_b"])
+
+        # 解码器
+        dec = tgt
+        causal_mask = torch.triu(torch.ones(L_t, L_t, device=dec.device), diagonal=1).bool()
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+
+        for layer in self.dec_layers:
+            # 因果自注意力
+            Q = torch.matmul(dec, layer["W_q"]).view(B, L_t, self.num_heads, self.d_k).transpose(1, 2)
+            K = torch.matmul(dec, layer["W_k"]).view(B, L_t, self.num_heads, self.d_k).transpose(1, 2)
+            V = torch.matmul(dec, layer["W_v"]).view(B, L_t, self.num_heads, self.d_k).transpose(1, 2)
+            attn_out = self._attn(Q, K, V, causal_mask)
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, L_t, self.d_model)
+            attn_out = torch.matmul(attn_out, layer["W_o"])
+            dec = self._ln(dec + attn_out, layer["ln1_w"], layer["ln1_b"])
+
+            # 交叉注意力
+            Q = torch.matmul(dec, layer["W_cq"]).view(B, L_t, self.num_heads, self.d_k).transpose(1, 2)
+            K = torch.matmul(enc, layer["W_ck"]).view(B, L_s, self.num_heads, self.d_k).transpose(1, 2)
+            V = torch.matmul(enc, layer["W_cv"]).view(B, L_s, self.num_heads, self.d_k).transpose(1, 2)
+            cross_out = self._attn(Q, K, V)
+            cross_out = cross_out.transpose(1, 2).contiguous().view(B, L_t, self.d_model)
+            cross_out = torch.matmul(cross_out, layer["W_co"])
+            dec = self._ln(dec + cross_out, layer["ln2_w"], layer["ln2_b"])
+
+            # FFN
+            ffn = torch.matmul(torch.relu(torch.matmul(dec, layer["W_1"]) + layer["b_1"]), layer["W_2"]) + layer["b_2"]
+            dec = self._ln(dec + ffn, layer["ln3_w"], layer["ln3_b"])
+
+        return dec
+```
+
+&emsp;&emsp;这个实现中，编码器使用双向自注意力，解码器先做因果自注意力，再做交叉注意力，最后做前馈网络。若 `src_ids` 形状为 $(B,L_s)$，`tgt_ids` 形状为 $(B,L_t)$，输出形状为 $(B,L_t,d_{model})$。
+
+---
 
 #### 2.2.4 Post-LN 与 Pre-LN
 
-&emsp;&emsp;原始 Transformer 使用 Post-LN：$x_{l+1} = \text{LayerNorm}(x_l + \text{Sublayer}(x_l))$。这种设计在深层网络中会导致梯度范数剧烈波动，训练不稳定。GPT-2 将层归一化移到每个子模块的输入之前，即 Pre-LN：$x_{l+1} = x_l + \text{Sublayer}(\text{LayerNorm}(x_l))$。Pre-LN 使残差路径上的信息可以不经过任何归一化变换而直接传递到深层，极大缓解了梯度消失和梯度爆炸问题，使训练数十层甚至上百层的 Transformer 成为可能。此后，几乎所有主流 LLM 都采用 Pre-LN 或其变体。
+&emsp;&emsp;Post-LN 和 Pre-LN 是 Transformer 中残差连接与层归一化的两种排列方式。Post-LN 将层归一化放在残差相加之后，Pre-LN 将层归一化放在子层输入之前。原始 Transformer 使用 Post-LN，而大多数现代大模型使用 Pre-LN，因为 Pre-LN 训练更稳定，对学习率预热依赖更小。
+
+&emsp;&emsp;设子层函数为 $F$，输入为 $x$。Post-LN 的计算为：
+
+$$
+y = \mathrm{LayerNorm}(x + F(x))
+$$
+
+&emsp;&emsp;Pre-LN 的计算为：
+
+$$
+y = x + F(\mathrm{LayerNorm}(x))
+$$
+
+&emsp;&emsp;在多层堆叠中，Post-LN 的残差路径上每层都经过 LayerNorm，导致梯度在反向传播时容易被归一化操作缩放，深层网络需要学习率预热才能稳定训练。Pre-LN 的残差路径是恒等映射，梯度可以直接回传，训练更稳定，因此成为主流选择。
+
+&emsp;&emsp;Post-LN 的优点是原始 Transformer 采用该结构，在浅层模型中表现良好，且输出经过归一化，数值范围稳定；缺点是深层训练不稳定，需要精细的学习率预热和初始化。Pre-LN 的优点是训练稳定，适合深层模型，对学习率预热不敏感；缺点是输出未归一化，可能需要额外的最终 LayerNorm，且在某些任务上最终性能可能略低于调优良好的 Post-LN。
+
+&emsp;&emsp;从维度视角看，Post-LN 和 Pre-LN 不改变 token 维扩散的数学形式，只改变特征维上归一化的位置。Pre-LN 让残差路径保持干净，相当于在特征维上保留了一条无归一化的信息高速公路。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Post-LN 和 Pre-LN 的裸实现对比：
+
+```python
+import torch
+import torch.nn as nn
+
+class PostLNBlock(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        self.ln1_w = nn.Parameter(torch.ones(d_model))
+        self.ln1_b = nn.Parameter(torch.zeros(d_model))
+        self.ln2_w = nn.Parameter(torch.ones(d_model))
+        self.ln2_b = nn.Parameter(torch.zeros(d_model))
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def _ln(self, x, w, b):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + 1e-6) * w + b
+
+    def forward(self, x, attn_fn):
+        # Post-LN: LayerNorm(x + F(x))
+        attn_out = attn_fn(x)
+        x = self._ln(x + attn_out, self.ln1_w, self.ln1_b)
+
+        ffn_out = torch.matmul(
+            torch.relu(torch.matmul(x, self.W_1) + self.b_1),
+            self.W_2
+        ) + self.b_2
+        x = self._ln(x + ffn_out, self.ln2_w, self.ln2_b)
+        return x
+
+
+class PreLNBlock(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        self.ln1_w = nn.Parameter(torch.ones(d_model))
+        self.ln1_b = nn.Parameter(torch.zeros(d_model))
+        self.ln2_w = nn.Parameter(torch.ones(d_model))
+        self.ln2_b = nn.Parameter(torch.zeros(d_model))
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def _ln(self, x, w, b):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + 1e-6) * w + b
+
+    def forward(self, x, attn_fn):
+        # Pre-LN: x + F(LayerNorm(x))
+        norm_x = self._ln(x, self.ln1_w, self.ln1_b)
+        x = x + attn_fn(norm_x)
+
+        norm_x = self._ln(x, self.ln2_w, self.ln2_b)
+        ffn_out = torch.matmul(
+            torch.relu(torch.matmul(norm_x, self.W_1) + self.b_1),
+            self.W_2
+        ) + self.b_2
+        x = x + ffn_out
+        return x
+```
+
+&emsp;&emsp;这个实现中，`PostLNBlock` 在残差相加后做 LayerNorm，`PreLNBlock` 在子层输入前做 LayerNorm。两者都使用手动实现的 LayerNorm 和前馈网络。若输入形状为 $(B,L,d_{model})$，输出形状相同。
 
 #### 2.2.5 残差连接
 
-&emsp;&emsp;残差连接由何恺明 2016 年在 ResNet 中提出，是深度学习能够工作的前提。模型一层一层堆叠，梯度沿着残差路径回传。在 Transformer 中，每个子模块（注意力、FFN）都包裹在残差连接中。标准残差为 $x_{l+1} = x_l + f(x_l)$。当模型越来越深、参数越来越多之后，传统残差连接开始暴露缺陷——信号传递不稳定，训练容易崩溃。DeepSeek-V4 引入 mHC（流形约束超连接）强化残差连接（见 2.7）。
+&emsp;&emsp;残差连接（Residual Connection）是 Transformer 能够堆叠数十甚至上百层的关键使能技术。这一概念最初由 He 等人在 2015 年的 ResNet 中提出，Transformer 对其进行了沿用。其核心思想是不让网络直接学习目标映射 $H(x)$，而是学习残差 $F(x) = H(x) - x$，网络的实际输出变为：
+
+$$
+H(x) = x + F(x)
+$$
+
+&emsp;&emsp;如果目标映射接近恒等变换，那么 $F(x)$ 接近零，让网络学习一个接近零的函数比学习一个恒等映射要容易得多，只需要将权重初始化为接近零即可。在 Transformer 中，每个子层都包裹在残差连接中：
+
+$$
+\mathrm{output} = x + \mathrm{Sublayer}(x)
+$$
+
+&emsp;&emsp;其中 $\mathrm{Sublayer}$ 可以是注意力层或前馈网络。残差连接对梯度传播的改善可以通过链式法则直观理解。对于没有残差连接的深层网络，梯度需要经过每一层的权重矩阵连乘：
+
+$$
+\frac{\partial \mathcal{L}}{\partial x} = \frac{\partial \mathcal{L}}{\partial h_L} \prod_{l=1}^{L} \frac{\partial h_l}{\partial h_{l-1}}
+$$
+
+&emsp;&emsp;当层数 $L$ 很大时，连乘容易导致梯度消失或爆炸。有了残差连接后，由于 $h_l = h_{l-1} + F_l(h_{l-1})$，梯度变为：
+
+$$
+\frac{\partial h_l}{\partial h_{l-1}} = I + \frac{\partial F_l}{\partial h_{l-1}}
+$$
+
+&emsp;&emsp;其中 $I$ 是单位矩阵。这意味着梯度始终有一条从输出直达输入的“高速公路”，即使 $\partial F_l / \partial h_{l-1}$ 很小，梯度仍然可以通过恒等路径 $I$ 无损地传播，这就是 Transformer 能够堆叠极深层数的根本原因。残差连接的优点是提供了梯度高速公路，使深层网络可训练，并具有“自适应深度”特性——如果某个子层学到的变换对任务无益，网络可以让子层输出接近零，退化为恒等映射，至少不会比浅层差；缺点是残差路径上的累积求和可能导致深层网络中特征范数持续增长，需要配合 LayerNorm 或 RMSNorm 来稳定数值范围，且在某些情况下残差分支的输出可能被主路径的恒等信号所淹没。
+
+&emsp;&emsp;从维度视角看，残差连接在特征维上保留了一条恒等通路，使 token 维扩散的结果以“增量”方式叠加到原始表示上，而非替换它。这相当于为每个子层提供了一个可学习的“残差修正”，网络只需学习在当前表示基础上需要补充什么信息。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出残差连接的裸实现，并对比有残差和无残差两种结构：
+
+```python
+import torch
+import torch.nn as nn
+
+class ResidualBlock(nn.Module):
+    """带残差连接的子层封装"""
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def forward(self, x, sublayer_fn):
+        # 残差连接: output = x + Sublayer(x)
+        return x + sublayer_fn(x)
+
+
+class NoResidualBlock(nn.Module):
+    """无残差连接的子层封装，用于对比"""
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def forward(self, x, sublayer_fn):
+        # 无残差连接: output = Sublayer(x)
+        return sublayer_fn(x)
+```
+
+&emsp;&emsp;实际使用时，子层函数通常包含 LayerNorm 和注意力或 FFN 操作。残差连接本身只是简单的加法，但正是这个加法使得深层 Transformer 的训练成为可能。若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.2.6 并行注意力与 MLP
 
-&emsp;&emsp;在标准 Transformer 块中，自注意力层和前馈网络是顺序执行的：先做注意力，再做 MLP，两者通过残差连接串联。Falcon 将两者改为并行执行：输入同时送入注意力分支和 MLP 分支，两个分支的输出相加后得到最终输出。这种并行化设计减少了串行计算链的长度，在训练时可以更充分地利用 GPU 的计算资源，在推理时也能降低延迟。TII 在论文中指出，并行注意力与 MLP 的设计受到 GPT-J 的启发，但在 Falcon 中得到了系统验证和规模化应用。
+&emsp;&emsp;标准 Transformer 层采用串行结构：先做自注意力，再做前馈网络，两个子层依次经过残差连接和归一化。并行注意力与 MLP（Parallel Attention and MLP）是一种替代结构，将自注意力和 MLP 从同一输入并行计算，然后将两个分支的输出同时加到残差路径上。这种结构在 GPT-NeoX 和 Falcon 等模型中广泛使用。
+
+&emsp;&emsp;串行结构的计算为：
+
+$$
+Z = \mathrm{LayerNorm}\left(X + \mathrm{Attention}(X)\right)
+$$
+
+$$
+Y = \mathrm{LayerNorm}\left(Z + \mathrm{MLP}(Z)\right)
+$$
+
+&emsp;&emsp;并行结构的计算为：
+
+$$
+Y = X + \mathrm{Attention}(\mathrm{LayerNorm}(X)) + \mathrm{MLP}(\mathrm{LayerNorm}(X))
+$$
+
+&emsp;&emsp;关键区别在于：串行结构中 MLP 的输入是自注意力的输出，两个子层之间有依赖关系；并行结构中自注意力和 MLP 都从同一个归一化输入出发，彼此独立，最后将两个输出同时加到残差路径上。在张量并行训练中，串行结构每层的 MHA-MLP 连接需要一次 all-reduce 通信，而并行结构消除了这个通信，使 MHA 和 MLP 可以在单个 GPU 上并行执行。
+
+&emsp;&emsp;并行注意力与 MLP 的优点是减少了子层间的依赖，在张量并行训练中消除了每层的 all-reduce 通信开销，支持 MHA 和 MLP 的并行执行，训练速度可提升显著；缺点是两个子层从同一输入出发，MLP 无法利用注意力层的输出信息，可能略微削弱表达能力，且并行结构下两个分支的输出直接相加，可能需要在初始化时调整各分支的缩放系数以保持数值稳定。
+
+&emsp;&emsp;从维度视角看，串行结构中 MLP 在注意力扩散之后进行特征维的非线性变换，而并行结构中 MLP 和注意力同时对原始表示做独立的特征维变换，最后叠加。这相当于把“先扩散再变换”改为“扩散与变换并行”，牺牲部分层间信息流换取计算效率。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出并行注意力与 MLP 的裸实现，并与串行结构对比：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class ParallelAttentionMLP(nn.Module):
+    """并行注意力与 MLP: 两个分支从同一输入出发，输出同时加到残差路径"""
+    def __init__(self, d_model, num_heads, d_ff):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+
+        # 注意力参数
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+
+        # MLP 参数
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+
+        # 共享 LayerNorm
+        self.ln_w = nn.Parameter(torch.ones(d_model))
+        self.ln_b = nn.Parameter(torch.zeros(d_model))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o, self.W_1, self.W_2):
+            nn.init.xavier_uniform_(w)
+
+    def _ln(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + 1e-6) * self.ln_w + self.ln_b
+
+    def _attn(self, x, causal=True):
+        B, L, _ = x.size()
+        Q = torch.matmul(x, self.W_q).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        K = torch.matmul(x, self.W_k).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        V = torch.matmul(x, self.W_v).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if causal:
+            mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
+            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        attn = torch.softmax(scores, dim=-1)
+        out = torch.matmul(attn, V)
+        out = out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        return torch.matmul(out, self.W_o)
+
+    def _mlp(self, x):
+        return torch.matmul(
+            torch.relu(torch.matmul(x, self.W_1) + self.b_1),
+            self.W_2
+        ) + self.b_2
+
+    def forward(self, x, causal=True):
+        # 共享 LayerNorm 后的输入
+        norm_x = self._ln(x)
+
+        # 两个分支并行计算
+        attn_out = self._attn(norm_x, causal=causal)
+        mlp_out = self._mlp(norm_x)
+
+        # 两个分支输出同时加到残差路径
+        return x + attn_out + mlp_out
+
+
+class SerialAttentionMLP(nn.Module):
+    """串行结构: 先注意力，再 MLP，作为对比"""
+    def __init__(self, d_model, num_heads, d_ff):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        self.ln1_w = nn.Parameter(torch.ones(d_model))
+        self.ln1_b = nn.Parameter(torch.zeros(d_model))
+        self.ln2_w = nn.Parameter(torch.ones(d_model))
+        self.ln2_b = nn.Parameter(torch.zeros(d_model))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o, self.W_1, self.W_2):
+            nn.init.xavier_uniform_(w)
+
+    def _ln(self, x, w, b):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + 1e-6) * w + b
+
+    def forward(self, x, causal=True):
+        B, L, _ = x.size()
+        norm_x = self._ln(x, self.ln1_w, self.ln1_b)
+
+        Q = torch.matmul(norm_x, self.W_q).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        K = torch.matmul(norm_x, self.W_k).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        V = torch.matmul(norm_x, self.W_v).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if causal:
+            mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
+            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        attn = torch.softmax(scores, dim=-1)
+        attn_out = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, L, self.d_model)
+        attn_out = torch.matmul(attn_out, self.W_o)
+
+        # 第一个残差
+        x = x + attn_out
+
+        # MLP 从注意力输出出发
+        norm_x = self._ln(x, self.ln2_w, self.ln2_b)
+        mlp_out = torch.matmul(
+            torch.relu(torch.matmul(norm_x, self.W_1) + self.b_1),
+            self.W_2
+        ) + self.b_2
+
+        return x + mlp_out
+```
+
+&emsp;&emsp;`ParallelAttentionMLP` 中自注意力和 MLP 从同一个 LayerNorm 输出并行计算，输出同时加到残差路径。`SerialAttentionMLP` 中 MLP 从注意力的输出出发。若输入形状为 $(B,L,d_{model})$，两者输出形状相同。
+
+---
 
 #### 2.2.7 统一系统与路由器
 
-&emsp;&emsp;GPT-5 采用“统一系统”（unified system）复合设计，由一个高效的基础模型（gpt-5-main）、一个深度推理模型（gpt-5-thinking）和一个实时路由器组成。路由器根据对话类型、复杂度、工具需求和明确意图快速决定使用哪个模型。这一设计用路由器替代了单一模型，使简单查询快速响应，复杂问题自动切换到深度推理模式。路由器持续基于真实信号进行训练，包括用户切换模型的频率、回复偏好率和测量准确性，随时间不断优化。
+&emsp;&emsp;统一系统与路由器（Unified System and Router）是混合专家（MoE）架构中的核心机制。传统 Transformer 的每层前馈网络被替换为 MoE 层，由多个“专家”组成，每个专家本质上是一个小型 FFN。当输入一个 token 时，模型通过路由器决定该 token 应该由哪些专家处理，通常是 1 到 2 个，然后将选中专家的输出加权求和。
+
+&emsp;&emsp;设第 $l$ 层的输入 token 表示为 $u_t^l$，路由器的门控分数为：
+
+$$
+s_{i,t} = \mathrm{Softmax}_i\left({u_t^l}^\top e_i^l\right)
+$$
+
+&emsp;&emsp;其中 $e_i^l$ 是第 $i$ 个专家的可学习嵌入。只保留匹配度最高的 $K$ 个专家：
+
+$$
+g_{i,t} = \begin{cases} s_{i,t} & s_{i,t} \in \mathrm{TopK}(\{s_{j,t}\}, K) \\ 0 & \text{otherwise} \end{cases}
+$$
+
+&emsp;&emsp;MoE 层的输出为：
+
+$$
+h_t^l = \sum_{i=1}^{N} g_{i,t} \cdot \mathrm{FFN}_i(u_t^l) + u_t^l
+$$
+
+&emsp;&emsp;DeepSeekMoE 在此基础上引入了细粒度专家划分和共享专家隔离两个优化。细粒度专家划分将每个专家拆分为更小的专家，增加组合灵活性；共享专家隔离则设置一组共享专家，所有 token 都固定分配给这些共享专家，专门捕获通用知识，从而减少路由专家的参数冗余。带有共享专家的 MoE 层输出为：
+
+$$
+h_t^l = \sum_{i=1}^{K_s} \mathrm{FFN}_i(u_t^l) + \sum_{i=K_s+1}^{mN} g_{i,t} \cdot \mathrm{FFN}_i(u_t^l) + u_t^l
+$$
+
+&emsp;&emsp;其中 $K_s$ 是共享专家数量，$mN$ 是总专家数量。在负载均衡方面，DeepSeek-V3.2 采用了一种基于偏置项的负载均衡策略：路由器计算每个 token 与每个专家之间的亲和度分数，然后对最近接收了较多 token 的专家添加一个轻微的负偏置，从而在不使用辅助损失的情况下实现负载均衡。
+
+&emsp;&emsp;统一系统与路由器的优点是稀疏激活使模型参数量可以极大扩展，但每个 token 只激活少量专家，推理成本远低于同等参数量的稠密模型，且通过共享专家隔离和细粒度划分使专家更加专业化；缺点是路由机制可能面临负载不均衡问题，部分专家可能过载而其他专家训练不足，导致路由坍缩，需要额外的负载均衡策略，且专家分布在多 GPU 上时 token 的分发和聚合会带来显著的通信开销。
+
+&emsp;&emsp;从维度视角看，路由器在特征维上做了一次稀疏选择：每个 token 根据自身特征被路由到不同的专家子网络，相当于在特征维上实现了条件计算。这不同于注意力在 token 维上的扩散，而是在特征维上按 token 内容动态选择变换路径。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 MoE 层与路由器的裸实现，包含共享专家和负载均衡偏置：
+
+```python
+import torch
+import torch.nn as nn
+
+class MoELayer(nn.Module):
+    """MoE 层: 共享专家 + 路由专家 + 负载均衡偏置"""
+    def __init__(self, d_model, d_ff, num_routed_experts, num_shared_experts, top_k):
+        super().__init__()
+        self.d_model = d_model
+        self.num_routed_experts = num_routed_experts
+        self.num_shared_experts = num_shared_experts
+        self.top_k = top_k
+
+        # 共享专家: 所有 token 固定激活
+        self.shared_experts = nn.ModuleList([
+            self._make_ffn(d_model, d_ff) for _ in range(num_shared_experts)
+        ])
+
+        # 路由专家
+        self.routed_experts = nn.ModuleList([
+            self._make_ffn(d_model, d_ff) for _ in range(num_routed_experts)
+        ])
+
+        # 路由器: 专家嵌入
+        self.expert_emb = nn.Parameter(torch.empty(num_routed_experts, d_model))
+        nn.init.normal_(self.expert_emb, std=0.02)
+
+        # 负载均衡偏置 (DeepSeek-V3.2 风格)
+        self.register_buffer("routing_bias", torch.zeros(num_routed_experts))
+
+    def _make_ffn(self, d_model, d_ff):
+        return nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.ReLU(),
+            nn.Linear(d_ff, d_model)
+        )
+
+    def forward(self, x):
+        B, L, D = x.size()
+        x_flat = x.view(B * L, D)
+
+        # 共享专家: 所有 token 固定经过
+        shared_out = sum(expert(x_flat) for expert in self.shared_experts)
+
+        # 路由器打分
+        scores = torch.matmul(x_flat, self.expert_emb.T)  # (B*L, num_experts)
+        scores = scores + self.routing_bias.unsqueeze(0)
+        scores = torch.softmax(scores, dim=-1)
+
+        # Top-k 选择
+        topk_scores, topk_indices = scores.topk(self.top_k, dim=-1)  # (B*L, top_k)
+        topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-9)
+
+        # 路由专家计算
+        routed_out = torch.zeros_like(x_flat)
+        for k in range(self.top_k):
+            idx = topk_indices[:, k]  # (B*L,)
+            weight = topk_scores[:, k].unsqueeze(-1)  # (B*L, 1)
+            for e in range(self.num_routed_experts):
+                mask = (idx == e)
+                if mask.any():
+                    expert_input = x_flat[mask]
+                    expert_output = self.routed_experts[e](expert_input)
+                    routed_out[mask] += weight[mask] * expert_output
+
+        # 输出: 共享专家 + 路由专家 + 残差
+        output = shared_out + routed_out + x_flat
+        return output.view(B, L, D)
+
+    def update_routing_bias(self, expert_load, bias_rate=0.001):
+        """根据专家负载更新偏置: 负载高的专家加负偏置"""
+        avg_load = expert_load.mean()
+        self.routing_bias -= bias_rate * (expert_load - avg_load)
+```
+
+&emsp;&emsp;这个实现中，共享专家对所有 token 固定激活，路由专家通过 Top-k 选择激活。`routing_bias` 用于负载均衡，负载过高的专家会被施加负偏置以降低其被选中的概率。若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
 
 ---
 
@@ -184,91 +2013,1133 @@ $$
 
 #### 2.3.1 绝对位置编码
 
-&emsp;&emsp;Transformer 的注意力机制本身是置换不变的。为了注入位置信息，Transformer 在输入嵌入中加入了位置编码。绝对位置编码为序列中的每个位置分配一个唯一的表示。GPT-2、GPT-3 和早期的 BERT 使用可学习的绝对位置嵌入：为每个位置学习一个向量 $p_{pos}$，输入嵌入为 $h_0 = \text{TokenEmbed}(x) + \text{PositionEmbed}(pos)$。这种方案简单有效，但无法外推到训练时未见过的长度。
+&emsp;&emsp;绝对位置编码（Absolute Positional Encoding）为序列中的每个位置分配一个独立的表示向量，并将其与 token 嵌入相加，使模型能够区分不同位置的 token。最直接的做法是维护一个可学习的位置嵌入矩阵 $P \in \mathbb{R}^{L_{max} \times d_{model}}$，其中 $L_{max}$ 是最大序列长度，$d_{model}$ 是模型维度。对于位置 $i$，其位置编码为 $P_i$，输入表示为：
+
+$$
+x_i = E_{token}(t_i) + P_i
+$$
+
+&emsp;&emsp;其中 $E_{token}(t_i)$ 是 token $t_i$ 的词嵌入。位置嵌入矩阵与模型其他参数一起通过反向传播学习。这种方案在 BERT、GPT-2 等模型中广泛使用。绝对位置编码的优点是实现简单，每个位置有独立的可学习参数，模型可以自由地为不同位置学习不同的表示，适合位置模式固定的任务；缺点是位置嵌入表的大小受最大序列长度限制，无法外推到训练时未见过的更长序列，且每个位置独立学习，位置之间的相对关系需要模型从数据中隐式推断，参数效率较低。
+
+&emsp;&emsp;从维度视角看，绝对位置编码在特征维上为每个位置添加了一个位置相关的偏置向量。它不改变 token 维扩散的结构，只是让每个位置的查询和键在特征空间中带有了位置标签，使注意力能够区分不同位置。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出可学习绝对位置编码的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class AbsolutePositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len):
+        super().__init__()
+        self.d_model = d_model
+        self.max_len = max_len
+        # 可学习的位置嵌入表
+        self.pos_emb = nn.Parameter(torch.empty(max_len, d_model))
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+    def forward(self, x):
+        # x: (B, L, d_model)
+        B, L, D = x.size()
+        assert L <= self.max_len, "序列长度超过最大位置编码长度"
+        return x + self.pos_emb[:L].unsqueeze(0)
+```
+
+&emsp;&emsp;这个实现中，位置嵌入是可学习参数，输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.3.2 正弦/余弦位置编码
 
-&emsp;&emsp;原始 Transformer 使用固定公式生成位置编码：
+&emsp;&emsp;正弦/余弦位置编码（Sinusoidal Positional Encoding）是原始 Transformer 使用的固定位置编码方案，不需要学习参数。它利用不同频率的正弦和余弦函数为每个位置生成唯一的位置向量，使模型能够通过三角恒等式捕捉相对位置关系。对于位置 $pos$ 和维度索引 $i$，编码定义为：
 
 $$
-PE_{(pos, 2i)} = \sin\left(\frac{pos}{10000^{2i/d_{\text{model}}}}\right)
+PE_{(pos, 2i)} = \sin\left(\frac{pos}{10000^{2i/d_{model}}}\right)
 $$
 
 $$
-PE_{(pos, 2i+1)} = \cos\left(\frac{pos}{10000^{2i/d_{\text{model}}}}\right)
+PE_{(pos, 2i+1)} = \cos\left(\frac{pos}{10000^{2i/d_{model}}}\right)
 $$
 
-&emsp;&emsp;这种编码不需要训练参数，不同位置之间的相对关系可以通过线性变换表示，理论上可以外推，但实际外推效果有限。
+&emsp;&emsp;其中 $i$ 从 $0$ 到 $d_{model}/2 - 1$。不同维度对应不同波长，从 $2\pi$ 到 $10000 \cdot 2\pi$ 形成几何级数。这种设计使得对于任意固定偏移 $k$，$PE_{pos+k}$ 可以表示为 $PE_{pos}$ 的线性函数，从而让模型更容易学习相对位置关系。正弦/余弦位置编码的优点是无需训练参数，可以外推到比训练时更长的序列，且不同位置之间的相对关系由三角函数自然编码；缺点是固定编码的表达能力不如可学习位置嵌入灵活，在某些需要位置特异性较强的任务上可能不如可学习方案，且与 token 嵌入相加后可能干扰语义信息。
+
+&emsp;&emsp;从维度视角看，正弦/余弦编码在特征维上为每个位置提供了一个确定性的、频率分解的偏置。不同维度对应不同尺度的位置变化，使注意力可以通过特征维上的模式匹配来感知位置差异。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出正弦/余弦位置编码的裸实现：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        self.d_model = d_model
+        self.max_len = max_len
+
+        # 预计算位置编码矩阵
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float)
+            * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, d_model)
+
+    def forward(self, x):
+        # x: (B, L, d_model)
+        L = x.size(1)
+        return x + self.pe[:, :L]
+```
+
+&emsp;&emsp;这个实现中，位置编码是固定的，不参与训练。输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.3.3 相对位置编码
 
-&emsp;&emsp;相对位置编码不关心 token 的绝对位置，而是关心两个 token 之间的距离。这一设计更符合语言建模的直觉，且理论上支持长度外推。相对位置编码经历了从“学习标量偏置”到“旋转位置编码”的演进。
+&emsp;&emsp;相对位置编码（Relative Positional Encoding）不关心 token 的绝对位置，而是关注 token 之间的相对距离。在注意力计算中，相对位置信息被注入到查询和键的交互中，使模型能够根据“两个 token 相距多远”来调整注意力权重。设位置 $i$ 和 $j$ 之间的相对距离为 $i-j$，相对位置编码为每个距离分配一个可学习的嵌入向量。注意力分数变为：
+
+$$
+e_{ij} = \frac{(q_i + r_{i-j})^\top k_j}{\sqrt{d_k}}
+$$
+
+&emsp;&emsp;或采用更常见的形式，将相对位置偏置直接加到注意力分数上：
+
+$$
+e_{ij} = \frac{q_i^\top k_j}{\sqrt{d_k}} + b_{i-j}
+$$
+
+&emsp;&emsp;其中 $b_{i-j}$ 是相对距离 $i-j$ 对应的可学习偏置。相对位置编码的优点是更符合语言中位置关系的本质，模型关注的是相对距离而非绝对位置，因此具有更好的长度外推能力，且对序列顺序的建模更自然；缺点是实现比绝对位置编码复杂，需要为每个相对距离维护参数，当序列很长时相对距离范围很大，参数表可能过大，通常需要裁剪或分桶。
+
+&emsp;&emsp;从维度视角看，相对位置编码在注意力分数矩阵上添加了一个与相对距离相关的偏置，直接修改了 token 维扩散的关系矩阵。它不改变查询和键的特征表示，而是让关系矩阵本身带有位置感知能力。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出相对位置编码的裸实现，将可学习相对位置偏置加到注意力分数上：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class RelativePositionEncoding(nn.Module):
+    def __init__(self, d_model, num_heads, max_relative_distance):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.max_rel = max_relative_distance
+
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+
+        # 相对位置偏置表: 范围 [-max_rel, max_rel]
+        self.rel_bias = nn.Parameter(torch.zeros(2 * max_relative_distance + 1, num_heads))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o):
+            nn.init.xavier_uniform_(w)
+
+    def forward(self, x, causal=True):
+        B, L, _ = x.size()
+
+        Q = torch.matmul(x, self.W_q).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        K = torch.matmul(x, self.W_k).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        V = torch.matmul(x, self.W_v).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+
+        # 构建相对距离矩阵并裁剪
+        pos = torch.arange(L, device=x.device)
+        rel = pos.unsqueeze(0) - pos.unsqueeze(1)  # (L, L)
+        rel = torch.clamp(rel, -self.max_rel, self.max_rel)
+        rel = rel + self.max_rel  # 映射到 [0, 2*max_rel]
+
+        # 取偏置: (L, L, num_heads) -> (num_heads, L, L)
+        bias = self.rel_bias[rel].permute(2, 0, 1)  # (h, L, L)
+        scores = scores + bias.unsqueeze(0)
+
+        if causal:
+            mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
+            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1)
+        head_out = torch.matmul(attn, V)
+        head_out = head_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        return torch.matmul(head_out, self.W_o), attn
+```
+
+&emsp;&emsp;这个实现中，相对距离被裁剪到 $[-max\_rel, max\_rel]$，每个距离和每个头有独立的偏置。输入形状为 $(B,L,d_{model})$，输出形状相同，`attn` 形状为 $(B,h,L,L)$。
+
+---
 
 #### 2.3.4 T5 相对位置偏置
 
-&emsp;&emsp;T5 为每一对相对位置偏移学习一个标量偏置，直接加到注意力权重上（pre-softmax）：
+&emsp;&emsp;T5 相对位置偏置（T5 Relative Position Bias）是 T5 模型采用的一种分桶式相对位置编码方案。它不直接为每个相对距离分配参数，而是将相对距离映射到有限数量的桶中，每个桶有一个可学习的偏置。这样既保留了相对位置信息，又控制了参数数量，并且能外推到训练时未见过的更长距离。
+
+&emsp;&emsp;T5 的分桶策略是：将相对距离 $i-j$ 映射到桶索引。对于距离 $d = |i-j|$，桶索引由以下规则确定：
 
 $$
-\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}} + B\right)V
+\mathrm{bucket}(d) = \begin{cases}
+d & d < n \\
+n + \lfloor \log(d/n) / \log(\log_{max}/n) \rfloor & d \geq n
+\end{cases}
 $$
 
-&emsp;&emsp;T5 将所有可能的相对位置偏移映射到 32 个桶中，每个桶对应一个可学习的标量偏置。参数量极小，计算效率高，但表达能力有限。
+&emsp;&emsp;其中 $n$ 是线性增长的边界，通常取 $n=8$，$\log_{max}$ 是最大距离的对数边界。对于有符号的相对距离，桶索引还需要根据符号偏移。最终，每个注意力头有一个可学习的偏置向量 $B \in \mathbb{R}^{n_{buckets}}$，注意力分数为：
+
+$$
+e_{ij} = \frac{q_i^\top k_j}{\sqrt{d_k}} + B_{\mathrm{bucket}(i-j)}
+$$
+
+&emsp;&emsp;T5 相对位置偏置的优点是参数数量远小于逐距离参数化方案，通过分桶实现了对长距离的粗粒度建模，且能够外推到比训练时更长的序列；缺点是分桶边界是人工设计的超参数，不同任务和序列长度下最优分桶可能不同，且分桶后的偏置精度不如逐距离方案，可能损失部分短距离的精细位置信息。
+
+&emsp;&emsp;从维度视角看，T5 相对位置偏置与相对位置编码类似，都是在注意力关系矩阵上添加位置相关的偏置。不同之处在于它将连续距离离散化到桶中，用有限参数覆盖任意距离，相当于对关系矩阵的位置偏置做了一次分段常值近似。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 T5 相对位置偏置的裸实现：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class T5RelativePositionBias(nn.Module):
+    def __init__(self, num_heads, num_buckets=32, max_distance=128, linear_boundary=8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.linear_boundary = linear_boundary
+
+        # 每个头每个桶一个偏置
+        self.rel_bias = nn.Parameter(torch.zeros(num_buckets, num_heads))
+
+    def _relative_position_bucket(self, relative_position):
+        """将相对距离映射到桶索引"""
+        ret = torch.zeros_like(relative_position, dtype=torch.long)
+        n = self.linear_boundary
+
+        # 绝对距离
+        abs_pos = torch.abs(relative_position)
+        # 线性部分: |d| < n
+        ret += torch.where(
+            abs_pos < n,
+            abs_pos,
+            torch.zeros_like(abs_pos)
+        )
+
+        # 对数部分: |d| >= n
+        log_bucket = torch.floor(
+            torch.log(abs_pos.float() / n)
+            / math.log(self.max_distance / n)
+            * (self.num_buckets - n)
+        ).long()
+        log_bucket = torch.clamp(log_bucket, 0, self.num_buckets - n - 1)
+        ret += torch.where(
+            abs_pos >= n,
+            n + log_bucket,
+            torch.zeros_like(log_bucket)
+        )
+
+        # 符号: 正向和负向使用不同桶范围
+        ret = torch.where(
+            relative_position < 0,
+            ret + self.num_buckets,
+            ret
+        )
+        return ret
+
+    def forward(self, x, num_buckets_total=None):
+        # x: (B, L, d_model)
+        B, L, _ = x.size()
+        pos = torch.arange(L, device=x.device)
+        rel = pos.unsqueeze(0) - pos.unsqueeze(1)  # (L, L)
+        rel = torch.clamp(rel, -self.max_distance, self.max_distance)
+
+        bucket = self._relative_position_bucket(rel)  # (L, L)
+        # 取偏置: (L, L, num_heads) -> (num_heads, L, L)
+        bias = self.rel_bias[bucket].permute(2, 0, 1)
+        return bias.unsqueeze(0)  # (1, h, L, L)
+```
+
+&emsp;&emsp;这个实现中，`_relative_position_bucket` 将相对距离映射到桶索引，然后从 `rel_bias` 中取出对应的偏置。实际使用时，将返回的偏置加到注意力分数上即可。若输入形状为 $(B,L,d_{model})$，返回的偏置形状为 $(1,h,L,L)$，可广播到 $(B,h,L,L)$。
 
 #### 2.3.5 ALiBi
 
-&emsp;&emsp;ALiBi（Attention with Linear Biases）不学习任何位置参数，而是直接根据 Query 和 Key 之间的距离施加一个线性偏置：
+&emsp;&emsp;ALiBi（Attention with Linear Biases）由 Press 等人于 2022 年提出，采用了一种极其简洁的位置编码方案：不添加任何位置编码向量，也不修改 Query 和 Key，而是直接在注意力分数上加上一个与相对距离成正比的负偏置。对于查询位置 $m$ 和键位置 $n$，注意力分数变为：
 
 $$
-\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}} + m \cdot \text{distance}\right)V
+\mathrm{score}(q_m, k_n) = \frac{q_m^\top k_n}{\sqrt{d_k}} - r \cdot |m - n|
 $$
 
-&emsp;&emsp;其中 $m$ 是每个注意力头固定的斜率。ALiBi 不引入可学习参数，训练时使用较短序列，推理时可以直接外推到更长序列。BLOOM 等模型采用过 ALiBi，但在 LLaMA 系列崛起后被 RoPE 取代。
+&emsp;&emsp;其中 $r$ 是每个注意力头特有的斜率参数。不同头使用不同的 $r$ 值，形成一个几何序列。对于 $H$ 个头，第 $h$ 个头的斜率定义为：
+
+$$
+r_h = 2^{-8h/H}, \quad h = 1, \dots, H
+$$
+
+&emsp;&emsp;当 $H=8$ 时，斜率依次为 $1/2, 1/4, \dots, 1/256$。斜率越大的头，注意力范围越窄，越聚焦于近邻；斜率越小的头，注意力范围越宽，能覆盖更远的距离。这种设计使不同头在不同尺度上工作，模拟了多尺度的局部性先验。
+
+&emsp;&emsp;ALiBi 的直觉非常自然：距离越远的位置，注意力分数的惩罚越大，模型倾向于关注相近的 token。这种线性偏置对任意距离都有定义，不存在位置上限，因此具有出色的长度外推能力。在 1024 长度上训练的模型可以直接外推到 2048 甚至更长，性能衰减很小。ALiBi 的优点是无需额外参数，实现极其简单，长度外推能力强，且不修改 Query 和 Key 的表示，计算开销几乎为零；缺点是线性偏置假设“距离越远越不相关”，在某些需要精确长距离依赖的任务中可能过度惩罚远距离注意力，且斜率几何序列是人工设定的，不同任务和模型规模下最优斜率分布可能不同。
+
+&emsp;&emsp;从维度视角看，ALiBi 在 token 维扩散的关系矩阵上直接添加了一个与相对距离线性相关的偏置，使关系矩阵天然带有距离衰减的归纳偏置。它不改变 Query 和 Key 的特征表示，而是让注意力分数的空间结构本身包含位置信息。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 ALiBi 的裸实现，只使用基础张量运算和手动参数：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class ALiBiAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+        self.b_q = nn.Parameter(torch.zeros(d_model))
+        self.b_k = nn.Parameter(torch.zeros(d_model))
+        self.b_v = nn.Parameter(torch.zeros(d_model))
+        self.b_o = nn.Parameter(torch.zeros(d_model))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o):
+            nn.init.xavier_uniform_(w)
+
+        # 为每个头预计算斜率 r_h = 2^{-8h/H}, h=1,...,H
+        slopes = torch.tensor(
+            [2.0 ** (-8.0 * h / num_heads) for h in range(1, num_heads + 1)],
+            dtype=torch.float32
+        )
+        self.register_buffer("slopes", slopes)
+
+    def _build_alibi_bias(self, seq_len, device):
+        """构建 ALiBi 偏置矩阵: (H, L, L)"""
+        # 相对距离 |m - n|
+        pos = torch.arange(seq_len, device=device)
+        distance = (pos.unsqueeze(0) - pos.unsqueeze(1)).abs().float()  # (L, L)
+        # 每个头的偏置: -r_h * distance
+        bias = -self.slopes.view(-1, 1, 1) * distance.unsqueeze(0)  # (H, L, L)
+        return bias
+
+    def forward(self, x, causal=True):
+        B, L, _ = x.size()
+
+        Q = torch.matmul(x, self.W_q) + self.b_q
+        K = torch.matmul(x, self.W_k) + self.b_k
+        V = torch.matmul(x, self.W_v) + self.b_v
+
+        Q = Q.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        K = K.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        V = V.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+
+        # 添加 ALiBi 偏置
+        alibi_bias = self._build_alibi_bias(L, x.device)  # (H, L, L)
+        scores = scores + alibi_bias.unsqueeze(0)  # (B, H, L, L)
+
+        if causal:
+            mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
+            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1)
+        head_out = torch.matmul(attn, V)
+
+        head_out = head_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        output = torch.matmul(head_out, self.W_o) + self.b_o
+        return output, attn
+```
+
+&emsp;&emsp;这个实现中，`_build_alibi_bias` 为每个头构建了与相对距离线性相关的负偏置矩阵。若输入形状为 $(B,L,d_{model})$，输出形状为 $(B,L,d_{model})$，`attn` 形状为 $(B,h,L,L)$。
+
+---
 
 #### 2.3.6 RoPE：旋转位置编码
 
-&emsp;&emsp;RoPE 通过旋转矩阵将位置信息注入 Query 和 Key 向量，使注意力分数自然地携带相对位置信息。对于位置 $m$ 的 Query 向量 $q_m$ 和位置 $n$ 的 Key 向量 $k_n$，RoPE 对它们施加与位置相关的旋转：
+&emsp;&emsp;旋转位置编码（Rotary Position Embedding, RoPE）由 Su 等人于 2021 年提出，核心思想是通过旋转操作将位置信息注入到查询和键向量中。与加法式位置编码不同，RoPE 不是将位置向量加到 token 嵌入上，而是根据 token 的绝对位置对 Query 和 Key 向量进行旋转，使得注意力分数天然地只依赖于相对位置。
+
+&emsp;&emsp;RoPE 的数学基础是复数旋转。将 Query 和 Key 的每两个相邻维度视为一个复数，实部为偶数维，虚部为奇数维。对于位置 $m$，Query 向量 $\mathbf{q}_m$ 被乘以旋转因子 $e^{i\theta_t m}$，其中 $\theta_t$ 是第 $t$ 个频率：
 
 $$
-q_m' = R_m q_m, \quad k_n' = R_n k_n
+\theta_t = 10000^{-t/(d_k/2)}, \quad t \in \{0, 1, \dots, d_k/2 - 1\}
 $$
 
-&emsp;&emsp;注意力分数为 $(q_m')^T k_n' = q_m^T R_{n-m} k_n$，只依赖于相对位置 $n-m$。在实际实现中，RoPE 将 $d$ 维向量分成 $d/2$ 对，每对施加一个二维旋转：
+&emsp;&emsp;在复数表示下，RoPE 的操作为：
 
 $$
-\begin{pmatrix} x_{2i}' \\ x_{2i+1}' \end{pmatrix} =
-\begin{pmatrix} \cos(m\theta_i) & -\sin(m\theta_i) \\ \sin(m\theta_i) & \cos(m\theta_i) \end{pmatrix}
-\begin{pmatrix} x_{2i} \\ x_{2i+1} \end{pmatrix}
+\bar{\mathbf{q}}_m = \mathbf{q}_m \circ e^{i\theta_t m}, \quad \bar{\mathbf{k}}_n = \mathbf{k}_n \circ e^{i\theta_t n}
 $$
 
-&emsp;&emsp;其中 $\theta_i = 10000^{-2i/d}$ 是频率。LLaMA 1/2/3、Qwen 2/2.5/3、Mistral、DeepSeek-V3、Kimi、GLM 等几乎所有开源模型都使用 RoPE 或其变体。
+&emsp;&emsp;其中 $\circ$ 表示逐元素乘法。注意力分数为 $\mathrm{Re}[\bar{\mathbf{q}}_m \bar{\mathbf{k}}_n^*]$，展开后：
+
+$$
+\mathrm{Re}[\bar{\mathbf{q}}_m \bar{\mathbf{k}}_n^*] = \mathrm{Re}\left[\sum_t q_t k_t^* e^{i\theta_t(m-n)}\right]
+$$
+
+&emsp;&emsp;旋转因子中的 $e^{i\theta_t(m-n)}$ 仅依赖于相对距离 $m-n$，因此 RoPE 天然编码了相对位置信息。在实数实现中，RoPE 等价于对每两个相邻维度应用一个 $2\times 2$ 旋转矩阵：
+
+$$
+\begin{pmatrix} q'_{2t} \\ q'_{2t+1} \end{pmatrix} =
+\begin{pmatrix} \cos(m\theta_t) & -\sin(m\theta_t) \\ \sin(m\theta_t) & \cos(m\theta_t) \end{pmatrix}
+\begin{pmatrix} q_{2t} \\ q_{2t+1} \end{pmatrix}
+$$
+
+&emsp;&emsp;RoPE 的优点是：无额外参数，长度外推能力强，通过频率覆盖可以扩展到训练长度之外的序列；相对位置编码使模型更自然地对位置关系建模；旋转操作不改变向量范数，数值稳定；实现简单，可以与任意注意力机制组合。缺点是当外推到远超训练长度的序列时，低频维度的旋转圈数会超出训练时的范围，导致注意力分数分布偏移，需要配合基频调整或位置插值才能有效外推。
+
+&emsp;&emsp;从维度视角看，RoPE 在特征维上对 Query 和 Key 施加了与位置相关的旋转，使注意力关系矩阵中的每个元素都带有相对距离的相位信息。它不改变 token 维扩散的结构，而是让关系矩阵的数值本身编码了位置差异。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 RoPE 的裸实现，包含旋转矩阵的构建和应用：
+
+```python
+import torch
+import torch.nn as nn
+
+class RoPE(nn.Module):
+    def __init__(self, d_k, base=10000.0, max_len=8192):
+        super().__init__()
+        self.d_k = d_k
+        self.base = base
+
+        # 预计算逆频率: theta_t = base^{-2t/d_k}, t=0,...,d_k/2-1
+        inv_freq = 1.0 / (base ** (torch.arange(0, d_k, 2).float() / d_k))
+        self.register_buffer("inv_freq", inv_freq)  # (d_k/2,)
+
+    def forward(self, q, k, positions=None):
+        """
+        q, k: (B, h, L, d_k)
+        positions: (B, L) 或 None 时使用 0..L-1
+        """
+        B, h, L, d_k = q.size()
+        if positions is None:
+            positions = torch.arange(L, device=q.device).unsqueeze(0).expand(B, -1)
+
+        # 计算角度: (B, L, d_k/2)
+        angles = positions.unsqueeze(-1).float() * self.inv_freq  # (B, L, d_k/2)
+        cos = torch.cos(angles)  # (B, L, d_k/2)
+        sin = torch.sin(angles)
+
+        # 将 q, k 的最后一维重塑为 (..., d_k/2, 2)
+        q_reshaped = q.view(B, h, L, d_k // 2, 2)
+        k_reshaped = k.view(B, h, L, d_k // 2, 2)
+
+        # 旋转: [q0, q1] -> [q0*cos - q1*sin, q0*sin + q1*cos]
+        cos = cos.unsqueeze(1)  # (B, 1, L, d_k/2)
+        sin = sin.unsqueeze(1)
+
+        q_rot = torch.stack([
+            q_reshaped[..., 0] * cos - q_reshaped[..., 1] * sin,
+            q_reshaped[..., 0] * sin + q_reshaped[..., 1] * cos
+        ], dim=-1)  # (B, h, L, d_k/2, 2)
+        k_rot = torch.stack([
+            k_reshaped[..., 0] * cos - k_reshaped[..., 1] * sin,
+            k_reshaped[..., 0] * sin + k_reshaped[..., 1] * cos
+        ], dim=-1)
+
+        return q_rot.reshape(B, h, L, d_k), k_rot.reshape(B, h, L, d_k)
+```
+
+&emsp;&emsp;这个实现中，`inv_freq` 预计算了 RoPE 的逆频率，`forward` 将 Query 和 Key 的每两个相邻维度视为一个复数进行旋转。若输入形状为 $(B,h,L,d_k)$，输出形状相同。
+
+---
 
 #### 2.3.7 RoPE 基频调整
 
-&emsp;&emsp;RoPE 的长度外推能力可以通过调整基频来增强。LLaMA 2 使用基频 10,000，LLaMA 3.1 将基频提升到 500,000，使模型能够有效处理 32K 以上的上下文。基频越大，相邻位置的旋转角度差越小，模型对远距离位置的分辨能力越强。
+&emsp;&emsp;RoPE 基频调整（RoPE Base Frequency Adjustment）是一类通过修改 RoPE 的频率参数来扩展上下文窗口的方法。标准 RoPE 使用固定的基频 $base = 10000$，当序列长度远超训练长度时，低频维度的旋转角度会超出训练时覆盖的范围，导致注意力分数分布偏移。基频调整通过增大 $base$ 或对频率进行缩放，使旋转角度在更长序列上仍保持在合理范围内。
+
+&emsp;&emsp;位置插值（Position Interpolation, PI）是最简单的方法：将位置索引 $m$ 除以缩放因子 $s = L_{target} / L_{train}$，等效于将所有频率统一缩小：
+
+$$
+m' = \frac{m}{s}, \quad \theta_t' = \frac{\theta_t}{s}
+$$
+
+&emsp;&emsp;PI 的问题是它均匀压缩了所有频率，导致高频维度的局部细节分辨率下降。
+
+&emsp;&emsp;NTK-aware 方法通过修改 $base$ 来实现非均匀缩放。设缩放因子为 $s$，新的基频为：
+
+$$
+base' = base \cdot s^{d_k / (d_k - 2)}
+$$
+
+&emsp;&emsp;这种调整等效于对高频维度保留更多分辨率，对低频维度进行更多压缩，从而在扩展上下文的同时保留局部结构。
+
+&emsp;&emsp;YaRN（Yet another RoPE extension）在 NTK-aware 的基础上进一步引入分频率插值和注意力温度校准。它将频率维度分为三组：高频维度保持原值，低频维度进行插值，中间频率平滑过渡。同时引入注意力缩放因子 $t$ 来校准注意力分布：
+
+$$
+\frac{1}{\sqrt{t}} = 0.1 \ln s + 1
+$$
+
+&emsp;&emsp;注意力分数被缩放为 $\frac{q_m^\top k_n}{t \sqrt{d_h}}$，以补偿长序列下注意力熵的变化。RoPE 基频调整的优点是能显著扩展上下文窗口，YaRN 等方法可以用较少的微调步数达到接近甚至超过训练长度的外推性能；缺点是需要额外的超参数（缩放因子、分界点、温度系数），不同模型和训练配置下最优参数不同，且部分方法仍需要少量微调才能稳定。
+
+&emsp;&emsp;从维度视角看，基频调整改变了 RoPE 中不同维度旋转速度的分布，使低频维度在更长序列上仍具有合理的相位覆盖，从而避免注意力分数在长距离上出现分布崩塌。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 NTK-aware 基频调整的裸实现：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class RoPEWithNTKScaling(nn.Module):
+    def __init__(self, d_k, base=10000.0, max_len=8192, scaling_factor=1.0):
+        super().__init__()
+        self.d_k = d_k
+        self.base = base
+        self.scaling_factor = scaling_factor
+
+        # NTK-aware 调整后的基频
+        adjusted_base = base * (scaling_factor ** (d_k / (d_k - 2)))
+        inv_freq = 1.0 / (adjusted_base ** (torch.arange(0, d_k, 2).float() / d_k))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, q, k, positions=None):
+        B, h, L, d_k = q.size()
+        if positions is None:
+            positions = torch.arange(L, device=q.device).unsqueeze(0).expand(B, -1)
+
+        angles = positions.unsqueeze(-1).float() * self.inv_freq
+        cos = torch.cos(angles).unsqueeze(1)  # (B, 1, L, d_k/2)
+        sin = torch.sin(angles).unsqueeze(1)
+
+        q_reshaped = q.view(B, h, L, d_k // 2, 2)
+        k_reshaped = k.view(B, h, L, d_k // 2, 2)
+
+        q_rot = torch.stack([
+            q_reshaped[..., 0] * cos - q_reshaped[..., 1] * sin,
+            q_reshaped[..., 0] * sin + q_reshaped[..., 1] * cos
+        ], dim=-1).reshape(B, h, L, d_k)
+
+        k_rot = torch.stack([
+            k_reshaped[..., 0] * cos - k_reshaped[..., 1] * sin,
+            k_reshaped[..., 0] * sin + k_reshaped[..., 1] * cos
+        ], dim=-1).reshape(B, h, L, d_k)
+
+        return q_rot, k_rot
+```
+
+&emsp;&emsp;这个实现中，`adjusted_base` 根据缩放因子 $s$ 计算 NTK-aware 的新基频。若输入形状为 $(B,h,L,d_k)$，输出形状相同。
+
+---
 
 #### 2.3.8 部分 RoPE
 
-&emsp;&emsp;DeepSeek-V4 采用部分 RoPE，仅在每头的尾部通道上施加旋转，其余通道保持无位置编码，以平衡位置精度和语义匹配。注意力输出的 rope 切片也以位置 $-i$ 施加相同旋转。
+&emsp;&emsp;部分 RoPE（Partial RoPE）是指对 Query 和 Key 向量只对部分维度施加 RoPE 旋转，剩余维度保持不变的编码方式。这种设计最早在 GPT-NeoX 中实验使用，后来在 DeepSeek 的 MLA 中得到了关键性的应用。
+
+&emsp;&emsp;设 Query 和 Key 的维度为 $d_k$，部分 RoPE 只对前 $d_r$ 个维度施加旋转，剩余 $d_k - d_r$ 个维度不做任何位置编码（称为 NoPE 部分）。以只旋转一半维度为例，频率设置为：
+
+$$
+\theta_i = \begin{cases}
+b^{-4i/d_k} & i < d_k/4 \\
+0 & i \geq d_k/4
+\end{cases}
+$$
+
+&emsp;&emsp;其中 $\theta_i = 0$ 的维度对应不旋转的 NoPE 部分。
+
+&emsp;&emsp;部分 RoPE 的核心洞察是：NoPE 部分负责语义聚合（关注内容相关性），RoPE 部分负责位置编码，两者互补。从理论上看，部分 RoPE 使 $\sum_i \cos(m\theta_i) \geq 0$ 对所有 $m$ 和 $b$ 恒成立，具有更好的语义聚合能力。在 MLA 中，DeepSeek 使用 128 个 NoPE 维度和 64 个 RoPE 维度，将主要计算放在 NoPE 部分，这是 MLA 能够实现双重投影（将 Query 和 Key 的投影吸收到潜在空间中）的理论前提。
+
+&emsp;&emsp;部分 RoPE 的优点是兼顾了位置编码和语义聚合，在长上下文任务中可能优于完整 RoPE，且为 MLA 等高效注意力架构提供了基础；缺点是旋转维度和非旋转维度的比例需要手动选择，不同任务和模型规模下最优比例可能不同。
+
+&emsp;&emsp;从维度视角看，部分 RoPE 将特征维划分为两个功能区：一部分维度承载位置信息，另一部分维度承载纯语义信息。这使得注意力关系矩阵中的位置信号和语义信号在特征维上解耦，模型可以更灵活地调节两者对注意力分数的贡献。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出部分 RoPE 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class PartialRoPE(nn.Module):
+    def __init__(self, d_k, rotary_dim, base=10000.0):
+        """
+        d_k: 总维度
+        rotary_dim: 施加 RoPE 的维度数，剩余维度不旋转
+        """
+        super().__init__()
+        self.d_k = d_k
+        self.rotary_dim = rotary_dim
+
+        inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2).float() / rotary_dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, q, k, positions=None):
+        B, h, L, d_k = q.size()
+        if positions is None:
+            positions = torch.arange(L, device=q.device).unsqueeze(0).expand(B, -1)
+
+        # 只对前 rotary_dim 个维度做旋转
+        q_rot_part = q[..., :self.rotary_dim]   # (B, h, L, rotary_dim)
+        q_pass_part = q[..., self.rotary_dim:]  # (B, h, L, d_k - rotary_dim)
+        k_rot_part = k[..., :self.rotary_dim]
+        k_pass_part = k[..., self.rotary_dim:]
+
+        angles = positions.unsqueeze(-1).float() * self.inv_freq  # (B, L, rotary_dim/2)
+        cos = torch.cos(angles).unsqueeze(1)
+        sin = torch.sin(angles).unsqueeze(1)
+
+        q_reshaped = q_rot_part.view(B, h, L, self.rotary_dim // 2, 2)
+        k_reshaped = k_rot_part.view(B, h, L, self.rotary_dim // 2, 2)
+
+        q_rot = torch.stack([
+            q_reshaped[..., 0] * cos - q_reshaped[..., 1] * sin,
+            q_reshaped[..., 0] * sin + q_reshaped[..., 1] * cos
+        ], dim=-1).reshape(B, h, L, self.rotary_dim)
+
+        k_rot = torch.stack([
+            k_reshaped[..., 0] * cos - k_reshaped[..., 1] * sin,
+            k_reshaped[..., 0] * sin + k_reshaped[..., 1] * cos
+        ], dim=-1).reshape(B, h, L, self.rotary_dim)
+
+        # 拼接旋转部分和不旋转部分
+        q_out = torch.cat([q_rot, q_pass_part], dim=-1)
+        k_out = torch.cat([k_rot, k_pass_part], dim=-1)
+        return q_out, k_out
+```
+
+&emsp;&emsp;这个实现中，`rotary_dim` 指定了施加旋转的维度数，剩余维度直接透传。若输入形状为 $(B,h,L,d_k)$，输出形状相同。
+
+---
 
 #### 2.3.9 iRoPE：交错旋转位置编码
 
-&emsp;&emsp;Llama 4 Scout 提出 iRoPE，交替使用带位置编码和不带位置编码的注意力层：偶数层使用 RoPE 处理局部位置信息，奇数层不使用位置编码（NoPE），专注于内容本身的语义匹配。这种交替设计使模型在超长上下文中既能利用位置信息进行精确检索，又能避免位置编码的数值不稳定性对语义匹配的干扰。
+&emsp;&emsp;iRoPE（interleaved Rotary Position Embeddings）是 Meta 在 Llama 4 Scout 中使用的架构，声称支持 1000 万 token 的上下文窗口。其核心思想是在模型的不同层之间交错使用两种注意力模式：一部分层使用 RoPE 并采用分块局部注意力掩码，只能关注固定窗口内的近期 token（例如 8K token）；另一部分层不使用任何位置编码（NoPE），采用完整的因果掩码，可以访问全部上下文历史。
+
+&emsp;&emsp;这种交错设计的关键动机是：NoPE 层不携带位置偏置，能够纯粹基于内容相似度进行注意力聚合，在处理超长上下文时不会因为位置编码的数值范围问题而失效；而 RoPE 层通过局部窗口聚焦于短距离的精细位置关系。两者交替堆叠，使模型既能捕捉长距离的语义依赖，又能维持局部的位置精度。
+
+&emsp;&emsp;具体实现中，通常采用“每 4 层使用一次 RoPE”的比例，即第 1、5、9、... 层使用 RoPE 和分块注意力，其余层使用 NoPE 和全局因果注意力。此外，iRoPE 还结合了推理时的注意力温度缩放（Attention Temperature Scaling）：随着序列长度增加，动态调整注意力分布的平滑程度，防止注意力分数在超长序列上变得过于尖锐或过于平坦。
+
+&emsp;&emsp;iRoPE 的优点是无需额外参数，通过层间交错实现了局部精度和全局覆盖的平衡，NoPE 层的全局注意力使模型能够直接访问任意距离的上下文，理论上可扩展到任意序列长度；缺点是 KV Cache 仍然随序列长度线性增长，注意力计算的 $O(n^2)$ 复杂度并未降低，内存瓶颈依然存在，且 NoPE 层不携带位置信息，在需要精确位置感知的任务中可能不如全 RoPE 方案。
+
+&emsp;&emsp;从维度视角看，iRoPE 在层间实现了位置编码的“交替启用与禁用”。RoPE 层在特征维上注入位置旋转，NoPE 层则让特征维纯粹承载语义信息。这种交错使得模型在不同深度上分别处理位置敏感和位置无关的注意力模式。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 iRoPE 交错层设计的裸实现，包含 RoPE 层和 NoPE 层的交替：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class iRoPEAttention(nn.Module):
+    """iRoPE 注意力层: 根据 use_rope 决定是否施加 RoPE"""
+    def __init__(self, d_model, num_heads, use_rope, chunk_size=8192):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.use_rope = use_rope
+        self.chunk_size = chunk_size
+
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o):
+            nn.init.xavier_uniform_(w)
+
+        if use_rope:
+            inv_freq = 1.0 / (10000.0 ** (torch.arange(0, self.d_k, 2).float() / self.d_k))
+            self.register_buffer("inv_freq", inv_freq)
+
+    def _apply_rope(self, x):
+        B, h, L, d_k = x.size()
+        positions = torch.arange(L, device=x.device).unsqueeze(0).expand(B, -1)
+        angles = positions.unsqueeze(-1).float() * self.inv_freq
+        cos = torch.cos(angles).unsqueeze(1)
+        sin = torch.sin(angles).unsqueeze(1)
+
+        x_reshaped = x.view(B, h, L, d_k // 2, 2)
+        x_rot = torch.stack([
+            x_reshaped[..., 0] * cos - x_reshaped[..., 1] * sin,
+            x_reshaped[..., 0] * sin + x_reshaped[..., 1] * cos
+        ], dim=-1).reshape(B, h, L, d_k)
+        return x_rot
+
+    def forward(self, x):
+        B, L, _ = x.size()
+
+        Q = torch.matmul(x, self.W_q).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        K = torch.matmul(x, self.W_k).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        V = torch.matmul(x, self.W_v).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+        if self.use_rope:
+            Q = self._apply_rope(Q)
+            K = self._apply_rope(K)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+
+        # 因果掩码
+        causal_mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
+
+        if self.use_rope:
+            # RoPE 层: 叠加分块局部掩码，只关注最近 chunk_size 个 token
+            local_mask = torch.ones(L, L, device=x.device).bool()
+            for i in range(L):
+                left = max(0, i - self.chunk_size + 1)
+                local_mask[i, :left] = False
+            mask = causal_mask | ~local_mask
+        else:
+            # NoPE 层: 只使用完整因果掩码，可访问全部历史
+            mask = causal_mask
+
+        scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        attn = torch.softmax(scores, dim=-1)
+        head_out = torch.matmul(attn, V)
+
+        head_out = head_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        return torch.matmul(head_out, self.W_o)
+
+
+class iRoPEStack(nn.Module):
+    """iRoPE 堆叠: 每 4 层使用一次 RoPE"""
+    def __init__(self, d_model, num_heads, num_layers, rope_every=4, chunk_size=8192):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            use_rope = ((i + 1) % rope_every == 0)
+            self.layers.append(
+                iRoPEAttention(d_model, num_heads, use_rope=use_rope, chunk_size=chunk_size)
+            )
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = x + layer(x)
+        return x
+```
+
+&emsp;&emsp;这个实现中，`iRoPEAttention` 根据 `use_rope` 标志决定是否施加 RoPE 和分块掩码。`iRoPEStack` 按照每 4 层使用一次 RoPE 的模式堆叠注意力层。若输入形状为 $(B,L,d_{model})$，输出形状相同。
 
 #### 2.3.10 NoPE
 
-&emsp;&emsp;NoPE（No Position Encoding）即不使用位置编码的注意力层。Llama 4 的 iRoPE 中，奇数层不使用位置编码，专注于内容本身的语义匹配。NoPE 层在超长上下文中可以避免位置编码的数值不稳定性，但单独使用可能损失位置感知能力，通常与 RoPE 层交替使用。
+&emsp;&emsp;NoPE（No Positional Encoding）指的是在 Transformer 中完全不添加任何显式位置编码。模型仅依靠因果注意力掩码和 token 自身的嵌入来隐式地学习位置信息。这一方案最初被认为会导致模型无法区分 token 顺序，但 Kazemnejad 等人在 2023 年的系统研究中发现，NoPE 在长度泛化任务上反而优于 ALiBi、RoPE、APE 和 T5 相对位置偏置等所有显式位置编码方案。
+
+&emsp;&emsp;NoPE 的理论基础在于：因果注意力掩码本身已经引入了一种隐式的顺序信号。由于每个位置只能关注自己和之前的位置，注意力权重的模式天然携带了位置信息。理论分析表明，NoPE 的注意力点积可以分解为内容函数和相对距离函数两部分：
+
+$$
+\langle \bm{q}_t, \bm{k}_i \rangle = f_{\mathrm{cnt}}(\bm{q}_t, \bm{k}_i) + f_{\mathrm{rel}}(t-i)
+$$
+
+&emsp;&emsp;其中 $f_{\mathrm{cnt}}$ 是内容的函数，$f_{\mathrm{rel}}$ 是相对距离的函数。这意味着 NoPE 虽然不显式注入位置编码，但通过多层注意力的组合，模型可以隐式地实现相对位置编码的功能。在实际训练中，SGD 优化后的 NoPE 主要呈现出与 T5 相对位置偏置相似的注意力模式。
+
+&emsp;&emsp;NoPE 的优点是无需任何位置编码参数或计算开销，长度泛化能力优于所有显式位置编码方案，且在长序列外推时不会出现位置编码数值范围失效的问题；缺点是位置信息的隐式学习需要更多训练步数才能收敛，在小规模模型或短序列任务上可能不如显式位置编码，且对于需要精确绝对位置感知的任务（如某些结构化预测任务），NoPE 可能表现不佳。
+
+&emsp;&emsp;从维度视角看，NoPE 让 token 维扩散的关系矩阵完全由内容和因果结构决定，不额外注入位置信号。位置信息不是不存在，而是以隐式方式编码在注意力模式中。在 iRoPE 等交错架构中，NoPE 层被用于全局注意力，专门负责长距离的语义聚合。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 NoPE 注意力的裸实现，与带 RoPE 的版本对比，NoPE 层不施加任何位置编码：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class NoPEAttention(nn.Module):
+    """NoPE 注意力层: 不施加任何位置编码，仅依靠因果掩码"""
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o):
+            nn.init.xavier_uniform_(w)
+
+    def forward(self, x):
+        B, L, _ = x.size()
+
+        Q = torch.matmul(x, self.W_q).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        K = torch.matmul(x, self.W_k).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        V = torch.matmul(x, self.W_v).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+        # 标准缩放点积注意力，不添加任何位置编码
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+
+        # 因果掩码是唯一的结构性信号
+        causal_mask = torch.triu(
+            torch.ones(L, L, device=x.device), diagonal=1
+        ).bool()
+        scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1)
+        head_out = torch.matmul(attn, V)
+
+        head_out = head_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        return torch.matmul(head_out, self.W_o), attn
+```
+
+&emsp;&emsp;这个实现中，`NoPEAttention` 不包含任何位置编码操作，Query 和 Key 直接进行点积，因果掩码是唯一的结构性位置信号。若输入形状为 $(B,L,d_{model})$，输出形状相同，`attn` 形状为 $(B,h,L,L)$。
+
+---
 
 #### 2.3.11 YARN
 
-&emsp;&emsp;YARN 用于重新调整注意力权重以实现更好的长度外推。Qwen2 引入 DCA 和 YARN，使模型在推理时能够有效处理超出训练长度的序列，而无需在更长序列上进行继续训练。YARN 与 DCA 一起作为扩展模型上下文长度的标准手段。
+&emsp;&emsp;YARN（Yet another RoPE extension）是 Peng 等人于 2023 年提出的 RoPE 上下文扩展方法，在 NTK-aware 基频调整的基础上进一步引入了分频率插值和注意力温度缩放。标准位置插值（PI）将所有 RoPE 频率统一除以缩放因子 $s$，导致高频维度的局部细节分辨率下降；NTK-aware 方法通过修改基频来非均匀缩放，但仍存在长距离注意力分数不稳定的问题。YARN 通过三个组件的组合解决了这些问题。
+
+&emsp;&emsp;第一个组件是分频率感知插值。YARN 将 RoPE 的频率维度按波长分为三组：高频维度保持原值，低频维度进行完整插值，中间频率平滑过渡。设第 $m$ 个维度的波长为 $\lambda_m = 2\pi / \theta_m$，YARN 的缩放策略为：
+
+$$
+\omega_m' = \begin{cases}
+\omega_m & \lambda_m < \alpha \\
+(1-\gamma(\lambda_m)) \omega_m + \gamma(\lambda_m) \omega_m / s & \alpha \leq \lambda_m \leq \beta \\
+\omega_m / s & \lambda_m > \beta
+\end{cases}
+$$
+
+&emsp;&emsp;其中 $\gamma$ 是在 $[\alpha, \beta]$ 区间上从 0 平滑增加到 1 的混合函数。这种分段策略使高频维度保留局部位置精度，低频维度获得更长的波长覆盖，中间频率平滑过渡。
+
+&emsp;&emsp;第二个组件是注意力温度缩放。当位置被插值后，Query 和 Key 的点积方差发生变化，导致 Softmax 分布偏移。YARN 在 Softmax 之前引入温度因子 $t$：
+
+$$
+\mathrm{softmax}\left(\frac{QK^\top}{t \cdot \sqrt{d_k}}\right)
+$$
+
+&emsp;&emsp;温度因子由缩放因子 $s$ 计算得到：
+
+$$
+t = 0.1 \ln(s) + 1.0
+$$
+
+&emsp;&emsp;当 $s=4$ 时 $t \approx 1.14$，当 $s=8$ 时 $t \approx 1.21$。温度缩放是 YARN 的关键组件，没有它时 8 倍扩展会失败。
+
+&emsp;&emsp;第三个组件是缩放因子的动态计算。YARN 支持在推理时根据实际输入长度动态调整缩放因子，使模型在训练时使用 $s=4$ 的情况下也能在 $s=8$ 时优雅降级而非灾难性失败。
+
+&emsp;&emsp;YARN 的优点是在 2 倍到 8 倍上下文扩展时能达到最优的困惑度，温度缩放组件对长距离稳定性至关重要，且支持零样本推理时扩展，无需额外微调即可使用；缺点是需要手动设置分频率的阈值 $\alpha$ 和 $\beta$，不同模型和基频下最优阈值不同，且温度因子的经验公式 $t = 0.1 \ln(s) + 1$ 是启发式的，在极端缩放比例下可能不够精确。
+
+&emsp;&emsp;从维度视角看，YARN 在不同频率维度上施加了不同程度的缩放：高频维度保留短距离精度，低频维度负责长距离覆盖，温度缩放则校准了 Softmax 分布的形状。这相当于在 RoPE 的频率轴上做了一次非均匀的维度重分配。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 YARN 的裸实现，包含分频率插值和注意力温度缩放：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class YaRNRoPE(nn.Module):
+    def __init__(self, d_k, base=10000.0, original_max_len=4096,
+                 extended_max_len=32768, beta_fast=32, beta_slow=1):
+        """
+        d_k: 头维度
+        original_max_len: 预训练时的最大长度
+        extended_max_len: 目标扩展长度
+        beta_fast: 高频边界（波长小于此值的维度不缩放）
+        beta_slow: 低频边界（波长大于此值的维度完全缩放）
+        """
+        super().__init__()
+        self.d_k = d_k
+        self.base = base
+        self.original_max_len = original_max_len
+        self.extended_max_len = extended_max_len
+        self.scale = extended_max_len / original_max_len
+
+        # 原始逆频率
+        inv_freq = 1.0 / (base ** (torch.arange(0, d_k, 2).float() / d_k))
+        self.register_buffer("inv_freq", inv_freq)
+
+        # 计算每个维度的波长
+        wavelengths = 2 * math.pi / inv_freq  # (d_k/2,)
+
+        # 分频率插值: 高频保留，低频插值，中间平滑过渡
+        gamma = ((wavelengths - beta_slow) / (beta_fast - beta_slow)).clamp(0, 1)
+        # gamma=0 -> 不缩放, gamma=1 -> 完全缩放
+        inv_freq_scaled = (1 - gamma) * inv_freq + gamma * inv_freq / self.scale
+        self.register_buffer("inv_freq_scaled", inv_freq_scaled)
+
+        # 注意力温度缩放因子
+        self.attn_scale = 0.1 * math.log(self.scale) + 1.0
+
+    def forward(self, q, k, positions=None):
+        B, h, L, d_k = q.size()
+        if positions is None:
+            positions = torch.arange(L, device=q.device).unsqueeze(0).expand(B, -1)
+
+        # 使用缩放后的频率
+        angles = positions.unsqueeze(-1).float() * self.inv_freq_scaled
+        cos = torch.cos(angles).unsqueeze(1)
+        sin = torch.sin(angles).unsqueeze(1)
+
+        q_r = q.view(B, h, L, d_k // 2, 2)
+        k_r = k.view(B, h, L, d_k // 2, 2)
+
+        q_rot = torch.stack([
+            q_r[..., 0] * cos - q_r[..., 1] * sin,
+            q_r[..., 0] * sin + q_r[..., 1] * cos
+        ], dim=-1).reshape(B, h, L, d_k)
+
+        k_rot = torch.stack([
+            k_r[..., 0] * cos - k_r[..., 1] * sin,
+            k_r[..., 0] * sin + k_r[..., 1] * cos
+        ], dim=-1).reshape(B, h, L, d_k)
+
+        return q_rot, k_rot, self.attn_scale
+```
+
+&emsp;&emsp;这个实现中，`inv_freq_scaled` 根据波长的分频率策略对逆频率进行非均匀缩放，`attn_scale` 是温度因子 $t$。实际使用时，注意力分数需要除以 $t \cdot \sqrt{d_k}$。若输入形状为 $(B,h,L,d_k)$，输出形状相同，同时返回温度因子。
+
+---
 
 #### 2.3.12 DCA：双块注意力
 
-&emsp;&emsp;DCA（Dual Chunk Attention）将长序列分割为可管理的长度块，如果输入可以在一个块中处理，DCA 产生与原始注意力相同的结果；否则，DCA 在块内和跨块之间有效捕获相对位置信息。DCA 的一个重要特性是无需训练即可扩展上下文长度。它被应用于 Qwen2、Qwen2.5 以及 Qwen3，使 Qwen2.5-1M 系列首次将开源模型的上下文长度扩展至 100 万 token。
+&emsp;&emsp;双块注意力（Dual Chunk Attention, DCA）由 An 等人于 2024 年提出，是一种无需训练即可扩展 LLM 上下文窗口的方法。DCA 将长序列的注意力计算分解为块内注意力和块间注意力，使 Llama2 70B（原生 4K 上下文）能够支持超过 100K token 的上下文窗口，而无需任何持续训练。
+
+&emsp;&emsp;DCA 的核心挑战在于：当序列长度超过预训练窗口时，直接使用 RoPE 的相对位置编码会导致超出训练范围的位置索引，使注意力分数分布偏移。DCA 的解决方案是重新设计相对位置矩阵的构建方式，使其能够准确反映 token 之间的相对位置，同时保持预训练模型的原始位置索引和嵌入。
+
+&emsp;&emsp;DCA 包含三个核心组件。设块大小为 $w$（通常设为预训练窗口大小），序列被分割为 $C = \lceil L/w \rceil$ 个块。块内注意力处理同一块内的 token，维持原始的相对位置编码：
+
+$$
+A_{\mathrm{intra}} = \mathrm{softmax}\left(\frac{Q_i K_i^\top}{\sqrt{d_k}}\right) V_i
+$$
+
+&emsp;&emsp;块间注意力处理不同块之间的 token，通过特殊的位置索引映射避免超出预训练范围。对于查询块 $c$ 和键块 $j$（$j < c$），查询使用位置索引 $c-1$ 对应的位置来关注之前的块，使相对位置被限制在预训练窗口内：
+
+$$
+A_{\mathrm{inter}} = \mathrm{softmax}\left(\frac{Q_i K_j^\top}{\sqrt{d_k}} \cdot M_{ij}\right) V_j
+$$
+
+&emsp;&emsp;其中 $M_{ij}$ 是位置掩码矩阵，确保相对位置不超出预训练范围。连续块注意力专门处理相邻块之间的 token，确保块边界处的连续性。
+
+&emsp;&emsp;DCA 的优点是训练无关，可以直接应用于现有预训练模型，将 4K 上下文扩展到 100K+ token 而困惑度增长微乎其微，计算复杂度从 $O(L^2)$ 降至 $O(L \cdot w)$，且与 FlashAttention 无缝集成；缺点是块大小的选择需要权衡局部精度和全局覆盖，块间注意力的位置索引映射可能损失部分跨块相对位置的精细信息，且 DCA 主要解决上下文长度限制问题，而非提升模型的核心能力。
+
+&emsp;&emsp;从维度视角看，DCA 在 token 维扩散的关系矩阵上施加了块结构：块内保持原始相对位置，块间通过压缩的位置索引维持长程依赖。这相当于将全局扩散分解为块内精确扩散和块间粗粒度扩散的叠加。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 DCA 的裸实现，包含块内注意力、块间注意力和连续块注意力：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class DualChunkAttention(nn.Module):
+    def __init__(self, d_model, num_heads, chunk_size):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.chunk_size = chunk_size
+
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o):
+            nn.init.xavier_uniform_(w)
+
+    def forward(self, x, causal=True):
+        B, L, _ = x.size()
+        w = self.chunk_size
+        num_chunks = math.ceil(L / w)
+
+        Q = torch.matmul(x, self.W_q).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        K = torch.matmul(x, self.W_k).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        V = torch.matmul(x, self.W_v).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+        # 构建 DCA 位置索引
+        # 块内: 使用原始相对位置
+        # 块间: 查询使用块边界位置索引 c-1 来关注之前的块
+        pos_intra = torch.arange(L, device=x.device)
+        pos_inter = torch.zeros(L, device=x.device, dtype=torch.long)
+        for c in range(num_chunks):
+            start = c * w
+            end = min(start + w, L)
+            # 块内使用原始位置
+            pos_intra[start:end] = torch.arange(start, end, device=x.device)
+            # 块间使用压缩位置: 当前块内的查询位置映射到 c-1
+            pos_inter[start:end] = c - 1 if c > 0 else 0
+
+        # 构建 DCA 偏置矩阵
+        pos_diff_intra = pos_intra.unsqueeze(0) - pos_intra.unsqueeze(1)
+        pos_diff_inter = pos_intra.unsqueeze(0) - pos_inter.unsqueeze(1)
+
+        # 判断每个 (i,j) 对属于块内还是块间
+        chunk_i = torch.arange(L, device=x.device) // w
+        chunk_j = torch.arange(L, device=x.device) // w
+        is_intra = (chunk_i.unsqueeze(1) == chunk_j.unsqueeze(0))  # (L, L)
+        is_inter = ~is_intra
+
+        # 综合位置差
+        pos_diff = torch.where(is_intra, pos_diff_intra, pos_diff_inter)
+
+        # 使用位置差作为偏置（简化实现，实际 DCA 用 RoPE 旋转）
+        # 这里用相对位置差作为注意力偏置
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+
+        # 添加 DCA 位置偏置
+        dca_bias = -torch.abs(pos_diff.float()) * 0.01  # 简化的线性偏置
+        scores = scores + dca_bias.unsqueeze(0).unsqueeze(0)
+
+        if causal:
+            mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
+            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1)
+        head_out = torch.matmul(attn, V)
+        head_out = head_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        return torch.matmul(head_out, self.W_o), attn
+```
+
+&emsp;&emsp;这个实现中，DCA 将序列分割为块，块内使用原始位置差，块间使用压缩后的位置索引。实际 DCA 使用 RoPE 旋转来实现位置编码，这里用位置偏置简化演示。若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.3.13 温度缩放与分块注意力掩码
 
-&emsp;&emsp;iRoPE 还包含温度缩放：根据序列长度动态调整注意力分布的“温度”，在序列变长时适当平滑注意力分布，防止其崩溃。在推理阶段，Llama 4 对特定层应用分块注意力掩码，将长序列分割为可管理的块进行处理，使模型能够在 10M token 的规模上保持内存效率。
+&emsp;&emsp;温度缩放与分块注意力掩码是 Llama 4 中 iRoPE 架构的两个关键推理时优化组件。iRoPE 将模型层分为 RoPE 层和 NoPE 层，RoPE 层使用分块注意力掩码进行局部注意力，NoPE 层使用全因果掩码进行全局注意力，并在 NoPE 层中引入推理时温度缩放来稳定长距离注意力分布。
+
+&emsp;&emsp;分块注意力掩码（Chunked Attention Mask）限制每个 token 只关注其所在块及之前固定窗口内的 token。与滑动窗口注意力不同，分块掩码将序列划分为不重叠的块，每个查询只能关注当前块和之前的块，但不对跨块注意力做进一步限制。在 Llama 4 中，块大小通常设为 8192，每 4 层中使用 3 层 RoPE 局部注意力和 1 层 NoPE 全局注意力。
+
+&emsp;&emsp;温度缩放（Temperature Scaling）在推理时对 NoPE 层的注意力 logits 进行动态调整。随着序列长度增加，注意力分数的分布会发生变化，温度缩放通过调整 Softmax 的平滑程度来补偿。Llama 4 的温度缩放公式为：
+
+$$
+\mathrm{scale} = \log\left(\left\lfloor \frac{\mathrm{position} + 1}{\mathrm{floor\_scale}} \right\rfloor + 1\right) \cdot \mathrm{attn\_scale} + 1
+$$
+
+&emsp;&emsp;其中 $\mathrm{floor\_scale}$ 控制从多长位置开始放大（默认 8192），$\mathrm{attn\_scale}$ 控制放大强度（默认 0.1）。当位置小于 $\mathrm{floor\_scale}$ 时，$\mathrm{scale} \approx 1$，不产生缩放效果；当位置远超 $\mathrm{floor\_scale}$ 时，温度因子对数增长，使注意力分布更加平滑。
+
+&emsp;&emsp;温度缩放与分块注意力掩码的优点是推理时无需额外训练即可启用，温度缩放对数增长的设计使长距离注意力不会过度平滑，分块掩码将局部注意力的计算量控制在 $O(L \cdot w)$ 内，两者配合使 iRoPE 架构能够处理 1000 万 token 级别的上下文；缺点是分块掩码的块大小需要手动设置，过大的块会降低局部精度，过小的块会增加层间信息传递的负担，温度缩放的经验参数 $\mathrm{floor\_scale}$ 和 $\mathrm{attn\_scale}$ 也需要根据模型规模调整。
+
+&emsp;&emsp;从维度视角看，分块注意力掩码在 token 维扩散的关系矩阵上施加了块对角约束，使 RoPE 层专注于块内的精细位置关系；温度缩放在 NoPE 层中调整注意力分布的锐度，使全局扩散在超长序列上保持数值稳定。两者配合，实现了局部精度和全局覆盖的平衡。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出温度缩放与分块注意力掩码的裸实现：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class TemperatureScaledChunkedAttention(nn.Module):
+    """结合温度缩放与分块注意力掩码的注意力层"""
+    def __init__(self, d_model, num_heads, chunk_size=8192,
+                 floor_scale=8192, attn_scale=0.1, use_rope=True):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.chunk_size = chunk_size
+        self.floor_scale = floor_scale
+        self.attn_scale = attn_scale
+        self.use_rope = use_rope
+
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o):
+            nn.init.xavier_uniform_(w)
+
+        if use_rope:
+            inv_freq = 1.0 / (10000.0 ** (torch.arange(0, self.d_k, 2).float() / self.d_k))
+            self.register_buffer("inv_freq", inv_freq)
+
+    def _apply_rope(self, x, positions):
+        B, h, L, d_k = x.size()
+        angles = positions.unsqueeze(-1).float() * self.inv_freq
+        cos = torch.cos(angles).unsqueeze(1)
+        sin = torch.sin(angles).unsqueeze(1)
+
+        x_r = x.view(B, h, L, d_k // 2, 2)
+        x_rot = torch.stack([
+            x_r[..., 0] * cos - x_r[..., 1] * sin,
+            x_r[..., 0] * sin + x_r[..., 1] * cos
+        ], dim=-1).reshape(B, h, L, d_k)
+        return x_rot
+
+    def _compute_temperature_scale(self, L, device):
+        """计算温度缩放因子: 随位置对数增长"""
+        positions = torch.arange(L, device=device).float()
+        scale = torch.log(
+            torch.floor((positions + 1.0) / self.floor_scale) + 1.0
+        ) * self.attn_scale + 1.0
+        return scale  # (L,)
+
+    def _build_chunked_mask(self, L, device):
+        """构建分块注意力掩码: 每个 token 只关注当前块及之前的块"""
+        w = self.chunk_size
+        num_chunks = math.ceil(L / w)
+        chunk_ids = torch.arange(L, device=device) // w  # (L,)
+        # 允许关注当前块及之前的所有块
+        mask = chunk_ids.unsqueeze(0) >= chunk_ids.unsqueeze(1)  # (L, L)
+        return mask.bool()
+
+    def forward(self, x):
+        B, L, _ = x.size()
+        positions = torch.arange(L, device=x.device).unsqueeze(0).expand(B, -1)
+
+        Q = torch.matmul(x, self.W_q).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        K = torch.matmul(x, self.W_k).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        V = torch.matmul(x, self.W_v).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+        if self.use_rope:
+            Q = self._apply_rope(Q, positions)
+            K = self._apply_rope(K, positions)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+
+        # 温度缩放: 对 NoPE 层应用
+        if not self.use_rope:
+            temp_scale = self._compute_temperature_scale(L, x.device)  # (L,)
+            scores = scores * temp_scale.view(1, 1, L, 1)
+
+        # 分块注意力掩码: 对 RoPE 层应用
+        if self.use_rope:
+            chunk_mask = self._build_chunked_mask(L, x.device)
+            causal_mask = torch.tril(torch.ones(L, L, device=x.device)).bool()
+            final_mask = chunk_mask & causal_mask
+            scores = scores.masked_fill(~final_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        else:
+            # NoPE 层: 全因果掩码，可访问全部历史
+            causal_mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
+            scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1)
+        head_out = torch.matmul(attn, V)
+        head_out = head_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        return torch.matmul(head_out, self.W_o), attn
+```
+
+&emsp;&emsp;这个实现中，当 `use_rope=True` 时施加分块注意力掩码和因果掩码的叠加，当 `use_rope=False` 时施加全因果掩码和温度缩放。若输入形状为 $(B,L,d_{model})$，输出形状相同，`attn` 形状为 $(B,h,L,L)$。
 
 ---
 
@@ -276,27 +3147,351 @@ $$
 
 #### 2.4.1 LayerNorm
 
-&emsp;&emsp;LayerNorm 对激活值进行均值中心化和方差归一化。原始 Transformer 使用 Post-LN，GPT-1 沿用。LayerNorm 在 NLP 中比 BatchNorm 更稳定，因为序列长度可变，BatchNorm 的统计量不稳定。
+&emsp;&emsp;层归一化（Layer Normalization, LayerNorm）由 Ba 等人于 2016 年提出，是 Transformer 中最早使用的归一化方法。它对每个样本的特征维做归一化，独立于 batch 维度，因此不受 batch size 影响，适合变长序列。设输入为 $x \in \mathbb{R}^{d}$，LayerNorm 计算为：
+
+$$
+\mu = \frac{1}{d}\sum_{i=1}^{d} x_i, \quad \sigma^2 = \frac{1}{d}\sum_{i=1}^{d}(x_i - \mu)^2
+$$
+
+$$
+\hat{x}_i = \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}}, \quad y_i = \gamma_i \hat{x}_i + \beta_i
+$$
+
+&emsp;&emsp;其中 $\gamma, \beta \in \mathbb{R}^{d}$ 是可学习的缩放和偏移参数，$\epsilon$ 是防止除零的小常数。与 BatchNorm 不同，LayerNorm 的统计量在单个样本内部计算，不跨 batch 聚合，因此训练和推理行为一致。在 Transformer 中，LayerNorm 通常作用在最后一维即特征维上，对每个 token 独立归一化。
+
+&emsp;&emsp;LayerNorm 的优点是训练和推理行为一致，不依赖 batch size，适合序列建模；同时对特征维做归一化使每层输入的分布稳定，缓解内部协变量偏移。缺点是计算需要同时求均值和方差，比 RMSNorm 多一次归约操作，在深层大模型中归一化层的开销不可忽略；此外 LayerNorm 的均值中心化在某些任务中并非必要，反而可能损失部分方向信息。
+
+&emsp;&emsp;从维度视角看，LayerNorm 在特征维上对每个 token 独立做中心化和缩放，将特征分布的均值和方差拉回稳定范围。它不改变 token 维扩散的结构，只是让每层子层的输入保持在合理的数值范围内。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 LayerNorm 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class LayerNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__()
+        self.d_model = d_model
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(d_model))
+        self.beta = nn.Parameter(torch.zeros(d_model))
+
+    def forward(self, x):
+        # x: (..., d_model)
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        x_norm = (x - mean) / torch.sqrt(var + self.eps)
+        return x_norm * self.gamma + self.beta
+```
+
+&emsp;&emsp;这个实现中，均值和方差在最后一维上计算，每个 token 独立归一化。若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.4.2 Post-LN
 
-&emsp;&emsp;Post-LN 将层归一化放置在残差连接之后：$x_{l+1} = \text{LayerNorm}(x_l + \text{Sublayer}(x_l))$。这种设计在深层网络中会导致梯度范数在反向传播时出现剧烈波动，训练不稳定。
+&emsp;&emsp;Post-LN 是原始 Transformer 采用的归一化排列方式，将 LayerNorm 放在残差相加之后。设子层函数为 $F$，输入为 $x$，Post-LN 的输出为：
+
+$$
+y = \mathrm{LayerNorm}(x + F(x))
+$$
+
+&emsp;&emsp;在编码器和解码器的每个子层中，输入先经过子层计算，与残差相加后再做 LayerNorm。Post-LN 的残差路径上每层都经过归一化，使得梯度在反向传播时被归一化操作的缩放因子影响。理论分析表明，Post-LN 的梯度范数随层数增加而衰减，深层网络需要学习率预热（warmup）才能稳定训练。
+
+&emsp;&emsp;Post-LN 的优点是原始 Transformer 采用该结构，在浅层模型（如 6 层、12 层）中表现良好，输出经过归一化后数值范围稳定，无需额外的最终 LayerNorm；缺点是深层训练不稳定，必须配合精细的学习率预热和参数初始化，当层数超过一定规模时训练容易发散，因此现代大模型大多改用 Pre-LN。
+
+&emsp;&emsp;从维度视角看，Post-LN 在特征维上让残差路径每层都经过归一化，使得信息在传递过程中不断被重新标准化。这有助于数值稳定，但也压缩了残差路径上信息的动态范围。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Post-LN 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class PostLNBlock(nn.Module):
+    def __init__(self, d_model, d_ff, eps=1e-6):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        self.ln1_gamma = nn.Parameter(torch.ones(d_model))
+        self.ln1_beta = nn.Parameter(torch.zeros(d_model))
+        self.ln2_gamma = nn.Parameter(torch.ones(d_model))
+        self.ln2_beta = nn.Parameter(torch.zeros(d_model))
+        self.eps = eps
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def _ln(self, x, gamma, beta):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + self.eps) * gamma + beta
+
+    def forward(self, x, attn_fn):
+        # Post-LN: LayerNorm(x + F(x))
+        attn_out = attn_fn(x)
+        x = self._ln(x + attn_out, self.ln1_gamma, self.ln1_beta)
+
+        ffn_out = torch.matmul(
+            torch.relu(torch.matmul(x, self.W_1) + self.b_1),
+            self.W_2
+        ) + self.b_2
+        x = self._ln(x + ffn_out, self.ln2_gamma, self.ln2_beta)
+        return x
+```
+
+&emsp;&emsp;这个实现中，每个子层先计算 $F(x)$，与残差相加后再做 LayerNorm。若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.4.3 Pre-LN
 
-&emsp;&emsp;Pre-LN 将层归一化移到每个子模块的输入之前：$x_{l+1} = x_l + \text{Sublayer}(\text{LayerNorm}(x_l))$。Pre-LN 使残差路径上的信息可以不经过任何归一化变换而直接传递到深层，极大缓解了梯度消失和梯度爆炸问题。GPT-2 首次大规模采用，后续几乎所有主流 LLM 沿用。
+&emsp;&emsp;Pre-LN 将 LayerNorm 放在子层输入之前，残差路径上不经过归一化。设子层函数为 $F$，输入为 $x$，Pre-LN 的输出为：
+
+$$
+y = x + F(\mathrm{LayerNorm}(x))
+$$
+
+&emsp;&emsp;Pre-LN 的残差路径是恒等映射，梯度可以通过残差路径直接回传，不受归一化操作的缩放影响。这使深层网络训练更稳定，对学习率预热不敏感，因此成为现代大模型（GPT-3、LLaMA、Qwen 等）的主流选择。Pre-LN 的缺点是残差路径上的激活值会随层数增加而累积增长，通常需要在最后一层后加一个最终的 LayerNorm 来稳定输出。
+
+&emsp;&emsp;从梯度角度看，Pre-LN 的梯度为 $\partial y / \partial x = I + \partial F / \partial x$，恒等路径保证了梯度的直接传播。而 Post-LN 的梯度为 $\partial y / \partial x = \partial \mathrm{LN} / \partial (x + F) \cdot (I + \partial F / \partial x)$，归一化的雅可比矩阵会缩放梯度，导致深层训练不稳定。
+
+&emsp;&emsp;Pre-LN 的优点是训练稳定，适合深层模型，对学习率预热不敏感，梯度传播良好；缺点是输出未归一化，残差路径上的激活值可能随深度增长，需要额外的最终 LayerNorm，且在相同层数下最终性能可能略低于调优良好的 Post-LN。
+
+&emsp;&emsp;从维度视角看，Pre-LN 让残差路径保持干净，相当于在特征维上保留了一条无归一化的信息高速公路。归一化只作用于子层的输入，不干扰恒等路径。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Pre-LN 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class PreLNBlock(nn.Module):
+    def __init__(self, d_model, d_ff, eps=1e-6):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        self.ln1_gamma = nn.Parameter(torch.ones(d_model))
+        self.ln1_beta = nn.Parameter(torch.zeros(d_model))
+        self.ln2_gamma = nn.Parameter(torch.ones(d_model))
+        self.ln2_beta = nn.Parameter(torch.zeros(d_model))
+        self.eps = eps
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def _ln(self, x, gamma, beta):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + self.eps) * gamma + beta
+
+    def forward(self, x, attn_fn):
+        # Pre-LN: x + F(LayerNorm(x))
+        norm_x = self._ln(x, self.ln1_gamma, self.ln1_beta)
+        x = x + attn_fn(norm_x)
+
+        norm_x = self._ln(x, self.ln2_gamma, self.ln2_beta)
+        ffn_out = torch.matmul(
+            torch.relu(torch.matmul(norm_x, self.W_1) + self.b_1),
+            self.W_2
+        ) + self.b_2
+        x = x + ffn_out
+        return x
+```
+
+&emsp;&emsp;这个实现中，LayerNorm 在子层输入前应用，残差路径保持恒等。若输入形状为 $(B,L,d_{model})$，输出形状相同。实际使用中通常在所有层之后再加一个最终 LayerNorm。
+
+---
 
 #### 2.4.4 RMSNorm
 
-&emsp;&emsp;RMSNorm 只对激活值的均方根进行缩放，省略了均值中心化操作。这一简化的代价极低，但在训练稳定性和计算效率上都有所提升。LLaMA 将 LayerNorm 替换为 RMSNorm，并沿用了 Pre-Norm 结构。Qwen3 的密集模型也包含带预归一化的 RMSNorm。
+&emsp;&emsp;RMSNorm（Root Mean Square Layer Normalization）由 Zhang 和 Sennrich 于 2019 年提出，是 LayerNorm 的简化版本。它去掉了均值中心化，只保留方差归一化，即用均方根（RMS）替代标准差。设输入为 $x \in \mathbb{R}^{d}$，RMSNorm 的计算为：
+
+$$
+\mathrm{RMS}(x) = \sqrt{\frac{1}{d}\sum_{i=1}^{d} x_i^2 + \epsilon}
+$$
+
+$$
+y_i = \frac{x_i}{\mathrm{RMS}(x)} \cdot \gamma_i
+$$
+
+&emsp;&emsp;与 LayerNorm 的区别有两点：RMSNorm 不减去均值，因此不需要计算均值；RMSNorm 只保留缩放参数 $\gamma$，去掉了偏移参数 $\beta$。这两个简化使 RMSNorm 的计算量比 LayerNorm 少约 10% 到 15%，在大模型中归一化层的开销不可忽略，因此这一节省相当可观。
+
+&emsp;&emsp;RMSNorm 的理论依据是：LayerNorm 的有效性主要来自方差归一化（缩放不变性），而非均值中心化（平移不变性）。实验表明，去掉均值中心化后模型性能几乎不变，但训练速度更快。RMSNorm 已被 LLaMA、Qwen、DeepSeek、Mistral 等主流大模型广泛采用。
+
+&emsp;&emsp;RMSNorm 的优点是计算更简单、更快，参数更少，且在大模型上性能与 LayerNorm 相当甚至更好；缺点是不做均值中心化，在某些对特征均值敏感的任务中可能损失部分表达能力，且去掉了偏移参数 $\beta$，灵活度略低于 LayerNorm。
+
+&emsp;&emsp;从维度视角看，RMSNorm 在特征维上只对幅度做归一化，不改变特征的方向。它保留了特征向量在特征空间中的方向信息，只将其缩放到单位均方根尺度，再通过 $\gamma$ 做逐维缩放。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 RMSNorm 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class RMSNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__()
+        self.d_model = d_model
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        # x: (..., d_model)
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x / rms * self.gamma
+```
+
+&emsp;&emsp;这个实现中，只计算均方根，不做均值中心化，也不使用偏移参数。若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.4.5 GroupNorm
 
-&emsp;&emsp;GroupNorm 在 DDPM 的 UNet 中替代 BatchNorm。因为在去噪采样时，Batch Size 通常很小甚至为 1，BatchNorm 在这种情况下极不稳定，而 GroupNorm 的表现非常鲁棒。Stable Diffusion 的 UNet 中，每个层级包含两个 ResNet 块，结构为 Conv → GroupNorm → SiLU → Conv。
+&emsp;&emsp;组归一化（Group Normalization, GroupNorm）由 Wu 和 He 于 2018 年提出，最初用于计算机视觉，后来被引入 Transformer 的变体中。GroupNorm 将特征维划分为 $G$ 个组，在每个组内独立计算均值和方差进行归一化。设输入为 $x \in \mathbb{R}^{d}$，将其划分为 $G$ 组，每组维度为 $d/G$，对第 $g$ 组：
+
+$$
+\mu_g = \frac{1}{d/G}\sum_{i \in \mathcal{G}_g} x_i, \quad \sigma_g^2 = \frac{1}{d/G}\sum_{i \in \mathcal{G}_g}(x_i - \mu_g)^2
+$$
+
+$$
+y_i = \frac{x_i - \mu_g}{\sqrt{\sigma_g^2 + \epsilon}} \cdot \gamma_i + \beta_i, \quad i \in \mathcal{G}_g
+$$
+
+&emsp;&emsp;GroupNorm 是 LayerNorm 和 InstanceNorm 的推广：当 $G=1$ 时退化为 LayerNorm，当 $G=d$ 时退化为 InstanceNorm。GroupNorm 的设计动机是在 batch size 很小时仍能稳定训练，因为它的统计量不依赖 batch 维度。
+
+&emsp;&emsp;在 Transformer 中，GroupNorm 主要用于一些对归一化粒度有特殊需求的结构，如 QK-Norm 中的分组归一化、部分视觉 Transformer 的混合架构。标准大语言模型仍以 LayerNorm 和 RMSNorm 为主，GroupNorm 使用较少。
+
+&emsp;&emsp;GroupNorm 的优点是统计量不依赖 batch size，在小 batch 下稳定，且分组归一化可以捕捉特征维内的局部统计结构，比 LayerNorm 更灵活；缺点是引入了分组数 $G$ 这一超参数，需要手动选择，且分组归一化破坏了特征维的全局统计一致性，在某些任务中可能不如 LayerNorm。
+
+&emsp;&emsp;从维度视角看，GroupNorm 在特征维上做了分块归一化，每个子空间独立计算统计量。这相当于在特征维上引入了分组结构，使不同特征组可以有不同的归一化尺度。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 GroupNorm 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class GroupNorm(nn.Module):
+    def __init__(self, d_model, num_groups, eps=1e-6):
+        super().__init__()
+        assert d_model % num_groups == 0
+        self.d_model = d_model
+        self.num_groups = num_groups
+        self.group_size = d_model // num_groups
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(d_model))
+        self.beta = nn.Parameter(torch.zeros(d_model))
+
+    def forward(self, x):
+        # x: (..., d_model)
+        shape = x.shape
+        # 重塑为 (..., num_groups, group_size)
+        x_grouped = x.view(*shape[:-1], self.num_groups, self.group_size)
+
+        mean = x_grouped.mean(dim=-1, keepdim=True)
+        var = x_grouped.var(dim=-1, keepdim=True, unbiased=False)
+        x_norm = (x_grouped - mean) / torch.sqrt(var + self.eps)
+
+        # 恢复原始形状
+        x_norm = x_norm.view(*shape)
+        return x_norm * self.gamma + self.beta
+```
+
+&emsp;&emsp;这个实现中，特征维被划分为 `num_groups` 组，每组独立计算均值和方差。若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.4.6 QK-Norm
 
-&emsp;&emsp;Qwen3 在注意力机制中引入 QK-Norm，以确保训练稳定性。Qwen3 还移除了 Qwen2 中使用的 QKV-bias。QK-Norm 对 Query 和 Key 进行归一化，防止注意力 logit 在训练过程中过大，提升大规模训练的稳定性。
+&emsp;&emsp;QK-Norm（Query-Key Normalization）是对注意力中的 Query 和 Key 分别做归一化的技术，用于稳定注意力 logits 的数值范围，防止训练发散。标准注意力中，注意力分数为 $QK^\top / \sqrt{d_k}$，当 $Q$ 和 $K$ 的范数较大时，分数可能变得极大或极小，导致 Softmax 饱和、梯度消失。QK-Norm 在计算注意力分数之前，对 $Q$ 和 $K$ 分别做 LayerNorm 或 RMSNorm：
+
+$$
+\hat{Q} = \mathrm{Norm}(Q), \quad \hat{K} = \mathrm{Norm}(K)
+$$
+
+$$
+\mathrm{scores} = \frac{\hat{Q}\hat{K}^\top}{\sqrt{d_k}}
+$$
+
+&emsp;&emsp;QK-Norm 最早在 Vision Transformer 的变体中被提出，后来被 ViT-22B、Stable Diffusion 3、Gemma 2 等模型采用。在 Gemma 2 中，QK-Norm 使用 RMSNorm 对每个注意力头的 Query 和 Key 做归一化，有效防止了注意力 logits 在训练中爆炸。QK-Norm 与 Pre-LN 配合使用时效果最好，因为 Pre-LN 的残差路径上激活值会累积增长，QK-Norm 可以在注意力计算前将这些激活值重新标准化。
+
+&emsp;&emsp;QK-Norm 的优点是显著提升训练稳定性，允许使用更大的学习率，防止注意力 logits 爆炸，对深层模型尤其有效；缺点是增加了额外的归一化计算，略微增加推理延迟，且归一化后的 Query 和 Key 损失了部分幅度信息，可能影响注意力的锐度。
+
+&emsp;&emsp;从维度视角看，QK-Norm 在注意力计算前对 Query 和 Key 的特征维做归一化，使关系矩阵的数值范围不依赖于输入的幅度。这相当于在 token 维扩散之前对查询和键做了一次特征维的尺度校准。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 QK-Norm 注意力的裸实现，使用 RMSNorm 对 Q 和 K 归一化：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class QKNormAttention(nn.Module):
+    def __init__(self, d_model, num_heads, eps=1e-6):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.eps = eps
+
+        self.W_q = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_k = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(d_model, d_model))
+        self.W_o = nn.Parameter(torch.empty(d_model, d_model))
+
+        # QK-Norm: 对每个头维度做 RMSNorm
+        self.q_gamma = nn.Parameter(torch.ones(self.d_k))
+        self.k_gamma = nn.Parameter(torch.ones(self.d_k))
+
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o):
+            nn.init.xavier_uniform_(w)
+
+    def _rms_norm(self, x, gamma):
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x / rms * gamma
+
+    def forward(self, x, causal=True):
+        B, L, _ = x.size()
+
+        Q = torch.matmul(x, self.W_q).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        K = torch.matmul(x, self.W_k).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+        V = torch.matmul(x, self.W_v).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+        # 对 Q 和 K 做 RMSNorm
+        Q = self._rms_norm(Q, self.q_gamma)
+        K = self._rms_norm(K, self.k_gamma)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+
+        if causal:
+            mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
+            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1)
+        head_out = torch.matmul(attn, V)
+
+        head_out = head_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        return torch.matmul(head_out, self.W_o), attn
+```
+
+&emsp;&emsp;这个实现中，Query 和 Key 在计算注意力分数前分别经过 RMSNorm。若输入形状为 $(B,L,d_{model})$，输出形状相同，`attn` 形状为 $(B,h,L,L)$。
 
 ---
 
