@@ -3499,27 +3499,254 @@ class QKNormAttention(nn.Module):
 
 #### 2.5.1 ReLU
 
-&emsp;&emsp;原始 Transformer 的 FFN 使用 ReLU：$\text{FFN}(x) = \max(0, xW_1 + b_1)W_2 + b_2$。T5 使用 ReLU 而非 GELU，虽然 T5 1.1 版本后来改用了 GeGLU。
+&emsp;&emsp;ReLU（Rectified Linear Unit）是最经典的激活函数之一，定义为：
+
+$$
+\mathrm{ReLU}(x) = \max(0, x)
+$$
+
+&emsp;&emsp;它保留正区间的线性响应，将负区间置零。在 Transformer 的前馈网络中，ReLU 曾是原始架构的默认选择。ReLU 的优点是计算极其简单，仅需一次比较和置零，正区间梯度恒为 1，能有效缓解梯度消失，且负区间输出为零，带来稀疏激活；缺点是负区间梯度为零，若某神经元的输入长期为负，其权重将无法更新，导致“神经元死亡”，且输出不是零中心的，可能影响优化稳定性。
+
+&emsp;&emsp;从维度视角看，ReLU 在特征维上对每个元素独立施加非线性，将负值截断为零。它不改变 token 维扩散的结构，只在前馈网络的中间层引入稀疏性和非线性变换。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 ReLU 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class ReLU(nn.Module):
+    def forward(self, x):
+        return torch.maximum(x, torch.zeros_like(x))
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d_{ff})$，输出形状相同。
+
+---
 
 #### 2.5.2 GELU
 
-&emsp;&emsp;GPT-2 的前馈网络使用 GELU 激活函数。Gopher 使用 GeLU 激活函数和 SentencePiece 分词器。GELU 是 ReLU 的平滑近似，在 Transformer 中被广泛使用。
+&emsp;&emsp;GELU（Gaussian Error Linear Unit）由 Hendrycks 和 Gimpel 于 2016 年提出，定义为：
+
+$$
+\mathrm{GELU}(x) = x \cdot \Phi(x)
+$$
+
+&emsp;&emsp;其中 $\Phi(x)$ 是标准正态分布的累积分布函数。实际计算中常用 tanh 近似：
+
+$$
+\mathrm{GELU}(x) \approx 0.5x\left(1 + \tanh\left(\sqrt{\frac{2}{\pi}}\left(x + 0.044715x^3\right)\right)\right)
+$$
+
+&emsp;&emsp;GELU 可以理解为对输入进行随机正则化的期望：以输入值的大小决定保留概率。它平滑、非单调，在负区间有微小负值，在 Transformer（如 BERT、GPT）中广泛使用。GELU 的优点是平滑可导，负区间梯度不为零，缓解了神经元死亡，在自然语言处理任务中通常优于 ReLU；缺点是计算涉及 tanh 或 erf，比 ReLU 慢，且没有 ReLU 那样的严格稀疏性。
+
+&emsp;&emsp;从维度视角看，GELU 在特征维上提供了一种平滑的门控：正区近似线性，负区平滑衰减到零。它比 ReLU 更平滑，使前馈网络的非线性变换更稳定。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 GELU 的 tanh 近似裸实现：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class GELU(nn.Module):
+    def forward(self, x):
+        c = math.sqrt(2.0 / math.pi)
+        return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * x ** 3)))
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d_{ff})$，输出形状相同。
+
+---
 
 #### 2.5.3 SwiGLU
 
-&emsp;&emsp;SwiGLU（Swish-Gated Linear Unit）是一种门控线性单元，通过两个并行的线性投影（一个内容投影和一个门控投影）进行逐元素相乘，再投影回模型维度。SwiGLU 使用三个投影矩阵而非两个，在同等参数量下提供了更强的表达能力。为了避免门控路径导致参数量膨胀，LLaMA 将 FFN 的中间维度调整为原始的 2/3。LLaMA 1/2/3、Mistral、Qwen、DeepSeek 等模型均采用 SwiGLU。
+&emsp;&emsp;SwiGLU 是 GLU（Gated Linear Unit）的变体，使用 Swish 作为门控激活。Swish 定义为：
+
+$$
+\mathrm{Swish}(x) = x \cdot \sigma(x)
+$$
+
+&emsp;&emsp;其中 $\sigma$ 是 Sigmoid。SwiGLU 的前馈计算为：
+
+$$
+\mathrm{SwiGLU}(x) = \mathrm{Swish}(xW_1) \odot (xW_2)
+$$
+
+&emsp;&emsp;然后经过输出投影 $W_3$。与标准 FFN 的两层结构不同，SwiGLU 有三个权重矩阵：$W_1$ 和 $W_2$ 将输入投影到中间维度，逐元素相乘后由 $W_3$ 投影回原维度。LLaMA、Qwen、DeepSeek 等主流大模型均采用 SwiGLU。SwiGLU 的优点是门控机制使网络能动态调节信息流，性能通常优于 ReLU 和 GELU，且平滑可导；缺点是参数量比标准 FFN 多约 50%（三个矩阵而非两个），计算量也相应增加。
+
+&emsp;&emsp;从维度视角看，SwiGLU 在特征维上引入了一个乘性门控：一个分支用 Swish 产生门控信号，另一个分支提供内容，两者逐元素相乘。这相当于在特征维上做了一次数据依赖的软选择。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 SwiGLU 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.W_3 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.b_2 = nn.Parameter(torch.zeros(d_ff))
+        self.b_3 = nn.Parameter(torch.zeros(d_model))
+        for w in (self.W_1, self.W_2, self.W_3):
+            nn.init.xavier_uniform_(w)
+
+    def forward(self, x):
+        # Swish(xW1) = xW1 * sigmoid(xW1)
+        gate = torch.matmul(x, self.W_1) + self.b_1
+        gate = gate * torch.sigmoid(gate)
+        content = torch.matmul(x, self.W_2) + self.b_2
+        hidden = gate * content
+        return torch.matmul(hidden, self.W_3) + self.b_3
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d_{model})$，输出形状为 $(B,L,d_{model})$。
+
+---
 
 #### 2.5.4 GeGLU
 
-&emsp;&emsp;GeGLU 是 GELU 的门控变体，与 SwiGLU 类似，但使用 GELU 作为门控激活函数。T5 1.1 版本使用了 GeGLU。
+&emsp;&emsp;GeGLU 与 SwiGLU 结构相同，但使用 GELU 作为门控激活：
+
+$$
+\mathrm{GeGLU}(x) = \mathrm{GELU}(xW_1) \odot (xW_2)
+$$
+
+&emsp;&emsp;然后经过 $W_3$ 投影。GeGLU 在 Gemma、PaLM 等模型中使用。与 SwiGLU 相比，GeGLU 的门控信号更平滑，负区间有微小负值，可能在某些任务中提供更细腻的门控。GeGLU 的优点是性能与 SwiGLU 相当，平滑门控有利于优化，在部分模型上表现略优；缺点是 GELU 计算比 Swish 稍复杂，整体参数量和计算量与 SwiGLU 相同。
+
+&emsp;&emsp;从维度视角看，GeGLU 与 SwiGLU 一样，在特征维上做乘性门控，区别仅在于门控函数从 Swish 换成了 GELU。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 GeGLU 的裸实现：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class GeGLU(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.W_3 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.b_2 = nn.Parameter(torch.zeros(d_ff))
+        self.b_3 = nn.Parameter(torch.zeros(d_model))
+        for w in (self.W_1, self.W_2, self.W_3):
+            nn.init.xavier_uniform_(w)
+
+    def _gelu(self, x):
+        c = math.sqrt(2.0 / math.pi)
+        return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * x ** 3)))
+
+    def forward(self, x):
+        gate = self._gelu(torch.matmul(x, self.W_1) + self.b_1)
+        content = torch.matmul(x, self.W_2) + self.b_2
+        hidden = gate * content
+        return torch.matmul(hidden, self.W_3) + self.b_3
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d_{model})$，输出形状为 $(B,L,d_{model})$。
+
+---
 
 #### 2.5.5 SiTU-GLU
 
-&emsp;&emsp;Kimi K3 的 Stable LatentMoE 使用 SiTU-GLU 与 Quantile Balancing 保持极高稀疏度下的训练稳定。
+&emsp;&emsp;SiTU（Sigmoid Tanh Unit）是一种平滑激活函数，定义为：
+
+$$
+\mathrm{SiTU}(x) = x \cdot \tanh(\mathrm{softplus}(x))
+$$
+
+&emsp;&emsp;其中 $\mathrm{softplus}(x) = \ln(1+e^x)$。SiTU 在负区间平滑衰减到零，在正区间近似线性，兼具 ReLU 的稀疏性和 GELU 的平滑性。SiTU-GLU 将 SiTU 作为门控激活：
+
+$$
+\mathrm{SiTU\text{-}GLU}(x) = \mathrm{SiTU}(xW_1) \odot (xW_2)
+$$
+
+&emsp;&emsp;然后经过 $W_3$ 投影。SiTU-GLU 的优点是门控函数平滑且非单调，负区间梯度稳定，训练稳定性好，在部分大模型中表现出与 SwiGLU 相当或更优的性能；缺点是 tanh 和 softplus 的复合计算比 Swish 和 GELU 稍复杂，推理延迟略高。
+
+&emsp;&emsp;从维度视角看，SiTU-GLU 在特征维上提供了更平滑的门控曲线，使门控信号在负区平滑趋近于零，正区平滑趋近于恒等，介于 ReLU 的硬门控和 Swish 的软门控之间。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 SiTU-GLU 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class SiTU_GLU(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.W_3 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.b_2 = nn.Parameter(torch.zeros(d_ff))
+        self.b_3 = nn.Parameter(torch.zeros(d_model))
+        for w in (self.W_1, self.W_2, self.W_3):
+            nn.init.xavier_uniform_(w)
+
+    def _softplus(self, x):
+        # 数值稳定的 softplus: max(x,0) + log1p(exp(-|x|))
+        return torch.maximum(x, torch.zeros_like(x)) + torch.log1p(torch.exp(-torch.abs(x)))
+
+    def _situ(self, x):
+        return x * torch.tanh(self._softplus(x))
+
+    def forward(self, x):
+        gate = self._situ(torch.matmul(x, self.W_1) + self.b_1)
+        content = torch.matmul(x, self.W_2) + self.b_2
+        hidden = gate * content
+        return torch.matmul(hidden, self.W_3) + self.b_3
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d_{model})$，输出形状为 $(B,L,d_{model})$。
+
+---
 
 #### 2.5.6 Sqrt(Softplus(·))
 
-&emsp;&emsp;DeepSeek-V4 的 MoE 部分将 affinity score 的激活函数从 Sigmoid 换成 Sqrt(Softplus(·))，去掉了 routing target nodes 的数量约束。
+&emsp;&emsp;Sqrt(Softplus) 是一种非负、平滑的激活函数，定义为：
+
+$$
+\mathrm{SqrtSoftplus}(x) = \sqrt{\mathrm{softplus}(x)} = \sqrt{\ln(1+e^x)}
+$$
+
+&emsp;&emsp;它的输出恒为正，且随 $x$ 增大而缓慢增长（近似 $\sqrt{x}$），随 $x$ 减小而平滑趋近于零。Sqrt(Softplus) 在部分 MoE 路由器和注意力门控中被用作替代 Sigmoid 或 Softmax 的平滑非负函数。Sqrt(Softplus) 的优点是输出非负，适合作为门控或权重生成函数，平滑可导，梯度稳定，且平方根使输出增长比 Softplus 更平缓，避免数值过大；缺点是输出不是零中心，且计算涉及 exp 和 log，比 Sigmoid 稍慢。
+
+&emsp;&emsp;从维度视角看，Sqrt(Softplus) 在特征维上将任意实数映射到正区间，可作为乘性门控的权重生成器。它不改变 token 维扩散的结构，而是在前馈或路由路径中提供平滑的非负门控信号。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Sqrt(Softplus) 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class SqrtSoftplus(nn.Module):
+    def forward(self, x):
+        # 数值稳定的 softplus
+        softplus = torch.maximum(x, torch.zeros_like(x)) + torch.log1p(torch.exp(-torch.abs(x)))
+        return torch.sqrt(softplus)
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d)$，输出形状相同，且所有输出非负。
+
 
 ---
 
@@ -3527,61 +3754,918 @@ class QKNormAttention(nn.Module):
 
 #### 2.6.1 前馈网络（FFN）
 
-&emsp;&emsp;前馈网络是一个两层 MLP，对每个位置独立应用：
+&emsp;&emsp;前馈网络（Feed-Forward Network, FFN）是 Transformer 中每个子层之后的标准组件，对每个位置独立进行特征维变换。原始 Transformer 的 FFN 由两层线性变换和一个激活函数组成：
 
 $$
-\text{FFN}(x) = \max(0, xW_1 + b_1)W_2 + b_2
+\mathrm{FFN}(x) = W_2 \cdot \sigma(W_1 x + b_1) + b_2
 $$
 
-&emsp;&emsp;中间维度通常为 $d_{\text{model}}$ 的 4 倍。FFN 为模型提供了非线性变换能力，是 Transformer 中参数量最大的部分之一。
+&emsp;&emsp;其中 $W_1 \in \mathbb{R}^{d_{ff} \times d_{model}}$，$W_2 \in \mathbb{R}^{d_{model} \times d_{ff}}$，中间维度 $d_{ff}$ 通常取 $4 d_{model}$。$\sigma$ 可以是 ReLU、GELU 或 SwiGLU 等激活函数。FFN 对序列中每个 token 独立作用，不混合 token 维信息，因此与注意力层互补：注意力负责 token 间信息交换，FFN 负责特征维的非线性变换和容量扩展。
+
+&emsp;&emsp;FFN 的优点是结构简单、并行度高，通过升维-非线性-降维的方式显著增加模型表达能力，且逐位置独立计算，不依赖序列长度；缺点是参数量和计算量较大，通常占 Transformer 总参数的三分之二左右，中间维度 $d_{ff}$ 的选择需要权衡容量和效率。
+
+&emsp;&emsp;从维度视角看，FFN 在特征维上先升维到高维空间，施加非线性后再降回原维度，相当于在特征维上做了一次非线性特征变换。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 FFN 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class FFN(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def forward(self, x):
+        hidden = torch.relu(torch.matmul(x, self.W_1) + self.b_1)
+        return torch.matmul(hidden, self.W_2) + self.b_2
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d_{model})$，输出形状为 $(B,L,d_{model})$。
+
+---
 
 #### 2.6.2 混合专家（MoE）
 
-&emsp;&emsp;MoE 将 Transformer 块中的前馈网络替换为 MoE 层，每个 MoE 层包含多个独立的“专家”，每个专家本身是一个标准的 FFN。对于每一个输入 token，一个路由网络从专家中选择部分来激活，并将这些专家的输出加权求和作为最终输出。MoE 的核心价值在于解耦模型容量与推理成本：用巨大的总参数量承载知识，用极小的激活参数量控制计算开销。
+&emsp;&emsp;混合专家（Mixture of Experts, MoE）将 Transformer 中的 FFN 替换为多个并行的专家网络，每个专家本质上是一个小型 FFN。对于每个输入 token，路由器计算其与各专家的匹配分数，并据此对专家输出进行加权求和：
+
+$$
+\mathrm{MoE}(x) = \sum_{i=1}^{N} g_i(x) \cdot \mathrm{FFN}_i(x)
+$$
+
+&emsp;&emsp;其中 $N$ 是专家总数，$g_i(x)$ 是路由器分配给第 $i$ 个专家的权重，通常满足 $\sum_i g_i = 1$。与稠密 FFN 相比，MoE 的参数量可以随专家数线性增长，但每个 token 只激活部分专家，因此计算量远小于同等参数量的稠密模型。
+
+&emsp;&emsp;MoE 的优点是参数量与计算量解耦，可以用较低的计算成本获得极大的模型容量，适合大规模预训练；缺点是路由机制可能导致负载不均衡，部分专家过载而其他专家训练不足，且专家分布在多 GPU 上时 token 分发和聚合会带来通信开销。
+
+&emsp;&emsp;从维度视角看，MoE 在特征维上实现了条件计算：每个 token 根据自身特征被路由到不同的专家子网络，相当于在特征维上按内容动态选择变换路径。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 MoE 的裸实现，包含路由器和多个专家：
+
+```python
+import torch
+import torch.nn as nn
+
+class Expert(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def forward(self, x):
+        return torch.matmul(
+            torch.relu(torch.matmul(x, self.W_1) + self.b_1),
+            self.W_2
+        ) + self.b_2
+
+
+class MoE(nn.Module):
+    def __init__(self, d_model, d_ff, num_experts):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
+        self.router = nn.Parameter(torch.empty(num_experts, d_model))
+        nn.init.normal_(self.router, std=0.02)
+
+    def forward(self, x):
+        B, L, D = x.size()
+        x_flat = x.view(B * L, D)
+
+        # 路由器打分并归一化
+        scores = torch.matmul(x_flat, self.router.T)  # (B*L, num_experts)
+        gates = torch.softmax(scores, dim=-1)
+
+        # 加权求和所有专家
+        out = torch.zeros_like(x_flat)
+        for i, expert in enumerate(self.experts):
+            out += gates[:, i:i+1] * expert(x_flat)
+
+        return out.view(B, L, D)
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.6.3 稀疏混合专家（SMoE）
 
-&emsp;&emsp;SMoE 是 MoE 的稀疏激活版本。Mixtral 8x7B 是第一个在工程上成功落地、性能可与顶级稠密模型竞争、且完全开源的 MoE 语言模型。它总参数量 46.7B，每个 token 仅激活 13B 参数，推理成本与 13B 稠密模型相当，性能却在大多数基准上超越了 Llama 2 70B 和 GPT-3.5。
+&emsp;&emsp;稀疏混合专家（Sparse Mixture of Experts, SMoE）是 MoE 的稀疏激活版本。在标准 MoE 中，所有专家都会对每个 token 计算并加权，计算量仍然很大。SMoE 只保留路由器分数最高的 $k$ 个专家，其余专家的输出直接置零：
+
+$$
+g_i(x) = \begin{cases}
+s_i(x) & s_i(x) \in \mathrm{TopK}(\{s_j(x)\}, k) \\
+0 & \text{otherwise}
+\end{cases}
+$$
+
+&emsp;&emsp;其中 $s_i(x)$ 是路由器对第 $i$ 个专家的原始分数。通常 $k$ 取 1 或 2。SMoE 使每个 token 只经过极少数专家，计算量从 $O(N)$ 降到 $O(k)$，同时参数量仍为 $O(N)$，因此可以用极低的计算成本获得巨大的模型容量。Switch Transformer、GShard、DeepSeekMoE 等都采用 SMoE。
+
+&emsp;&emsp;SMoE 的优点是计算效率极高，参数量与计算量解耦，适合万亿级参数模型；缺点是 Top-k 选择不可导，通常需要用直通估计器或强化学习来训练路由器，且负载不均衡问题更严重，需要辅助损失或偏置调整来维持专家利用率。
+
+&emsp;&emsp;从维度视角看，SMoE 在特征维上做了稀疏门控：每个 token 只激活少数专家，其余专家的计算完全跳过。这相当于在特征维上实现了高度条件化的稀疏变换。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Top-1 SMoE 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class Expert(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def forward(self, x):
+        return torch.matmul(
+            torch.relu(torch.matmul(x, self.W_1) + self.b_1),
+            self.W_2
+        ) + self.b_2
+
+
+class SparseMoE(nn.Module):
+    def __init__(self, d_model, d_ff, num_experts, top_k=1):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
+        self.router = nn.Parameter(torch.empty(num_experts, d_model))
+        nn.init.normal_(self.router, std=0.02)
+
+    def forward(self, x):
+        B, L, D = x.size()
+        x_flat = x.view(B * L, D)
+
+        scores = torch.matmul(x_flat, self.router.T)  # (B*L, num_experts)
+        topk_scores, topk_indices = scores.topk(self.top_k, dim=-1)
+        topk_gates = torch.softmax(topk_scores, dim=-1)
+
+        out = torch.zeros_like(x_flat)
+        for k in range(self.top_k):
+            idx = topk_indices[:, k]
+            gate = topk_gates[:, k].unsqueeze(-1)
+            for e in range(self.num_experts):
+                mask = (idx == e)
+                if mask.any():
+                    out[mask] += gate[mask] * self.experts[e](x_flat[mask])
+
+        return out.view(B, L, D)
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.6.4 专家
 
-&emsp;&emsp;每个专家是一个独立的 FFN。DeepSeekMoE 采用细粒度专家和共享专家的组合策略。每个 token 被路由到多个小型专家，而非少数大型专家。部分专家被设为“共享专家”，所有 token 都必须经过这些专家处理，确保基础能力的稳定传递。Llama 4 的 MoE 层采用共享专家 + 路由专家的混合设计：Scout 配置 1 个共享专家和 16 个路由专家，Maverick 配置 1 个共享专家和 128 个路由专家。
+&emsp;&emsp;专家（Expert）是 MoE 架构中的基本计算单元，本质上是一个小型前馈网络。每个专家通常由两层线性变换和一个激活函数组成：
+
+$$
+\mathrm{Expert}_i(x) = W_2^{(i)} \cdot \sigma(W_1^{(i)} x + b_1^{(i)}) + b_2^{(i)}
+$$
+
+&emsp;&emsp;与标准 FFN 的区别在于，专家的中间维度通常更小，因为 MoE 层会包含大量专家，总参数量需要控制。例如 DeepSeekMoE 将每个专家拆分为更细粒度的专家，中间维度仅为标准 FFN 的几分之一。专家之间不共享参数，各自学习不同的特征变换模式。
+
+&emsp;&emsp;专家的优点是专业化：不同专家可以在训练中分化出不同的功能，有的处理语法，有的处理语义，有的处理特定领域知识；缺点是单个专家的训练数据较少，如果路由不当，部分专家可能得不到充分训练，导致专家冗余或坍缩。
+
+&emsp;&emsp;从维度视角看，每个专家在特征维上执行一次独立的升维-非线性-降维变换。多个专家并行存在，路由器根据 token 内容选择使用哪些专家的变换结果。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出单个专家的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class Expert(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def forward(self, x):
+        hidden = torch.relu(torch.matmul(x, self.W_1) + self.b_1)
+        return torch.matmul(hidden, self.W_2) + self.b_2
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d_{model})$，输出形状为 $(B,L,d_{model})$。
+
+---
 
 #### 2.6.5 路由网络
 
-&emsp;&emsp;Router 是一个可学习的线性层，输入是 token 的隐藏状态，输出是专家的概率分布。Router 的选择是 token 级别的，而非序列级别的——同一个序列中的不同 token 可以被路由到不同的专家。Mixtral 使用 top-2 选择机制，Llama 4 使用 Top-1 选择，DeepSeek-V3 使用细粒度专家和共享专家，Kimi K3 每个 token 从 896 个路由专家中激活 16 个。
+&emsp;&emsp;路由网络（Router Network）是 MoE 中决定每个 token 分配给哪些专家的模块。它通常是一个简单的线性层，将 token 的隐藏状态映射到专家数量维度的分数向量，再经过 Softmax 得到归一化的门控权重：
+
+$$
+s(x) = W_r x, \quad g(x) = \mathrm{softmax}(s(x))
+$$
+
+&emsp;&emsp;其中 $W_r \in \mathbb{R}^{N \times d_{model}}$ 是路由器的可学习参数，$N$ 是专家总数。路由器与专家一起端到端训练，通过反向传播学习如何根据 token 内容分配专家。为了避免负载不均衡，通常会引入辅助损失或偏置调整机制。
+
+&emsp;&emsp;路由网络的优点是结构简单、计算量小，仅为一个线性层加 Softmax，可以轻松集成到 Transformer 中；缺点是路由决策是离散的，Top-k 选择不可导，需要用直通估计器或 Gumbel-Softmax 等技巧，且路由器容易陷入局部最优，导致部分专家被过度使用。
+
+&emsp;&emsp;从维度视角看，路由网络在特征维上计算 token 与专家的匹配分数，相当于在特征维上做了一次相似度匹配，然后根据匹配结果选择专家子网络。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出路由网络的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class Router(nn.Module):
+    def __init__(self, d_model, num_experts):
+        super().__init__()
+        self.num_experts = num_experts
+        self.W_r = nn.Parameter(torch.empty(num_experts, d_model))
+        nn.init.normal_(self.W_r, std=0.02)
+
+    def forward(self, x):
+        # x: (B, L, d_model)
+        scores = torch.matmul(x, self.W_r.T)  # (B, L, num_experts)
+        gates = torch.softmax(scores, dim=-1)
+        return gates, scores
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d_{model})$，`gates` 形状为 $(B,L,N)$，`scores` 形状相同。
+
+---
 
 #### 2.6.6 Top-k 路由
 
-&emsp;&emsp;Top-k 路由选择概率最高的 k 个专家。Mixtral 使用 Top-2，Llama 4 使用 Top-1，Qwen3-235B-A22B 每个 token 激活 8 个专家，Kimi K3 激活 16 个。Top-1 路由的优势在于计算效率：每个 token 只触发一个路由专家的前向传播，进一步降低了推理计算量。
+&emsp;&emsp;Top-k 路由是稀疏 MoE 中最常用的路由策略。路由器先计算所有专家的分数，然后只保留分数最高的 $k$ 个专家，其余专家的门控权重置零：
+
+$$
+\mathrm{TopK}(s, k)_i = \begin{cases}
+s_i & s_i \in \mathrm{TopK}(\{s_j\}, k) \\
+-\infty & \text{otherwise}
+\end{cases}
+$$
+
+$$
+g(x) = \mathrm{softmax}(\mathrm{TopK}(s(x), k))
+$$
+
+&emsp;&emsp;通常 $k$ 取 1 或 2。Top-1 路由计算最省，但负载不均衡风险最高；Top-2 路由允许 token 同时使用两个专家，通常能提升模型质量，但计算量翻倍。Switch Transformer 使用 Top-1，GShard 和 DeepSeekMoE 使用 Top-2 或更细粒度的 Top-k。
+
+&emsp;&emsp;Top-k 路由的优点是计算量固定为 $O(k)$，与专家总数无关，适合大规模稀疏模型；缺点是 Top-k 操作不可导，路由器无法直接通过梯度学习，通常需要对选中的门控值做 Softmax 后回传梯度，且负载不均衡问题需要通过辅助损失或专家偏置来缓解。
+
+&emsp;&emsp;从维度视角看，Top-k 路由在特征维上执行了稀疏选择：每个 token 只激活少数几个专家，其余专家的变换被完全跳过，实现了条件计算。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Top-k 路由的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class TopKRouter(nn.Module):
+    def __init__(self, d_model, num_experts, top_k):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.W_r = nn.Parameter(torch.empty(num_experts, d_model))
+        nn.init.normal_(self.W_r, std=0.02)
+
+    def forward(self, x):
+        # x: (B, L, d_model)
+        scores = torch.matmul(x, self.W_r.T)  # (B, L, num_experts)
+        topk_scores, topk_indices = scores.topk(self.top_k, dim=-1)  # (B, L, k)
+        topk_gates = torch.softmax(topk_scores, dim=-1)  # (B, L, k)
+        return topk_gates, topk_indices
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d_{model})$，`topk_gates` 形状为 $(B,L,k)$，`topk_indices` 形状相同。
+
+---
 
 #### 2.6.7 共享专家
 
-&emsp;&emsp;共享专家是所有 token 都必须经过的专家，确保基础能力的稳定传递。DeepSeekMoE 采用共享专家，Llama 4 也配置了 1 个共享专家。Qwen3-MoE 则舍弃了共享专家模块，并采用全局批次负载均衡损失技术促进专家专业化。
+&emsp;&emsp;共享专家（Shared Expert）是 DeepSeekMoE 引入的一种专家设计，指所有 token 都固定分配到的专家，不经过路由器选择。共享专家与路由专家并行存在，其输出直接加到最终结果中：
+
+$$
+h = \sum_{i=1}^{K_s} \mathrm{Expert}_i(x) + \sum_{j=K_s+1}^{N} g_j(x) \cdot \mathrm{Expert}_j(x)
+$$
+
+&emsp;&emsp;其中 $K_s$ 是共享专家数量，$N$ 是总专家数量。共享专家负责捕获通用知识，减少路由专家之间的参数冗余，使路由专家可以更专注于特定领域或模式。DeepSeekMoE 的实验表明，设置 1 到 2 个共享专家即可显著提升专家专业化程度。
+
+&emsp;&emsp;共享专家的优点是提供了稳定的通用变换路径，缓解了路由不均衡问题，且减少了路由专家的冗余；缺点是增加了固定的计算量，因为所有 token 都必须经过共享专家，且共享专家和路由专家的比例需要手动调整。
+
+&emsp;&emsp;从维度视角看，共享专家在特征维上提供了一条所有 token 共享的通用变换路径，而路由专家提供条件化的专用变换路径。两者叠加，使模型既有稳定的基础表示，又有灵活的条件计算。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出带共享专家的 MoE 层裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class Expert(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def forward(self, x):
+        return torch.matmul(
+            torch.relu(torch.matmul(x, self.W_1) + self.b_1),
+            self.W_2
+        ) + self.b_2
+
+
+class MoEWithSharedExperts(nn.Module):
+    def __init__(self, d_model, d_ff, num_shared, num_routed, top_k=2):
+        super().__init__()
+        self.num_shared = num_shared
+        self.num_routed = num_routed
+        self.top_k = top_k
+
+        self.shared_experts = nn.ModuleList(
+            [Expert(d_model, d_ff) for _ in range(num_shared)]
+        )
+        self.routed_experts = nn.ModuleList(
+            [Expert(d_model, d_ff) for _ in range(num_routed)]
+        )
+        self.router = nn.Parameter(torch.empty(num_routed, d_model))
+        nn.init.normal_(self.router, std=0.02)
+
+    def forward(self, x):
+        B, L, D = x.size()
+        x_flat = x.view(B * L, D)
+
+        # 共享专家：所有 token 固定经过
+        shared_out = sum(expert(x_flat) for expert in self.shared_experts)
+
+        # 路由专家：Top-k 选择
+        scores = torch.matmul(x_flat, self.router.T)
+        topk_scores, topk_indices = scores.topk(self.top_k, dim=-1)
+        topk_gates = torch.softmax(topk_scores, dim=-1)
+
+        routed_out = torch.zeros_like(x_flat)
+        for k in range(self.top_k):
+            idx = topk_indices[:, k]
+            gate = topk_gates[:, k].unsqueeze(-1)
+            for e in range(self.num_routed):
+                mask = (idx == e)
+                if mask.any():
+                    routed_out[mask] += gate[mask] * self.routed_experts[e](x_flat[mask])
+
+        return (shared_out + routed_out).view(B, L, D)
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d_{model})$，输出形状相同。
 
 #### 2.6.8 细粒度专家
 
-&emsp;&emsp;DeepSeekMoE 采用细粒度专家，将标准前馈网络替换为稀疏专家混合层。与 Mixtral 8x7B 的粗粒度专家设计不同，DeepSeekMoE 采用细粒度专家和共享专家的组合策略，使专家分配更加精细。
+&emsp;&emsp;细粒度专家（Fine-Grained Expert Segmentation）是 DeepSeekMoE 提出的专家设计策略。传统 MoE 中，每个专家的中间维度与标准 FFN 相同，专家数量有限，路由组合的灵活性受到制约。细粒度专家将每个专家进一步拆分为多个更小的专家，使总专家数从 $N$ 增加到 $mN$，同时从其中激活 $mK$ 个专家，保持总参数量和计算量不变：
+
+$$
+g_{i,t} = \begin{cases}
+s_{i,t}, & s_{i,t} \in \mathrm{TopK}(\{s_{j,t} \mid 1 \leqslant j \leqslant mN\}, mK) \\
+0, & \text{otherwise}
+\end{cases}
+$$
+
+&emsp;&emsp;其中 $m$ 是细分因子，通常取 2 到 4。每个细粒度专家的中间维度缩小为原来的 $1/m$。这种设计从组合角度看极大地增强了激活专家的组合灵活性。以一个典型的 Top-2 路由为例，若 $N=16$，组合数为 $\binom{16}{2}=120$；若每个专家拆分为 4 个，则 $mN=64$，激活 $mK=8$ 个专家，组合数变为 $\binom{64}{8}=4{,}426{,}165{,}368$，增长了七个数量级。
+
+&emsp;&emsp;细粒度专家的优点是组合灵活性的大幅提升使模型能够更精确地匹配 token 与专家的关系，实现更精细的知识获取和专家专业化；缺点是专家数量增加后路由器的选择空间更大，路由决策的计算量和负载均衡难度也随之上升，且每个专家的训练数据更少，可能加剧专家欠训练的风险。
+
+&emsp;&emsp;从维度视角看，细粒度专家在特征维上将每个专家的变换空间进一步细分，使特征维上的条件计算粒度更细。路由器可以在更大的专家集合中选择更匹配的子集，相当于在特征维上实现了更精细的稀疏激活。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出细粒度专家的裸实现，将标准专家拆分为多个小专家并激活 Top-k：
+
+```python
+import torch
+import torch.nn as nn
+
+class FineGrainedExpert(nn.Module):
+    """细粒度专家: 中间维度为标准 FFN 的 1/m"""
+    def __init__(self, d_model, d_ff_fine):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff_fine))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff_fine))
+        self.W_2 = nn.Parameter(torch.empty(d_ff_fine, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def forward(self, x):
+        return torch.matmul(
+            torch.relu(torch.matmul(x, self.W_1) + self.b_1),
+            self.W_2
+        ) + self.b_2
+
+
+class FineGrainedMoE(nn.Module):
+    def __init__(self, d_model, d_ff, num_experts_base, seg_factor, top_k):
+        super().__init__()
+        self.num_experts = num_experts_base * seg_factor
+        self.top_k = top_k
+        self.d_ff_fine = d_ff // seg_factor
+
+        self.experts = nn.ModuleList([
+            FineGrainedExpert(d_model, self.d_ff_fine)
+            for _ in range(self.num_experts)
+        ])
+        self.router = nn.Parameter(torch.empty(self.num_experts, d_model))
+        nn.init.normal_(self.router, std=0.02)
+
+    def forward(self, x):
+        B, L, D = x.size()
+        x_flat = x.view(B * L, D)
+
+        scores = torch.matmul(x_flat, self.router.T)
+        topk_scores, topk_indices = scores.topk(self.top_k, dim=-1)
+        topk_gates = torch.softmax(topk_scores, dim=-1)
+
+        out = torch.zeros_like(x_flat)
+        for k in range(self.top_k):
+            idx = topk_indices[:, k]
+            gate = topk_gates[:, k].unsqueeze(-1)
+            for e in range(self.num_experts):
+                mask = (idx == e)
+                if mask.any():
+                    out[mask] += gate[mask] * self.experts[e](x_flat[mask])
+
+        return out.view(B, L, D)
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.6.9 负载均衡损失
 
-&emsp;&emsp;负载均衡损失通过惩罚专家负载分布的方差来鼓励 Router 均匀分配 token，防止所有 token 都被路由到同一个专家。Mixtral 8x7B 使用了标准的负载均衡损失。
+&emsp;&emsp;负载均衡损失（Load Balancing Loss）是 MoE 训练中用于防止专家负载不均衡的辅助损失函数。稀疏 MoE 中，Top-k 路由容易导致部分专家被过度使用而其他专家几乎不被激活，严重时出现“路由坍缩”。负载均衡损失通过惩罚不均衡的分配来引导路由器将 token 均匀地分配到各专家。
+
+&emsp;&emsp;设一个 batch 中有 $T$ 个 token，$N$ 个专家。定义 $D_i$ 为分配给专家 $i$ 的 token 比例，$P_i$ 为专家 $i$ 的平均门控概率：
+
+$$
+D_i = \frac{1}{T}\sum_{x \in \mathcal{B}} \mathbf{1}\{\mathrm{argmax}\,G_\sigma(x) = i\}
+$$
+
+$$
+P_i = \frac{1}{T}\sum_{x \in \mathcal{B}} G_\sigma(x)_i
+$$
+
+&emsp;&emsp;其中 $\mathcal{B}$ 是当前 batch，$G_\sigma(x)$ 是路由器的门控输出。负载均衡损失定义为：
+
+$$
+\mathcal{L}_{\mathrm{load\text{-}balancing}} = N \sum_{i=1}^{N} D_i P_i
+$$
+
+&emsp;&emsp;当所有专家被均匀分配时，$D_i = P_i = 1/N$，损失取得最小值 1。总训练损失为：
+
+$$
+\mathcal{L}_{\mathrm{total}} = \mathcal{L}_{\mathrm{moe}} + \alpha \mathcal{L}_{\mathrm{load\text{-}balancing}}
+$$
+
+&emsp;&emsp;其中 $\alpha$ 是辅助损失的权重系数，通常取 0.01 左右。负载均衡损失的优点是实现简单，只需在训练损失上增加一个可微的辅助项，能有效防止路由坍缩，使所有专家都得到充分训练；缺点是辅助损失会引入干扰梯度，与主任务损失产生竞争，可能轻微损害模型性能，且 $\alpha$ 需要手动调优，过大会主导训练，过小则无法有效均衡。
+
+&emsp;&emsp;从维度视角看，负载均衡损失在特征维上约束了路由器的分配行为，使 token 在专家子空间中的分布更加均匀。它不改变注意力或 FFN 的结构，而是通过优化目标引导路由器学习更均衡的分配策略。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出负载均衡损失的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+def load_balancing_loss(router_scores, topk_indices, num_experts):
+    """
+    router_scores: (B*L, num_experts) 路由器原始分数
+    topk_indices: (B*L, top_k) Top-k 选择的专家索引
+    """
+    T = router_scores.size(0)
+
+    # Di: 分配给专家 i 的 token 比例
+    D = torch.zeros(num_experts, device=router_scores.device)
+    for k in range(topk_indices.size(1)):
+        for e in range(num_experts):
+            D[e] += (topk_indices[:, k] == e).float().sum()
+    D = D / T
+
+    # Pi: 专家 i 的平均门控概率
+    gates = torch.softmax(router_scores, dim=-1)
+    P = gates.mean(dim=0)  # (num_experts,)
+
+    # 负载均衡损失
+    loss = num_experts * (D * P).sum()
+    return loss
+```
+
+&emsp;&emsp;这个实现中，$D_i$ 通过统计 Top-k 索引中专家 $i$ 出现的次数得到，$P_i$ 通过路由器概率的均值得到。损失值在均匀分配时接近 1。
+
+---
 
 #### 2.6.10 无辅助损失负载均衡
 
-&emsp;&emsp;DeepSeek-V3 完全去掉了辅助损失，改用一种基于动态偏置项的均衡策略，在几乎不影响主目标的前提下实现专家负载的动态均衡。论文报告这一策略在训练全程保持了专家负载的稳定分布，且未产生任何性能干扰。
+&emsp;&emsp;无辅助损失负载均衡（Auxiliary-Loss-Free Load Balancing）是 DeepSeek-V2/V3 采用的一种负载均衡策略，由 Wang 等人于 2024 年提出。传统辅助损失方法通过在主损失上增加均衡惩罚项来引导路由，但辅助损失会产生干扰梯度，与主任务优化目标竞争，可能损害模型性能。无辅助损失方法完全去掉了辅助损失，改为在 Top-K 路由前对每个专家的路由分数施加一个专家级偏置 $b_i$，并根据近期负载动态更新偏置。
+
+&emsp;&emsp;设路由器对专家 $i$ 的原始分数为 $s_{i,t}$，加上偏置后的分数为：
+
+$$
+s'_{i,t} = s_{i,t} + b_i
+$$
+
+&emsp;&emsp;Top-K 选择基于 $s'_{i,t}$ 进行。偏置 $b_i$ 不参与梯度计算，而是根据每个专家近期的实际负载进行增量更新：如果专家 $i$ 负载过高，减小 $b_i$；如果负载过低，增大 $b_i$：
+
+$$
+b_i \leftarrow b_i - \gamma \cdot \mathrm{sign}(\mathrm{load}_i - \bar{\mathrm{load}})
+$$
+
+&emsp;&emsp;其中 $\gamma$ 是偏置更新速率，$\mathrm{load}_i$ 是专家 $i$ 近期的 token 分配量，$\bar{\mathrm{load}}$ 是平均负载。这种更新形成了一种历史反馈机制，使偏置自动收敛到使负载均衡的值。
+
+&emsp;&emsp;无辅助损失负载均衡的优点是消除了辅助损失带来的干扰梯度，不损害主任务性能，偏置更新不通过反向传播因此无需额外的梯度计算，且与专家并行训练兼容；缺点是偏置更新速率 $\gamma$ 需要调优，过大会导致路由震荡，过小则均衡速度慢，且偏置的初始值需要合理设置，否则早期训练可能出现极端不均衡。
+
+&emsp;&emsp;从维度视角看，无辅助损失均衡通过修改路由分数的偏置来引导分配，而不是修改损失函数。这相当于在特征维的专家选择阶段引入了一个自适应的校准项，使路由器的决策更倾向于均衡。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出无辅助损失负载均衡的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class LossFreeBalancedMoE(nn.Module):
+    def __init__(self, d_model, d_ff, num_experts, top_k, bias_rate=0.001):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.bias_rate = bias_rate
+
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_ff), nn.ReLU(), nn.Linear(d_ff, d_model)
+            ) for _ in range(num_experts)
+        ])
+        self.router = nn.Parameter(torch.empty(num_experts, d_model))
+        nn.init.normal_(self.router, std=0.02)
+
+        # 专家偏置: 不参与梯度计算
+        self.register_buffer("routing_bias", torch.zeros(num_experts))
+
+    def forward(self, x):
+        B, L, D = x.size()
+        x_flat = x.view(B * L, D)
+
+        # 原始路由分数
+        scores = torch.matmul(x_flat, self.router.T)
+
+        # 加上偏置后的分数用于 Top-K 选择
+        biased_scores = scores + self.routing_bias.unsqueeze(0)
+
+        # Top-K 选择基于 biased_scores
+        topk_biased, topk_indices = biased_scores.topk(self.top_k, dim=-1)
+
+        # 门控权重使用原始分数计算
+        topk_original = scores.gather(1, topk_indices)
+        topk_gates = torch.softmax(topk_original, dim=-1)
+
+        # 计算专家
+        out = torch.zeros_like(x_flat)
+        for k in range(self.top_k):
+            idx = topk_indices[:, k]
+            gate = topk_gates[:, k].unsqueeze(-1)
+            for e in range(self.num_experts):
+                mask = (idx == e)
+                if mask.any():
+                    out[mask] += gate[mask] * self.experts[e](x_flat[mask])
+
+        # 更新偏置（不通过梯度）
+        with torch.no_grad():
+            for e in range(self.num_experts):
+                load_e = (topk_indices == e).float().sum()
+                avg_load = topk_indices.numel() / self.num_experts
+                if load_e > avg_load:
+                    self.routing_bias[e] -= self.bias_rate
+                elif load_e < avg_load:
+                    self.routing_bias[e] += self.bias_rate
+
+        return out.view(B, L, D)
+```
+
+&emsp;&emsp;这个实现中，Top-K 选择基于加了偏置的分数，但门控权重使用原始分数计算。偏置在每次前向传播后根据负载自动更新。若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.6.11 Hash routing
 
-&emsp;&emsp;DeepSeek-V4 的前几层 dense FFN 换成了用 Hash routing 的 MoE 层。
+&emsp;&emsp;Hash routing（哈希路由）是一种无参数的路由策略，使用预定义的哈希函数将 token 确定性地分配到专家，而非通过可学习的路由器。最简单的形式是基于 token ID 的哈希表：每个 token ID 通过哈希函数映射到固定的专家索引。在 DeepSeek-V4 中，前几个 MoE 层采用了冻结的 token-id 到 expert-id 查找表（`tid2eid`），专家选择完全由查表决定，不使用可学习的 argmax。
+
+&emsp;&emsp;Hash routing 的核心形式为：
+
+$$
+\mathrm{expert}(t) = \mathrm{Hash}(t) \bmod N
+$$
+
+&emsp;&emsp;其中 $t$ 是 token 的标识（如 token ID 或位置索引），$N$ 是专家总数。哈希函数可以是简单的取模运算、乘法哈希或更复杂的混合哈希。由于哈希函数是固定的，每个 token 的专家分配在训练前就已确定，不随训练过程变化。
+
+&emsp;&emsp;Hash routing 的优点是路由完全无参数，消除了路由器的训练开销和负载均衡问题，且分配是确定性的，便于推理时的预计算和缓存；缺点是哈希分配与 token 内容无关，无法根据语义特征选择最合适的专家，路由质量受哈希函数设计影响很大，通常性能不如可学习路由。实验表明，哈希路由在 GPT-OSS-20B 上的平均得分约为 36.1 分，显著低于基于特征的路由方法。在 DeepSeek-V4 中，Hash routing 仅用于前几个 MoE 层，后续层仍使用可学习的 Top-K 路由。
+
+&emsp;&emsp;从维度视角看，Hash routing 完全绕过了特征维上的内容匹配，将 token 维的分配问题转化为一个固定的映射。它不利用 token 的特征信息来决定专家选择，因此无法实现内容感知的条件计算。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Hash routing 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class HashRoutingMoE(nn.Module):
+    def __init__(self, d_model, d_ff, num_experts, vocab_size):
+        super().__init__()
+        self.num_experts = num_experts
+
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_ff), nn.ReLU(), nn.Linear(d_ff, d_model)
+            ) for _ in range(num_experts)
+        ])
+
+        # 冻结的 token-id 到 expert-id 查找表
+        self.register_buffer(
+            "tid2eid",
+            torch.randint(0, num_experts, (vocab_size,))
+        )
+
+    def forward(self, x, input_ids):
+        """
+        x: (B, L, d_model)
+        input_ids: (B, L) token ID 序列
+        """
+        B, L, D = x.size()
+        x_flat = x.view(B * L, D)
+        ids_flat = input_ids.view(B * L)
+
+        # 查表获得专家索引
+        expert_ids = self.tid2eid[ids_flat]  # (B*L,)
+
+        out = torch.zeros_like(x_flat)
+        for e in range(self.num_experts):
+            mask = (expert_ids == e)
+            if mask.any():
+                out[mask] = self.experts[e](x_flat[mask])
+
+        return out.view(B, L, D)
+```
+
+&emsp;&emsp;这个实现中，每个 token 的专家分配完全由冻结的 `tid2eid` 查找表决定，路由器不参与计算。若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.6.12 Stable LatentMoE
 
-&emsp;&emsp;Kimi K3 的 MoE 部分采用 Stable LatentMoE：每个 token 从 896 个路由专家中激活 16 个，通过 SiTU-GLU 与 Quantile Balancing 保持极高稀疏度下的训练稳定。
+&emsp;&emsp;Stable LatentMoE 是 Kimi K3 采用的 MoE 架构，在 LatentMoE 的基础上增加了训练稳定性优化。其核心设计思想是将专家计算从主干隐藏维度解耦到低维潜在空间：主干保持较高的隐藏维度以维持全局表达能力，专家在低维潜在空间中计算以控制成本。
+
+&emsp;&emsp;LatentMoE 的流程为：首先通过共享下投影矩阵 $W_{\mathrm{down}}$ 将 token 的隐藏状态 $h \in \mathbb{R}^{d}$ 投影到潜在空间：
+
+$$
+z = W_{\mathrm{down}} h, \quad z \in \mathbb{R}^{\ell}
+$$
+
+&emsp;&emsp;其中 $\ell = d / \alpha$ 是潜在维度，$\alpha$ 是压缩因子。然后所有路由专家都在潜在空间中执行计算：
+
+$$
+z' = \sum_{i \in \mathrm{TopK}} g_i \cdot \mathrm{Expert}_i(z)
+$$
+
+&emsp;&emsp;最后通过共享上投影矩阵 $W_{\mathrm{up}}$ 将结果映射回完整隐藏维度：
+
+$$
+h' = W_{\mathrm{up}} z'
+$$
+
+&emsp;&emsp;这种设计的核心优势是将“主干表达能力”和“专家计算成本”解耦。主干可以保持较宽的隐藏维度以维持表示能力，而专家的计算在低维潜在空间中进行，参数量和计算量都大幅降低。
+
+&emsp;&emsp;Kimi K3 的 Stable LatentMoE 具体配置为：896 个路由专家，每个 token 激活 16 个专家，同时保留 2 个全宽度共享专家。隐藏状态从 7168 维投影到 3584 维的潜在空间（压缩比 2:1），在潜在空间中执行专家计算后再映射回完整维度。训练稳定性方面，Kimi K3 采用 SiTU-GLU 作为专家激活函数，并配合 Quantile Balancing 进行负载均衡，在极高稀疏度下保持训练稳定。
+
+&emsp;&emsp;Stable LatentMoE 的优点是解耦了主干宽度与专家计算成本，使模型可以在不增加专家计算量的情况下扩展主干表示能力，共享专家提供了稳定的通用变换路径，SiTU-GLU 的平滑门控和 Quantile Balancing 的精确均衡共同保障了训练稳定性；缺点是引入了潜在维度和压缩比两个额外超参数，下投影和上投影增加了额外的计算开销，且潜在空间的维度选择需要权衡表达能力和计算效率。
+
+&emsp;&emsp;从维度视角看，Stable LatentMoE 在特征维上引入了一个低维瓶颈：token 先被压缩到潜在空间，在低维空间中完成专家选择和非线性变换，再展开回原始维度。这相当于在特征维上做了一次“压缩-条件计算-解压缩”的循环。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Stable LatentMoE 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class LatentExpert(nn.Module):
+    """在潜在空间中计算的专家"""
+    def __init__(self, latent_dim, d_ff_latent):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(latent_dim, d_ff_latent))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff_latent))
+        self.W_2 = nn.Parameter(torch.empty(d_ff_latent, latent_dim))
+        self.b_2 = nn.Parameter(torch.zeros(latent_dim))
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def _situ(self, x):
+        sp = torch.maximum(x, torch.zeros_like(x)) + torch.log1p(torch.exp(-torch.abs(x)))
+        return x * torch.tanh(sp)
+
+    def forward(self, z):
+        return torch.matmul(
+            self._situ(torch.matmul(z, self.W_1) + self.b_1),
+            self.W_2
+        ) + self.b_2
+
+
+class StableLatentMoE(nn.Module):
+    def __init__(self, d_model, latent_dim, num_routed, num_shared,
+                 top_k, d_ff_latent):
+        super().__init__()
+        self.num_routed = num_routed
+        self.top_k = top_k
+
+        # 共享下投影和上投影
+        self.W_down = nn.Parameter(torch.empty(d_model, latent_dim))
+        self.W_up = nn.Parameter(torch.empty(latent_dim, d_model))
+        nn.init.xavier_uniform_(self.W_down)
+        nn.init.xavier_uniform_(self.W_up)
+
+        # 路由专家（潜在空间）
+        self.routed_experts = nn.ModuleList([
+            LatentExpert(latent_dim, d_ff_latent) for _ in range(num_routed)
+        ])
+        # 共享专家（全宽度）
+        self.shared_experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_ff_latent * 2), nn.ReLU(),
+                nn.Linear(d_ff_latent * 2, d_model)
+            ) for _ in range(num_shared)
+        ])
+
+        self.router = nn.Parameter(torch.empty(num_routed, d_model))
+        nn.init.normal_(self.router, std=0.02)
+
+    def forward(self, x):
+        B, L, D = x.size()
+        x_flat = x.view(B * L, D)
+
+        # 共享专家（全宽度）
+        shared_out = sum(expert(x_flat) for expert in self.shared_experts)
+
+        # 投影到潜在空间
+        z = torch.matmul(x_flat, self.W_down)  # (B*L, latent_dim)
+
+        # 路由
+        scores = torch.matmul(x_flat, self.router.T)
+        topk_scores, topk_indices = scores.topk(self.top_k, dim=-1)
+        topk_gates = torch.softmax(topk_scores, dim=-1)
+
+        # 在潜在空间中计算路由专家
+        routed_out = torch.zeros_like(z)
+        for k in range(self.top_k):
+            idx = topk_indices[:, k]
+            gate = topk_gates[:, k].unsqueeze(-1)
+            for e in range(self.num_routed):
+                mask = (idx == e)
+                if mask.any():
+                    routed_out[mask] += gate[mask] * self.routed_experts[e](z[mask])
+
+        # 投影回完整维度
+        routed_out = torch.matmul(routed_out, self.W_up)
+
+        return (shared_out + routed_out).view(B, L, D)
+```
+
+&emsp;&emsp;这个实现中，路由专家在潜在空间中计算，共享专家在完整维度中计算。若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.6.13 Quantile Balancing
 
-&emsp;&emsp;Quantile Balancing 是 Kimi K3 用于保持极高稀疏度下训练稳定的技术，与 SiTU-GLU 配合使用。
+&emsp;&emsp;Quantile Balancing（QB）是由 Jianlin Su 提出的一种无辅助损失的 MoE 负载均衡方法，将负载均衡问题建模为等式约束的线性规划，并用分位数求解路由偏置。
+
+&emsp;&emsp;QB 的核心思想是：不再通过辅助损失惩罚主损失，而是为每个专家维护一个偏置 $\beta_j$，偏置只影响专家的排序或阈值，不参与梯度计算。在 Top-k 路由版本中，路由器打分矩阵为 $s \in \mathbb{R}^{m \times n}$，其中 $m$ 是 token 数，$n$ 是专家数。QB 的目标是找到偏置 $\beta \in \mathbb{R}^n$，使得每个专家被激活的次数接近 $mk/n$。
+
+&emsp;&emsp;QB 的最优解具有简洁的分位数形式。对于每个专家 $j$，其最优偏置为：
+
+$$
+\beta_j = \text{第 } \frac{mk}{n} \text{ 大的 } s_{i,j} \text{ 值}
+$$
+
+&emsp;&emsp;这对应于打分矩阵第 $j$ 列的 $1 - k/n$ 分位数。也就是说，QB 不需要交替迭代或梯度下降，而是直接从当前 batch 的打分矩阵中一步计算出最优偏置。推理时的路由决策变为：
+
+$$
+\mathrm{TopK}(s_i - \beta)
+$$
+
+&emsp;&emsp;其中 $s_i$ 是第 $i$ 个 token 的打分向量。在动态激活版本中，去掉“每 token 恰好激活 $k$ 个专家”的行约束，只保留列方向的负载约束和平均预算，激活条件变为 $s_{i,j} - \beta_j > 0$，一步分位数求解即可得到绝对均衡的最优解。
+
+&emsp;&emsp;Quantile Balancing 的优点是没有学习率等超参数需要调优，均衡速度快，尤其擅长处理极端不均衡的情况，如在全 MoE 模型中第一层也能快速达到均衡，且不产生干扰梯度，与主任务优化完全解耦；缺点是需要计算打分矩阵的分位数，在大规模分布式训练中分位数的跨设备通信可能成为开销，且 QB 假设每个 token 的打分矩阵在 batch 内可比较，在某些流式或小 batch 场景下可能不够稳定。
+
+&emsp;&emsp;从维度视角看，Quantile Balancing 在特征维上通过分位数确定偏置，使每个专家的有效容量被精确地校准到目标负载。它不修改损失函数，而是直接调整路由的决策边界。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Quantile Balancing 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class QuantileBalancedMoE(nn.Module):
+    def __init__(self, d_model, d_ff, num_experts, top_k):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_ff), nn.ReLU(), nn.Linear(d_ff, d_model)
+            ) for _ in range(num_experts)
+        ])
+        self.router = nn.Parameter(torch.empty(num_experts, d_model))
+        nn.init.normal_(self.router, std=0.02)
+
+        self.register_buffer("beta", torch.zeros(num_experts))
+
+    def update_beta(self, scores):
+        """
+        scores: (m, n) 打分矩阵, m 为 token 数, n 为专家数
+        一步分位数更新 beta
+        """
+        m, n = scores.shape
+        k = self.top_k
+        target = int(m * k / n)  # 每个专家的目标激活次数
+
+        with torch.no_grad():
+            for j in range(n):
+                col = scores[:, j].sort(descending=True).values
+                # beta_j = 第 target 大的值（1 - k/n 分位数）
+                if target < m:
+                    self.beta[j] = col[target]
+                else:
+                    self.beta[j] = col[-1]
+
+    def forward(self, x, update=True):
+        B, L, D = x.size()
+        x_flat = x.view(B * L, D)
+
+        scores = torch.matmul(x_flat, self.router.T)  # (B*L, num_experts)
+
+        if update:
+            self.update_beta(scores)
+
+        # 用偏置调整后的分数做 Top-K
+        adjusted = scores - self.beta.unsqueeze(0)
+        topk_scores, topk_indices = adjusted.topk(self.top_k, dim=-1)
+        topk_gates = torch.softmax(scores.gather(1, topk_indices), dim=-1)
+
+        out = torch.zeros_like(x_flat)
+        for k in range(self.top_k):
+            idx = topk_indices[:, k]
+            gate = topk_gates[:, k].unsqueeze(-1)
+            for e in range(self.num_experts):
+                mask = (idx == e)
+                if mask.any():
+                    out[mask] += gate[mask] * self.experts[e](x_flat[mask])
+
+        return out.view(B, L, D)
+```
+
+&emsp;&emsp;这个实现中，`update_beta` 从打分矩阵的每一列取第 $m k / n$ 大的值作为偏置，实现了一步分位数均衡。若输入形状为 $(B,L,d_{model})$，输出形状相同。
 
 ---
 
@@ -3589,23 +4673,352 @@ $$
 
 #### 2.7.1 标准残差连接
 
-&emsp;&emsp;标准残差为 $x_{l+1} = x_l + f(x_l)$。残差连接使梯度可以直接回传，是深层网络训练的基础。
+&emsp;&emsp;标准残差连接（Standard Residual Connection）是 Transformer 中最基础的跨层信息通路，它将子层的输出与输入直接相加：
+
+$$
+x_{l+1} = x_l + F_l(x_l)
+$$
+
+&emsp;&emsp;其中 $x_l$ 是第 $l$ 层的输入，$F_l$ 是该层的子层函数（注意力或 FFN）。展开多层后，第 $L$ 层的输出可以写成：
+
+$$
+x_L = x_0 + \sum_{l=0}^{L-1} F_l(x_l)
+$$
+
+&emsp;&emsp;这个形式揭示了残差连接的两个核心性质。第一，主干路径 $x_0$ 是恒等映射，浅层信息可以无损地传到任意深度。第二，每层的贡献 $F_l(x_l)$ 以累加方式叠加到主干上，而不是替换主干。反向传播时，梯度为：
+
+$$
+\frac{\partial \mathcal{L}}{\partial x_0} = \frac{\partial \mathcal{L}}{\partial x_L} \prod_{l=0}^{L-1}\left(I + \frac{\partial F_l}{\partial x_l}\right)
+$$
+
+&emsp;&emsp;乘积中的 $I$ 保证了梯度至少有一条恒等通路可以回传，不会因为连乘而指数衰减。标准残差连接的优点是实现极简，仅一次加法，不增加参数，且为深层网络提供了稳定的梯度通路，是 Transformer 能堆叠上百层的基础；缺点是主干路径上的激活值会随层数线性累积增长，深层网络中残差分支的输出可能被主干的恒等信号淹没，且所有层共享同一条主干路径，无法对不同深度的信息流做差异化调节。
+
+&emsp;&emsp;从维度视角看，标准残差连接在特征维上为每个子层提供了一条恒等通路，使 token 维扩散的结果以增量方式叠加到主干表示上。主干和残差分支是固定的一对一相加关系，没有可学习的混合机制。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出标准残差连接的裸实现，并与无残差版本对比：
+
+```python
+import torch
+import torch.nn as nn
+
+class StandardResidual(nn.Module):
+    """标准残差连接: x_{l+1} = x_l + F_l(x_l)"""
+    def forward(self, x, sublayer_fn):
+        return x + sublayer_fn(x)
+
+
+class NoResidual(nn.Module):
+    """无残差连接，用于对比"""
+    def forward(self, x, sublayer_fn):
+        return sublayer_fn(x)
+```
+
+&emsp;&emsp;若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.7.2 残差路径缩放初始化
 
-&emsp;&emsp;GPT-2 在初始化时对残差层的权重进行缩放：将残差分支中特定权重矩阵的标准差乘以 $1/\sqrt{N}$，其中 $N$ 是残差层的数量。以 GPT-2 XL 为例，$N = 48$，缩放因子约为 $1/6.93$。这意味着在训练开始时，每个残差分支的输出被显著压制，残差路径上的信号以近乎恒等映射的方式逐层传递，网络的初始行为接近于一个浅层模型。随着训练的进行，各层的残差权重逐渐增大，网络的有效深度逐步“生长”出来。这一初始化策略后来成为 GPT-3 及后续模型的标准做法。
+&emsp;&emsp;残差路径缩放初始化（Residual Path Scaling Initialization）是针对标准残差连接中激活值随深度累积增长问题的初始化策略。GPT-2 首次系统性地采用了这一方案：将每个残差分支的输出投影层权重按 $1/\sqrt{2N}$ 缩放，其中 $N$ 是残差层总数。
+
+&emsp;&emsp;设第 $l$ 层的子层输出为 $F_l(x_l)$，其最后一层线性变换的权重初始化为：
+
+$$
+W_l \sim \mathcal{N}\left(0, \frac{\sigma^2}{2N}\right)
+$$
+
+&emsp;&emsp;其中 $\sigma$ 是基础标准差，$2N$ 是因为每层有两个残差分支（注意力和 FFN）。这种缩放使得每个残差分支的输出方差被压缩，从而在 $N$ 层累加后，主干激活值的方差仍保持在合理范围内。若不缩放，每层残差分支的方差为 $\sigma^2$，$N$ 层累加后主干方差约为 $N\sigma^2$，随深度线性增长，导致深层激活值爆炸。
+
+&emsp;&emsp;从方差传播的角度看，设每层残差分支的输出独立且方差为 $\sigma_l^2$，则主干方差为：
+
+$$
+\mathrm{Var}(x_L) = \mathrm{Var}(x_0) + \sum_{l=0}^{L-1} \sigma_l^2
+$$
+
+&emsp;&emsp;若每层 $\sigma_l^2 = \sigma^2 / (2N)$，则 $N$ 层累加后总方差约为 $\mathrm{Var}(x_0) + \sigma^2/2$，与深度无关。残差路径缩放初始化的优点是无需额外参数或计算，仅在初始化时缩放权重，就能使深层网络的激活值方差保持稳定，配合 Pre-LN 可以训练上百层模型；缺点是需要知道总层数 $N$，不适用于动态深度或层数变化的场景，且缩放因子 $1/\sqrt{2N}$ 是启发式的，不同任务和模型规模下最优缩放可能不同。
+
+&emsp;&emsp;从维度视角看，残差路径缩放初始化在特征维上控制了每层残差分支的贡献幅度，使主干上的累积信号不会随深度失控。它不改变残差连接的数学形式，只改变了各层贡献的相对尺度。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出残差路径缩放初始化的裸实现，对输出投影层按 $1/\sqrt{2N}$ 缩放：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class ScaledResidualBlock(nn.Module):
+    """带残差路径缩放初始化的子层"""
+    def __init__(self, d_model, d_ff, num_layers):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+
+        nn.init.xavier_uniform_(self.W_1)
+        # 输出投影按 1/sqrt(2N) 缩放
+        std = math.sqrt(2.0 / (2 * num_layers)) / math.sqrt(d_ff)
+        nn.init.normal_(self.W_2, std=std)
+
+    def forward(self, x):
+        hidden = torch.relu(torch.matmul(x, self.W_1) + self.b_1)
+        return torch.matmul(hidden, self.W_2) + self.b_2
+
+
+class ScaledResidualStack(nn.Module):
+    def __init__(self, d_model, d_ff, num_layers):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            ScaledResidualBlock(d_model, d_ff, num_layers)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = x + layer(x)
+        return x
+```
+
+&emsp;&emsp;这个实现中，每个残差块的输出投影 `W_2` 按 $1/\sqrt{2N}$ 缩放初始化，使多层累加后方差保持稳定。若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.7.3 零初始化与零卷积
 
-&emsp;&emsp;ControlNet 的核心设计是零卷积：一个 $1 \times 1$ 的卷积层，权重和偏置全部初始化为零。这意味着在训练的第一步，无论控制条件是什么，零卷积的输出都是零，ControlNet 对锁定副本的影响完全为零。LoRA 对两个低秩矩阵采用不对称初始化策略：矩阵 $A$ 使用高斯分布随机初始化，矩阵 $B$ 初始化为全零矩阵。在这一初始化下 $\Delta W = BA = 0$，模型的前向行为与未添加 LoRA 时的预训练模型完全一致。这种“从零开始、渐进生长”的机制，使训练过程天然稳定。
+&emsp;&emsp;零初始化（Zero Initialization）与零卷积（Zero Convolution）是一类将子层输出投影初始化为零的技术，使每个残差块在训练开始时退化为恒等映射。设子层为 $F_l$，将其最后一层权重初始化为零：
+
+$$
+W_l^{out} = 0, \quad b_l^{out} = 0
+$$
+
+&emsp;&emsp;则训练初期 $F_l(x) = 0$，残差块输出为 $x + 0 = x$，整个网络在初始化时等价于恒等映射。这种设计的代表工作包括 ReZero、ControlNet 的零卷积、以及 GLM 等模型中的零初始化输出层。
+
+&emsp;&emsp;零初始化的核心优势在于训练稳定性：由于每个残差块初始时对主干无贡献，网络的初始行为等同于一个浅层模型，随着训练逐步学习到非零的残差贡献。这避免了深层网络初始化时的信号爆炸和梯度问题，同时让每个残差块从“零贡献”开始渐进地学习自己的功能。ReZero 进一步引入了一个可学习的标量 $\alpha_l$，初始化为零：
+
+$$
+x_{l+1} = x_l + \alpha_l F_l(x_l)
+$$
+
+&emsp;&emsp;这样 $\alpha_l$ 可以从零开始随训练增长，自动调节每个残差分支的贡献强度。零初始化与零卷积的优点是训练稳定性极佳，深层网络在初始化时等价于浅层网络，每个残差块渐进学习，且 ReZero 的 $\alpha_l$ 提供了可学习的贡献强度；缺点是训练初期残差分支梯度极小（因为输出为零），学习速度较慢，需要更多训练步数才能达到与标准初始化相当的性能，且零初始化破坏了权重的对称性，某些情况下需要额外的扰动来打破对称。
+
+&emsp;&emsp;从维度视角看，零初始化在特征维上让每个残差分支的初始贡献为零，主干路径完全主导初始表示。随着训练进行，各分支逐步学习到非零的修正信号，相当于从恒等映射出发渐进地学习深度。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出零初始化与 ReZero 风格的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class ZeroInitBlock(nn.Module):
+    """零初始化残差块: 输出投影初始化为零"""
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.zeros(d_ff, d_model))  # 零初始化
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        nn.init.xavier_uniform_(self.W_1)
+
+    def forward(self, x):
+        hidden = torch.relu(torch.matmul(x, self.W_1) + self.b_1)
+        return torch.matmul(hidden, self.W_2) + self.b_2
+
+
+class ReZeroBlock(nn.Module):
+    """ReZero: 可学习标量 alpha 初始化为零"""
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        self.alpha = nn.Parameter(torch.zeros(1))  # 初始化为零
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def forward(self, x):
+        hidden = torch.relu(torch.matmul(x, self.W_1) + self.b_1)
+        out = torch.matmul(hidden, self.W_2) + self.b_2
+        return x + self.alpha * out
+```
+
+&emsp;&emsp;这个实现中，`ZeroInitBlock` 将输出投影初始化为零，`ReZeroBlock` 使用可学习的标量 $\alpha$ 初始化为零。若输入形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.7.4 mHC：流形约束超连接
 
-&emsp;&emsp;DeepSeek-V4 引入 mHC（Manifold-Constrained Hyper-Connections），将残差流从一维变成 $n_{hc}$ 条并行通道，每层之间通过一个矩阵 $B$ 来混合。核心创新在于将矩阵 $B$ 约束到双随机矩阵的流形上（Birkhoff polytope），行和列都归一化为 1。这个约束带来两个关键好处：矩阵的谱范数天然不超过 1，残差传播有了硬上限，不会爆炸；这种矩阵在乘法下是封闭的，堆叠很多层仍然稳定。输入映射 $A$ 和输出映射 $C$ 通过 Sigmoid 函数保证非负且有界，避免信号互相抵消。
+&emsp;&emsp;mHC（Manifold-Constrained Hyper-Connections，流形约束超连接）由字节跳动 Seed 团队于 2025 年提出，是对超连接（Hyper-Connections, HC）的改进。超连接将标准残差连接从单条主干扩展为 $n$ 条并行残差流，每层通过可学习的混合矩阵在这 $n$ 条流之间重新分配信息，从而提升模型的表达能力和训练稳定性。
+
+&emsp;&emsp;设第 $l$ 层有 $n$ 条残差流 $x_l^{(1)}, \dots, x_l^{(n)}$，超连接的更新规则为：
+
+$$
+x_{l+1}^{(i)} = \sum_{j=1}^{n} A_{ij} x_l^{(j)} + F_l\left(\sum_{j=1}^{n} B_{ij} x_l^{(j)}\right)
+$$
+
+&emsp;&emsp;其中 $A \in \mathbb{R}^{n \times n}$ 是残差流的混合矩阵，$B \in \mathbb{R}^{n \times n}$ 是子层输入的混合矩阵。当 $n=1$ 时，超连接退化为标准残差连接。HC 的问题是 $A$ 和 $B$ 是无约束的可学习矩阵，训练中可能出现特征值超出稳定范围的情况，导致残差流爆炸或消失。
+
+&emsp;&emsp;mHC 的核心创新是将混合矩阵 $A$ 约束在双随机矩阵流形上，即 $A$ 的每一行和每一列的元素之和都等于 1，且所有元素非负：
+
+$$
+A \mathbf{1} = \mathbf{1}, \quad \mathbf{1}^\top A = \mathbf{1}^\top, \quad A_{ij} \geq 0
+$$
+
+&emsp;&emsp;双随机矩阵的谱范数不超过 1，即所有特征值的绝对值 $\leq 1$，且 1 是最大的特征值。这意味着残差流的混合是保范的，不会放大信号，从而保证了深层堆叠的稳定性。此外，双随机矩阵的乘积仍然是双随机矩阵，因此多层混合的复合仍然保持稳定。
+
+&emsp;&emsp;为了让 $A$ 在训练中始终保持双随机性，mHC 采用 Sinkhorn-Knopp 算法对可学习的原始矩阵进行归一化，或将参数化设计为流形上的内在坐标。mHC 的优点是显著提升了深层网络的训练稳定性，双随机约束使残差流的谱范数有界，混合矩阵的复合不会放大信号，在视觉和大语言模型任务上都报告了优于标准残差连接的性能；缺点是引入了 $n^2$ 级别的混合参数和额外的 Sinkhorn 归一化计算，$n$ 较大时计算开销不可忽略，且双随机约束可能限制了混合矩阵的表达能力。
+
+&emsp;&emsp;从维度视角看，mHC 将残差路径从单条主干扩展为 $n$ 条并行流，并通过双随机矩阵在各流之间做保范的线性混合。这相当于在特征维上维护了 $n$ 条并行的信息高速公路，并通过流形约束保证信息在流之间的重新分配不会导致尺度失控。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 mHC 的裸实现，包含双随机约束的混合矩阵和 Sinkhorn 归一化：
+
+```python
+import torch
+import torch.nn as nn
+
+class ManifoldConstrainedHyperConnection(nn.Module):
+    """mHC: 多条残差流 + 双随机混合矩阵"""
+    def __init__(self, d_model, num_streams, d_ff, sinkhorn_iters=20):
+        super().__init__()
+        self.num_streams = num_streams
+        self.sinkhorn_iters = sinkhorn_iters
+
+        # 混合矩阵的可学习原始参数
+        self.A_raw = nn.Parameter(torch.eye(num_streams) + 0.01 * torch.randn(num_streams, num_streams))
+        self.B_raw = nn.Parameter(torch.eye(num_streams) + 0.01 * torch.randn(num_streams, num_streams))
+
+        # 子层参数
+        self.W_1 = nn.Parameter(torch.empty(d_model, d_ff))
+        self.b_1 = nn.Parameter(torch.zeros(d_ff))
+        self.W_2 = nn.Parameter(torch.empty(d_ff, d_model))
+        self.b_2 = nn.Parameter(torch.zeros(d_model))
+        nn.init.xavier_uniform_(self.W_1)
+        nn.init.xavier_uniform_(self.W_2)
+
+    def _sinkhorn(self, M):
+        """Sinkhorn-Knopp 算法: 将正矩阵归一化为双随机矩阵"""
+        M = torch.exp(M)  # 保证非负
+        for _ in range(self.sinkhorn_iters):
+            M = M / (M.sum(dim=1, keepdim=True) + 1e-9)
+            M = M / (M.sum(dim=0, keepdim=True) + 1e-9)
+        return M
+
+    def forward(self, streams):
+        """
+        streams: (n, B, L, d_model) 或 list of (B, L, d_model)
+        """
+        # 双随机混合矩阵
+        A = self._sinkhorn(self.A_raw)  # (n, n)
+        B = self._sinkhorn(self.B_raw)
+
+        # 堆叠为 (n, B, L, d_model)
+        if isinstance(streams, list):
+            X = torch.stack(streams, dim=0)
+        else:
+            X = streams
+        n = X.size(0)
+
+        # 残差流混合: sum_j A_ij X_j
+        X_mixed = torch.einsum("ij,jbld->ibld", A, X)
+        # 子层输入混合: sum_j B_ij X_j
+        X_sub = torch.einsum("ij,jbld->ibld", B, X)
+
+        # 子层计算
+        hidden = torch.relu(torch.matmul(X_sub, self.W_1) + self.b_1)
+        F_out = torch.matmul(hidden, self.W_2) + self.b_2
+
+        # 输出: 混合残差 + 子层输出
+        return X_mixed + F_out
+```
+
+&emsp;&emsp;这个实现中，`_sinkhorn` 将可学习的原始矩阵归一化为双随机矩阵，保证谱范数不超过 1。若输入为 $n$ 条残差流，每条形状为 $(B,L,d_{model})$，输出形状相同。
+
+---
 
 #### 2.7.5 双随机矩阵与 Sinkhorn-Knopp
 
-&emsp;&emsp;双随机矩阵是行和列都归一化为 1 的矩阵。实现上使用 Sinkhorn-Knopp 迭代，交替做行归一化和列归一化，迭代 20 次收敛。DeepSeek 做了 fused kernel 配合选择性 recomputation，实测 mHC 带来的 wall-time 开销控制在 overlapped pipeline 的 6.7%。
+&emsp;&emsp;双随机矩阵（Doubly Stochastic Matrix）是指所有元素非负、每行之和为 1、每列之和也为 1 的方阵。形式化地，$A \in \mathbb{R}^{n \times n}$ 是双随机矩阵当且仅当：
+
+$$
+A_{ij} \geq 0, \quad \sum_{j=1}^{n} A_{ij} = 1, \quad \sum_{i=1}^{n} A_{ij} = 1
+$$
+
+&emsp;&emsp;双随机矩阵在数学上具有优良的性质。根据 Birkhoff-von Neumann 定理，任何双随机矩阵都可以表示为置换矩阵的凸组合。双随机矩阵的谱范数不超过 1，即 $\|A\|_2 \leq 1$，且 1 是最大特征值，对应的特征向量是 $\mathbf{1}/\sqrt{n}$。这意味着双随机矩阵作用在任意向量上不会放大其范数，且双随机矩阵的乘积仍然是双随机矩阵。这些性质使双随机矩阵成为残差流混合的理想选择：多层复合后信号不会爆炸，也不会消失。
+
+&emsp;&emsp;Sinkhorn-Knopp 算法是一种将正矩阵迭代归一化为双随机矩阵的经典算法。给定一个元素全为正的矩阵 $M$，算法交替进行行归一化和列归一化：
+
+$$
+M^{(t+1/2)} = \mathrm{diag}(M^{(t)} \mathbf{1})^{-1} M^{(t)}
+$$
+
+$$
+M^{(t+1)} = M^{(t+1/2)} \mathrm{diag}(\mathbf{1}^\top M^{(t+1/2)})^{-1}
+$$
+
+&emsp;&emsp;即先把每一行归一化到和为 1，再把每一列归一化到和为 1，如此交替迭代。Sinkhorn 证明了对于任意正矩阵，这个过程收敛到一个双随机矩阵。实际中迭代 10 到 20 次即可达到足够精度。在 mHC 中，可学习的原始矩阵 $A_{raw}$ 先通过指数函数映射到正数域，再用 Sinkhorn 归一化为双随机矩阵。
+
+&emsp;&emsp;双随机矩阵与 Sinkhorn-Knopp 的优点是数学性质优良，谱范数有界保证信号不放大，乘积封闭性保证多层复合稳定，Sinkhorn 算法简单且收敛快，无需额外的超参数；缺点是 Sinkhorn 迭代增加了前向和反向的计算开销，且双随机约束将所有矩阵限制在同一流形上，可能损失部分表达能力，对于非方阵或非平衡场景，双随机约束需要推广为行随机或列随机。
+
+&emsp;&emsp;从维度视角看，双随机矩阵在特征维上提供了一种保范的线性混合：它重新分配各条残差流的信息，但不改变总的信息量。Sinkhorn-Knopp 算法则是将无约束的可学习矩阵投影到这个保范流形上的工具。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出双随机矩阵和 Sinkhorn-Knopp 算法的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+def sinkhorn_knopp(M, num_iters=20, eps=1e-9):
+    """
+    将正矩阵 M 归一化为双随机矩阵。
+    M: (n, n) 元素为正的矩阵
+    """
+    M = M.clone()
+    for _ in range(num_iters):
+        # 行归一化
+        M = M / (M.sum(dim=1, keepdim=True) + eps)
+        # 列归一化
+        M = M / (M.sum(dim=0, keepdim=True) + eps)
+    return M
+
+
+class DoublyStochasticLinear(nn.Module):
+    """参数化双随机矩阵的模块"""
+    def __init__(self, n, num_iters=20):
+        super().__init__()
+        self.n = n
+        self.num_iters = num_iters
+        # 可学习原始参数
+        self.M_raw = nn.Parameter(torch.randn(n, n) * 0.01)
+
+    def forward(self):
+        # 指数映射到正数域，再 Sinkhorn 归一化
+        M = torch.exp(self.M_raw)
+        return sinkhorn_knopp(M, self.num_iters)
+
+
+# 验证双随机性质
+if __name__ == "__main__":
+    layer = DoublyStochasticLinear(n=4)
+    A = layer()
+    print("行和:", A.sum(dim=1))  # 应接近全 1
+    print("列和:", A.sum(dim=0))  # 应接近全 1
+    print("最小元素:", A.min().item())  # 应 >= 0
+    # 谱范数检查
+    print("谱范数:", torch.linalg.norm(A, ord=2).item())  # 应 <= 1
+```
+
+&emsp;&emsp;这个实现中，`sinkhorn_knopp` 交替进行行归一化和列归一化，将任意正矩阵转化为双随机矩阵。`DoublyStochasticLinear` 将可学习参数通过指数映射保证非负，再经 Sinkhorn 归一化。实际使用中，每次前向传播都需要调用 Sinkhorn 迭代，反向传播通过迭代过程自动求导。若输入矩阵形状为 $(n,n)$，输出形状相同，且满足行和、列和均为 1。
+
 
 ---
 
@@ -3613,23 +5026,311 @@ $$
 
 #### 2.8.1 BPE
 
-&emsp;&emsp;BPE（Byte Pair Encoding）通过迭代合并频率最高的字节对来构建词表。GPT-1 使用的 BPE 分词器以 Unicode 字符为基本单位，词表大小为 40,478，仍然存在一定数量的未登录词（OOV）。
+&emsp;&emsp;BPE（Byte Pair Encoding，字节对编码）最初是一种数据压缩算法，后被 Sennrich 等人引入神经机器翻译，成为最常用的子词分词方法之一。BPE 的核心思想是从字符级表示出发，迭代合并频率最高的相邻符号对，逐步构建子词词表。训练过程为：将语料中的每个词拆分为字符序列，并在词尾添加结束符；统计所有相邻符号对的频率；合并频率最高的符号对为一个新符号；重复上述过程直到词表达到预设大小。编码时，将新词拆分为字符，然后按照训练时学到的合并规则依次合并，直到无法再合并。
+
+&emsp;&emsp;设当前符号序列为 $s = (s_1, s_2, \dots, s_m)$，相邻符号对 $(s_i, s_{i+1})$ 的频率为 $\mathrm{freq}(s_i, s_{i+1})$。BPE 每步选择：
+
+$$
+(a, b) = \arg\max_{(x,y)} \mathrm{freq}(x, y)
+$$
+
+&emsp;&emsp;然后将所有出现的相邻对 $(a, b)$ 合并为新符号 $ab$。BPE 的优点是算法简单、训练和编码速度快，能有效平衡词表大小和序列长度，且对未登录词可以通过子词组合表示；缺点是合并规则基于频率贪心选择，可能产生不合理的子词边界，对多语言和形态丰富语言的支持依赖训练语料，且字符级初始化使低频字符的表示可能不够充分。
+
+&emsp;&emsp;从维度视角看，BPE 在 token 维上做了一次离散化的降维：将字符序列合并为更长的子词单元，减少序列长度，同时保持词表规模可控。
+
+**&emsp;&emsp;Python 实现示例**
+
+&emsp;&emsp;下面给出 BPE 训练和编码的裸实现：
+
+```python
+from collections import Counter
+
+def get_stats(vocab):
+    """统计相邻符号对频率"""
+    pairs = Counter()
+    for word, freq in vocab.items():
+        symbols = word.split()
+        for i in range(len(symbols) - 1):
+            pairs[(symbols[i], symbols[i+1])] += freq
+    return pairs
+
+def merge_vocab(pair, vocab):
+    """合并指定符号对"""
+    new_vocab = {}
+    bigram = ' '.join(pair)
+    replacement = ''.join(pair)
+    for word, freq in vocab.items():
+        new_word = word.replace(bigram, replacement)
+        new_vocab[new_word] = freq
+    return new_vocab
+
+def train_bpe(corpus, num_merges):
+    # 初始化：每个词拆为字符，词尾加 </w>
+    vocab = Counter()
+    for word in corpus:
+        chars = ' '.join(list(word)) + ' </w>'
+        vocab[chars] += 1
+
+    merges = []
+    for _ in range(num_merges):
+        pairs = get_stats(vocab)
+        if not pairs:
+            break
+        best = max(pairs, key=pairs.get)
+        vocab = merge_vocab(best, vocab)
+        merges.append(best)
+    return merges
+
+def encode_bpe(word, merges):
+    symbols = list(word) + ['</w>']
+    for a, b in merges:
+        i = 0
+        while i < len(symbols) - 1:
+            if symbols[i] == a and symbols[i+1] == b:
+                symbols = symbols[:i] + [a+b] + symbols[i+2:]
+            else:
+                i += 1
+    return symbols
+```
+
+&emsp;&emsp;这个实现中，`train_bpe` 迭代合并频率最高的相邻符号对，`encode_bpe` 按合并顺序依次应用规则。若输入为单词列表，输出为子词序列。
+
+---
 
 #### 2.8.2 Byte-level BPE
 
-&emsp;&emsp;GPT-2 将分词器升级为 Byte-level BPE：以 256 个字节作为基础字符集，通过 BPE 合并操作构建词表，最终词表大小为 50,257。Byte-level BPE 的关键优势在于：任何 Unicode 文本都可以被无损地表示为字节序列，因此词汇表中不存在任何 OOV token。GPT-2 的 Byte-level BPE 分词器被后续几乎所有 GPT 系列模型沿用。
+&emsp;&emsp;Byte-level BPE（字节级 BPE）由 Radford 等人在 GPT-2 中提出，将 BPE 的基础单元从 Unicode 字符改为字节。文本首先被编码为 UTF-8 字节序列，每个字节映射到一个可打印的 Unicode 字符，然后在这个字节序列上执行标准 BPE。基础词表固定为 256 个字节，因此任何文本都可以被无损表示，不存在未登录词问题。
+
+&emsp;&emsp;字节级 BPE 的关键设计是字节到 Unicode 的映射表，将 256 个字节中的可打印字符保持不变，不可打印字符映射到 Unicode 的私用区或其他可打印区间。例如，空格映射为 Ġ，换行映射为 Ċ。设字节序列为 $b_1, b_2, \dots, b_m$，映射函数为 $\phi$，则初始符号序列为 $\phi(b_1), \phi(b_2), \dots, \phi(b_m)$，然后执行标准 BPE 合并。
+
+&emsp;&emsp;字节级 BPE 的优点是完全消除了未登录词问题，任何文本都可以表示，且对多语言、表情符号、代码等混合内容鲁棒；缺点是字节级序列比字符级更长，导致序列长度增加，推理速度变慢，且多字节字符被拆分为多个字节，可能增加模型学习难度。
+
+&emsp;&emsp;从维度视角看，字节级 BPE 将 token 维的离散化粒度降到字节级别，使词表覆盖所有可能的输入，但代价是序列长度增加，注意力计算的 token 维规模变大。
+
+**&emsp;&emsp;Python 实现示例**
+
+&emsp;&emsp;下面给出字节级 BPE 的字节映射和简化训练实现：
+
+```python
+from collections import Counter
+
+def bytes_to_unicode():
+    """构建字节到可打印 Unicode 的映射"""
+    bs = list(range(ord("!"), ord("~")+1)) + \
+         list(range(ord("¡"), ord("¬")+1)) + \
+         list(range(ord("®"), ord("ÿ")+1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return dict(zip(bs, [chr(c) for c in cs]))
+
+def train_byte_level_bpe(corpus, num_merges):
+    byte_encoder = bytes_to_unicode()
+    vocab = Counter()
+    for text in corpus:
+        # 文本 -> UTF-8 字节 -> 映射为 Unicode 字符
+        byte_seq = text.encode('utf-8')
+        symbols = [byte_encoder[b] for b in byte_seq]
+        vocab[' '.join(symbols)] += 1
+
+    merges = []
+    for _ in range(num_merges):
+        pairs = Counter()
+        for word, freq in vocab.items():
+            syms = word.split()
+            for i in range(len(syms)-1):
+                pairs[(syms[i], syms[i+1])] += freq
+        if not pairs:
+            break
+        best = max(pairs, key=pairs.get)
+        new_vocab = {}
+        bigram = ' '.join(best)
+        repl = ''.join(best)
+        for word, freq in vocab.items():
+            new_vocab[word.replace(bigram, repl)] = freq
+        vocab = new_vocab
+        merges.append(best)
+    return merges, byte_encoder
+```
+
+&emsp;&emsp;这个实现中，文本先被编码为 UTF-8 字节，再映射为可打印 Unicode 字符，然后执行 BPE 合并。任何输入都可以被表示，不会出现未登录词。
+
+---
 
 #### 2.8.3 SentencePiece
 
-&emsp;&emsp;Gopher 使用 SentencePiece 分词器。SentencePiece 将文本视为 Unicode 字符序列，支持直接从原始文本训练分词器，无需预分词。
+&emsp;&emsp;SentencePiece 由 Kudo 和 Richardson 于 2018 年提出，是一种语言无关的子词分词框架。与 BPE 需要预分词不同，SentencePiece 直接将原始文本视为 Unicode 字符序列，包括空格，然后在该序列上训练 BPE 或 Unigram 语言模型。空格被转义为特殊符号 ▁（U+2581），使分词过程完全可逆，解码时只需将 ▁ 替换回空格。
+
+&emsp;&emsp;SentencePiece 支持两种主要算法：BPE 和 Unigram。Unigram 语言模型从一个大词表开始，迭代删除对语言模型概率损失最小的子词，直到达到目标词表大小。与 BPE 的贪心合并不同，Unigram 基于概率模型，通常能产生更合理的子词划分。SentencePiece 的编码过程使用 Viterbi 算法在 Unigram 模型中寻找最优分割。
+
+&emsp;&emsp;SentencePiece 的优点是语言无关，不需要预分词，适合中文、日文等无空格语言，可逆性保证解码无损，且支持 BPE 和 Unigram 两种算法，灵活性强；缺点是训练速度比纯 BPE 慢，Unigram 模型的实现复杂度较高，且 ▁ 符号的引入使词表中包含特殊标记，需要额外处理。
+
+&emsp;&emsp;从维度视角看，SentencePiece 在 token 维上直接对 Unicode 字符序列做子词切分，不依赖语言特定的预分词规则，使 token 维的离散化对多语言统一。
+
+**&emsp;&emsp;Python 实现示例**
+
+&emsp;&emsp;下面给出 SentencePiece 风格的 Unigram 简化实现，包含 ▁ 转义和 Viterbi 编码：
+
+```python
+import math
+from collections import Counter
+
+def prepare_text(text):
+    """将空格替换为 ▁"""
+    return text.replace(' ', '▁')
+
+def train_unigram(corpus, target_vocab_size):
+    """简化 Unigram 训练：从字符开始，统计子词频率"""
+    vocab = Counter()
+    for text in corpus:
+        text = prepare_text(text)
+        for ch in text:
+            vocab[ch] += 1
+    # 简化为字符级词表，实际 Unigram 会迭代剪枝
+    return dict(vocab)
+
+def encode_unigram(text, vocab):
+    """Viterbi 最优分割"""
+    text = prepare_text(text)
+    n = len(text)
+    # dp[i] = (最小负对数概率, 最优分割)
+    dp = [(0.0, []) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        best = (float('inf'), None)
+        for j in range(i):
+            sub = text[j:i]
+            if sub in vocab:
+                prob = vocab[sub] / sum(vocab.values())
+                cost = dp[j][0] - math.log(prob + 1e-9)
+                if cost < best[0]:
+                    best = (cost, j)
+        if best[1] is not None:
+            j = best[1]
+            dp[i] = (best[0], dp[j][1] + [text[j:i]])
+        else:
+            dp[i] = (dp[i-1][0] - math.log(1e-9), dp[i-1][1] + [text[i-1]])
+    return dp[n][1]
+```
+
+&emsp;&emsp;这个实现中，`prepare_text` 将空格替换为 ▁，`encode_unigram` 使用 Viterbi 算法寻找最优子词分割。实际 SentencePiece 会训练完整的 Unigram 模型并剪枝词表。
+
+---
 
 #### 2.8.4 tiktoken
 
-&emsp;&emsp;LLaMA 3 的词汇表从 LLaMA 2 的 32K 扩展到 128K token，使用 OpenAI 的 tiktoken 分词器开发。这一扩展显著提升了多语言场景下的分词效率——中文、日文、韩文等非拉丁语系的 token 压缩率大幅改善，同等文本所需的 token 数量减少，间接扩展了有效上下文长度。
+&emsp;&emsp;tiktoken 是 OpenAI 开发的快速 BPE 分词器，用于 GPT 系列模型。它的核心是字节级 BPE，但引入了一个正则表达式预分词步骤，将文本按模式拆分为片段，再对每个片段应用 BPE。GPT-2 使用的正则模式为：
+
+$$
+\text{pattern} = \text{``'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+''}
+$$
+
+&emsp;&emsp;这个模式将缩写、字母、数字、标点和空白分开，使 BPE 在不同类别内部合并，避免跨类别产生不合理的子词。tiktoken 的另一个优化是使用 Rust 实现核心循环，并支持并行编码，速度远快于 Python 实现。tiktoken 的优点是速度极快，与 OpenAI 模型完全兼容，字节级 BPE 保证无未登录词，正则预分词提升了子词质量；缺点是主要用于 OpenAI 模型，词表固定，不便于自定义训练，且正则模式对多语言特别是中文、日文等无空格语言的支持有限，需要依赖字节回退。
+
+&emsp;&emsp;从维度视角看，tiktoken 在 BPE 之前增加了一次基于正则的 token 维预切分，将文本按字符类别分组，使后续 BPE 合并在语义一致的片段内进行。
+
+**&emsp;&emsp;Python 实现示例**
+
+&emsp;&emsp;下面给出 tiktoken 风格的正则预分词 + 字节级 BPE 的简化实现：
+
+```python
+import re
+from collections import Counter
+
+# GPT-2 风格的正则预分词模式（简化）
+PAT = re.compile(r"'s|'t|'re|'ve|'m|'ll|'d| ?\w+| ?\d+| ?[^\s\w\d]+|\s+(?!\S)|\s+")
+
+def bytes_to_unicode():
+    bs = list(range(ord("!"), ord("~")+1)) + \
+         list(range(ord("¡"), ord("¬")+1)) + \
+         list(range(ord("®"), ord("ÿ")+1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return dict(zip(bs, [chr(c) for c in cs]))
+
+def pre_tokenize(text):
+    return PAT.findall(text)
+
+def byte_level_bpe_train(corpus, num_merges):
+    byte_encoder = bytes_to_unicode()
+    vocab = Counter()
+    for text in corpus:
+        for chunk in pre_tokenize(text):
+            byte_seq = chunk.encode('utf-8')
+            symbols = [byte_encoder[b] for b in byte_seq]
+            vocab[' '.join(symbols)] += 1
+
+    merges = []
+    for _ in range(num_merges):
+        pairs = Counter()
+        for word, freq in vocab.items():
+            syms = word.split()
+            for i in range(len(syms)-1):
+                pairs[(syms[i], syms[i+1])] += freq
+        if not pairs:
+            break
+        best = max(pairs, key=pairs.get)
+        bigram = ' '.join(best)
+        repl = ''.join(best)
+        new_vocab = {}
+        for word, freq in vocab.items():
+            new_vocab[word.replace(bigram, repl)] = freq
+        vocab = new_vocab
+        merges.append(best)
+    return merges, byte_encoder
+```
+
+&emsp;&emsp;这个实现中，`pre_tokenize` 使用正则将文本拆分为片段，然后对每个片段做字节级 BPE。实际 tiktoken 使用预编译的词表和 Rust 加速。
+
+---
 
 #### 2.8.5 词表大小与多语言
 
-&emsp;&emsp;Qwen2 的词表大小为 151,643 个常规词元加 3 个控制词元，所有规模的模型共享同一词汇表。Qwen2 的分词器对中文的压缩效率显著优于 LLaMA 系列的 128K 分词器。Qwen3 将多语言支持从 Qwen2.5 的 29 种扩展至 119 种语言及方言。
+&emsp;&emsp;词表大小是多语言模型设计中的关键超参数。词表越大，单个 token 能承载的信息越多，序列长度越短，但嵌入矩阵和输出层的参数量也越大，且低频 token 的训练样本不足，容易欠拟合。词表越小，参数量越少，但序列长度增加，注意力计算的成本上升，且多语言字符可能被拆分为多个字节，进一步拉长序列。
+
+&emsp;&emsp;设词表大小为 $V$，模型维度为 $d$，则嵌入矩阵参数量为 $V \times d$。对于 128K 词表和 4096 维模型，嵌入矩阵约有 5 亿参数。多语言场景下，不同语言的字符频率差异巨大，若训练语料以英语为主，其他语言的字符可能被拆分得很碎。常见的平衡策略包括：增加词表大小以覆盖更多语言的常用子词；为特定语言添加专用 token；使用字节级回退保证任何语言都能表示；在训练语料中按语言比例采样，使词表反映多语言分布。
+
+&emsp;&emsp;词表大小与多语言的权衡没有统一最优解。实践表明，英语为主的模型词表通常在 32K 到 128K 之间，多语言模型倾向于使用更大的词表（如 128K 到 256K），并在训练中引入语言特定的子词。词表大小与多语言设计的优点是合理配置可以显著提升多语言性能，减少序列长度和推理成本；缺点是词表扩大带来参数量和显存开销，多语言平衡需要大量实验调优，且小语种在词表中仍可能被过度拆分。
+
+&emsp;&emsp;从维度视角看，词表大小决定了 token 维离散化的粒度：词表越大，每个 token 覆盖的字符越多，序列越短；词表越小，序列越长但词表嵌入矩阵越小。多语言场景需要在不同语言的字符分布之间找到平衡点。
+
+**&emsp;&emsp;Python 实现示例**
+
+&emsp;&emsp;下面给出词表大小与序列长度的简单分析代码：
+
+```python
+import math
+
+def vocab_tradeoff(vocab_size, d_model, avg_token_per_word=1.0):
+    """计算嵌入参数量和序列长度关系"""
+    embed_params = vocab_size * d_model
+    # 假设词表越大，平均每个 token 覆盖的字符越多
+    avg_chars_per_token = math.log(vocab_size) / math.log(2)
+    seq_len_factor = 1.0 / avg_chars_per_token
+    return {
+        "vocab_size": vocab_size,
+        "embed_params": embed_params,
+        "avg_chars_per_token": avg_chars_per_token,
+        "relative_seq_len": seq_len_factor,
+    }
+
+# 示例：比较不同词表大小
+for vs in [32000, 64000, 128000, 256000]:
+    result = vocab_tradeoff(vs, d_model=4096)
+    print(f"词表 {vs:6d} | 嵌入参数 {result['embed_params']/1e6:8.1f}M | "
+          f"平均字符/token {result['avg_chars_per_token']:.2f} | "
+          f"相对序列长度 {result['relative_seq_len']:.4f}")
+```
+
+&emsp;&emsp;这个实现中，`vocab_tradeoff` 展示了词表大小与嵌入参数量、平均字符/token 数的关系。实际模型设计中，需要结合训练语料的多语言分布、序列长度限制和硬件显存综合选择词表大小。
 
 ---
 
@@ -3637,23 +5338,18 @@ $$
 
 #### 2.9.1 自回归语言建模
 
-&emsp;&emsp;自回归语言建模是 GPT 系列和 LLaMA 系列的核心预训练目标：给定前文 token 序列，预测下一个 token。训练损失为交叉熵。GPT-3 的训练目标仍然是无监督的下一个 token 预测，模型从未见过“任务描述 + 示例 + 输出”这种格式的标注数据。
 
 #### 2.9.2 掩码语言建模
 
-&emsp;&emsp;BERT 使用掩码语言建模：随机遮蔽输入中的部分 token，训练模型根据上下文重建被遮蔽的 token。它提供双向上下文理解，适合理解类任务，但无法直接生成文本。
 
 #### 2.9.3 Span Corruption
 
-&emsp;&emsp;T5 的预训练目标是 span corruption，受 SpanBERT 启发。从输入文本中随机选择连续 token 跨度，将这些跨度替换为特殊的哨兵 token，然后训练模型根据上下文重建被替换的原始文本。具体参数为：破坏原始序列的 15%，每个被替换的跨度平均长度为 3 个 token。span corruption 在生成任务上表现优于独立同分布的掩码语言建模，且由于目标序列通常比输入序列短得多，训练的计算效率也更高。
 
 #### 2.9.4 多 Token 预测（MTP）
 
-&emsp;&emsp;DeepSeek-V3 要求模型在每个位置同时预测多个未来 token。这一目标通过完整的因果链增强了训练信号的密度，使模型能够更好地进行规划和推理。消融实验表明，MTP 策略持续提升了模型在大多数评估基准上的性能。MiMo-V2-Flash 也采用多层 MTP 推理加速技术。
 
 #### 2.9.5 降噪自编码
 
-&emsp;&emsp;T5 的 span corruption 是一种降噪自编码目标。UL2 在 T5 的基础上提出了 Mixture-of-Denoisers 目标，混合了 span corruption、极端 span corruption 和顺序 PrefixLM 三种降噪任务，进一步提升了预训练的通用性。
 
 ---
 
@@ -3661,31 +5357,24 @@ $$
 
 #### 2.10.1 Adam
 
-&emsp;&emsp;Adam 是常用的自适应优化器。Gopher 使用 Adam。Kimi K2 摒弃了传统的 Adam 优化器，创新性地使用了 Muon 优化器。
 
 #### 2.10.2 AdamW
 
-&emsp;&emsp;Chinchilla 将优化器从 Adam 替换为 AdamW，这一改动被报告为改善了语言建模损失和下游任务性能。DeepSeek-V4 将 V3 使用的 AdamW 替换为 Muon 优化器。
 
 #### 2.10.3 Muon
 
-&emsp;&emsp;Muon 最早由 Kimi 团队在大规模训练中验证，其在大规模训练中表现出更快的收敛速度和更好的训练稳定性，同时优化了梯度更新过程，减少了内存占用。DeepSeek-V4 采用 Muon 优化器替代 AdamW，接管绝大多数参数的训练。
 
 #### 2.10.4 MuonClip
 
-&emsp;&emsp;Kimi K2 在 Muon 基础上引入了 QK-clip 技术，形成 MuonClip 优化器，有效缓解了训练过程中的不稳定性问题。基于 MuonClip，K2 在 15.5 万亿 token 的数据上完成了训练。
 
 #### 2.10.5 L-BFGS
 
-&emsp;&emsp;Chinchilla 的缩放实验采用 L-BFGS 优化拟合损失函数的参数。
 
 #### 2.10.6 FP8 混合精度训练
 
-&emsp;&emsp;DeepSeek-V3 首次在超大规模模型上验证了 FP8 混合精度训练的有效性。通过精细的量化策略，模型在 FP8 精度下进行前向和反向计算，同时以 BF16 格式存储低精度优化器状态，显著提升了训练速度并降低了 GPU 内存占用。这一技术是 DeepSeek-V3 能够以 2.788M H800 GPU 小时完成 671B 模型训练的关键因素之一。
 
 #### 2.10.7 BF16 与 INT4 量化
 
-&emsp;&emsp;GPT-4o 通过 INT4 量化将模型体积缩小至原版的 1/8，同时保持 98% 的精度，使边缘设备上的本地运行成为可能。LLaMA 3.1 405B 使用 int8 量化需要约 400GB 显存。Mixtral 8x7B 可通过 int4 量化进一步压缩模型大小。
 
 ---
 
@@ -3693,57 +5382,36 @@ $$
 
 #### 2.11.1 监督微调（SFT）
 
-&emsp;&emsp;InstructGPT 的 SFT 阶段使用约 13,000 条训练样例，模型在 GPT-3 的基础上进行监督微调，训练 16 个 epoch。Qwen2.5 的 SFT 阶段使用了超过 100 万个高质量指令样本。LLaMA 3.1 的 SFT 数据来源包括人工标注和合成数据。
 
 #### 2.11.2 RLHF
 
-&emsp;&emsp;RLHF（Reinforcement Learning from Human Feedback）由 InstructGPT 提出，三步框架为 SFT → 奖励模型 → PPO。RLHF 的目标不是提升模型的知识或推理能力，而是调整它的行为倾向：在多种可能的输出中，选择更符合人类偏好的那一种。
 
 #### 2.11.3 奖励模型（RM）
 
-&emsp;&emsp;奖励模型的任务是学习“什么样的输出更符合人类偏好”，并将其量化为一个标量奖励值。OpenAI 选择使用 6B 参数的模型作为奖励模型，而非 175B 版本。损失函数采用 pairwise 排序损失：
-
-$$
-\mathcal{L}_{\text{RM}}(\theta) = -\mathbb{E}_{(x, y_w, y_l)} \left[ \log \sigma \left( r_\theta(x, y_w) - r_\theta(x, y_l) \right) \right]
-$$
 
 #### 2.11.4 PPO
 
-&emsp;&emsp;PPO 阶段的目标是让 SFT 模型学会生成能够从奖励模型获得高分的输出。OpenAI 在目标函数中加入了逐 token 的 KL 散度惩罚，约束策略模型的输出分布不要偏离 SFT 模型太远：
-
-$$
-\text{objective}(\phi) = \mathbb{E}_{(x,y) \sim \pi_\phi^{RL}} \left[ r_\theta(x, y) - \beta \log \frac{\pi_\phi^{RL}(y|x)}{\pi^{SFT}(y|x)} \right]
-$$
-
-&emsp;&emsp;此外，OpenAI 还提出了 PPO-ptx 变体，在 PPO 的优化目标中额外加入预训练数据的梯度更新项，缓解“对齐税”。
 
 #### 2.11.5 DPO
 
-&emsp;&emsp;DPO（Direct Preference Optimization）将奖励模型和策略模型合并为一个目标函数，直接使用偏好数据优化策略模型，避免了 PPO 中奖励模型和策略模型交替训练的复杂性。DPO 的训练稳定性优于 PPO，且不需要在线生成样本，训练效率更高。Qwen2.5 使用 DPO 进行离线学习。
 
 #### 2.11.6 GRPO
 
-&emsp;&emsp;GRPO（Group Relative Policy Optimization）由 DeepSeek 在 DeepSeek-Math 中提出。其核心思想是：对于每个问题，从旧策略中采样一组输出，计算组内每个输出的奖励，然后用组内均值和标准差对奖励进行归一化，得到每个输出的优势值。与 PPO 不同，GRPO 不需要训练独立的价值网络（critic），而是用组内相对比较来估计优势。GRPO 在数学和代码等需要精确推理的任务上表现尤为突出。Qwen2.5 使用 GRPO 进行在线学习，MiMo-V2-Flash 也使用 GRPO 进行强化学习优化。
 
 #### 2.11.7 拒绝采样
 
-&emsp;&emsp;LLaMA 3.1 后训练第二步是拒绝采样。对于每个提示，模型生成多个候选回答，通过奖励模型或人工评估筛选出最优回答，将筛选后的数据用于下一轮微调。Meta 的一个关键创新是：在拒绝采样阶段，从多个使用不同超参数训练的 DPO 模型中选择表现最好的模型来生成 Prompt 的回答。
 
 #### 2.11.8 RLAIF
 
-&emsp;&emsp;Google 的 Gemini 在 RLHF 之外引入了基于 AI 反馈的强化学习（RLAIF）。
 
 #### 2.11.9 宪法 AI 与自我纠正
 
-&emsp;&emsp;Anthropic 的 Claude 系列在 RLHF 基础上提出了 Constitutional AI，用一组明确的规则替代部分人类标注。Claude 5 最核心的创新是宪法自我纠正机制：在模型训练的底层植入一套“宪法”原则，使模型学会根据宪法原则自我评估并修正回应。这一机制使模型具备实时自检与价值偏差修正的能力。
 
 #### 2.11.10 可验证奖励
 
-&emsp;&emsp;DeepSeek-R1 的奖励设计完全使用基于规则的奖励，不涉及任何神经奖励模型。奖励由两部分组成：准确性奖励和格式奖励。准确性奖励评估最终答案是否正确——在数学问题上，模型需要将最终答案以指定格式输出；在代码竞赛问题上，使用编译器对模型输出进行预定义测试用例的评估。这一奖励设计的核心优势在于不可欺骗性。
 
 #### 2.11.11 思考预算
 
-&emsp;&emsp;Qwen3 引入思考预算机制，允许用户在推理过程中自适应分配计算资源，从而根据任务复杂度平衡延迟与性能。
 
 ---
 
@@ -3751,31 +5419,24 @@ $$
 
 #### 2.12.1 思维链（CoT）
 
-&emsp;&emsp;o1 和 o3 系列将推理时的计算量从固定值变为可调变量，让模型在生成最终答案之前，先生成一条内部的、隐藏的“思维链”，在思维链中探索、验证和修正推理过程，然后仅将结论呈现给用户。
 
 #### 2.12.2 隐藏思维链
 
-&emsp;&emsp;o1 的思维链是隐藏的。用户看到的是模型最终输出的简洁答案，而非思维链本身。隐藏思维链使 OpenAI 能够对思维链内容进行安全审查和过滤，同时也构成竞争壁垒。DeepSeek-R1 则采用公开的思维链格式。
 
 #### 2.12.3 推理时计算扩展
 
-&emsp;&emsp;o1 和 o3 代表了推理时计算扩展（Test-Time Compute Scaling）。OpenAI 研究员 Noam Brown 指出：“让模型在一手牌中思考 20 秒，获得的提升相当于将模型规模和训练扩大 100,000 倍。”在 AIME 2024 上，o1 的单样本贪婪解码达到 74%，64 样本多数投票达到 83%，1000 样本重排序达到 93%。
 
 #### 2.12.4 reasoning_effort
 
-&emsp;&emsp;o3 引入了 reasoning_effort 参数，允许开发者按请求控制模型的“思考深度”，支持低、中、高三个计算层级。在 ARC-AGI 基准上，低计算层级得分 75.7%，高计算层级达到 87.5%。
 
 #### 2.12.5 MCTS 与 Q*
 
-&emsp;&emsp;o3 的核心创新是将 Q* 算法与蒙特卡洛树搜索（MCTS）深度结合，形成“预测-验证-优化”的闭环推理系统。与 o1 的线性思维链不同，o3 的推理过程更像一棵搜索树：模型在推理过程中探索多条候选路径，通过奖励信号评估每条路径的潜力，然后选择最有希望的路径深入展开。
 
 #### 2.12.6 路由器与统一系统
 
-&emsp;&emsp;GPT-5 采用统一系统，由 gpt-5-main、gpt-5-thinking 和实时路由器组成。路由器根据对话类型、复杂度、工具需求和明确意图快速决定使用哪个模型。路由器持续基于真实信号进行训练。
 
 #### 2.12.7 推测解码
 
-&emsp;&emsp;推测解码的核心思想是“先猜后验”：使用一个更小、更快的“草稿模型”先生成 K 个候选 token，然后让大模型对这 K 个 token 进行一次性验证。由于大模型只需要进行一次前向传播就能验证多个 token，整体推理速度可以提升 2 到 3 倍，且理论上不损失生成质量。
 
 ---
 
@@ -3783,23 +5444,18 @@ $$
 
 #### 2.13.1 KV 缓存
 
-&emsp;&emsp;KV 缓存是自回归推理中缓存历史 Key 和 Value 的机制。MHA 的 KV 缓存大小与注意力头数成正比；MQA 将所有 Query 头共享同一组 KV 头；GQA 将 Query 头分组共享 KV 头；MLA 通过低秩压缩降低 KV 缓存的内存占用。
 
 #### 2.13.2 滚动缓冲区缓存
 
-&emsp;&emsp;Mistral 7B 配合滚动缓冲区缓存，可以在处理任意长度序列时保持恒定的显存占用。
 
 #### 2.13.3 量化
 
-&emsp;&emsp;GPT-4o 通过 INT4 量化将模型体积缩小至原版的 1/8，同时保持 98% 的精度。FP8 混合精度训练被 DeepSeek-V3 验证。LLaMA 3.1 405B 使用 int8 量化需要约 400GB 显存。
 
 #### 2.13.4 FlashAttention
 
-&emsp;&emsp;FlashAttention 通过分块计算和显存优化，将注意力操作的内存访问从二次方降低到线性，使长序列训练在合理显存下成为可能。Falcon 的训练和推理中大规模应用了 FlashAttention。
 
 #### 2.13.5 分块注意力掩码
 
-&emsp;&emsp;Llama 4 在推理阶段对特定层应用分块注意力掩码，将长序列分割为可管理的块进行处理，使模型能够在 10M token 的规模上保持内存效率。
 
 ---
 
@@ -3807,31 +5463,24 @@ $$
 
 #### 2.14.1 上下文窗口扩展
 
-&emsp;&emsp;从 GPT-2 的 1024 token 到 GPT-3 的 2048，再到 GPT-4 的 32K、LLaMA 3.1 的 128K、Gemini 1.5 Pro 的 100 万 token、Llama 4 Scout 的 1000 万 token，上下文窗口持续扩展。
 
 #### 2.14.2 RoPE 基频调整
 
-&emsp;&emsp;LLaMA 3.1 将 RoPE 基频从 10,000 提升到 500,000，使模型能够有效处理 32K 以上的上下文长度。
 
 #### 2.14.3 YARN
 
-&emsp;&emsp;YARN 用于重新调整注意力权重以实现更好的长度外推。Qwen2 引入 DCA 和 YARN，使模型在推理时能够有效处理超出训练长度的序列。
 
 #### 2.14.4 DCA
 
-&emsp;&emsp;DCA（Dual Chunk Attention）将长序列分割为可管理的长度块，在块内和跨块之间有效捕获相对位置信息。DCA 无需训练即可扩展上下文长度。
 
 #### 2.14.5 iRoPE
 
-&emsp;&emsp;Llama 4 的 iRoPE 交替使用带位置编码和不带位置编码的注意力层，使模型在超长上下文中既能利用位置信息进行精确检索，又能避免位置编码的数值不稳定性。
 
 #### 2.14.6 稀疏与混合注意力
 
-&emsp;&emsp;GLM-5 的 DSA、DeepSeek-V4 的 CSA + HCA、MiMo-V2 的 5:1 SWA + 全局注意力混合、Kimi K3 的 KDA + Gated MLA 3:1 混合，都是在保持长上下文理解能力的同时降低注意力计算量。
 
 #### 2.14.7 温度缩放与分块注意力掩码
 
-&emsp;&emsp;iRoPE 包含温度缩放，根据序列长度动态调整注意力分布的温度。Llama 4 在推理阶段对特定层应用分块注意力掩码。
 
 ---
 
@@ -3839,23 +5488,18 @@ $$
 
 #### 2.15.1 拼接式多模态
 
-&emsp;&emsp;GPT-4 的多模态是“拼接式”的：视觉和文本模态通过独立的编码器处理，然后在某个中间层进行融合。LLaVA、Flamingo 等开源多模态模型也采用类似设计——用独立的视觉编码器（如 CLIP ViT）提取图像特征，再通过交叉注意力或投影层注入语言模型。
 
 #### 2.15.2 早期融合
 
-&emsp;&emsp;Llama 4 采用早期融合策略，将文本和视觉信息在模型骨干的初始处理阶段即整合到统一表示空间。文本 token 和视觉 token 在进入 Transformer 的第一层之前就处于同一表示空间中，所有 Transformer 层都能同时“看到”两种模态的信息。
 
 #### 2.15.3 端到端统一
 
-&emsp;&emsp;GPT-4o 是端到端训练的单一模型，文本、视觉和音频的所有输入和输出都由同一个神经网络处理。其核心机制是动态跨模态注意力，通过模态掩码矩阵让模型在推理时动态决定不同模态特征的权重。
 
 #### 2.15.4 跨模态注意力
 
-&emsp;&emsp;GPT-4o 的动态跨模态注意力让模型在推理时动态决定不同模态特征的权重。Grok 3 在 CM3leon 架构基础上引入了跨模态注意力对齐机制、量子化语义编码器和时空连续性建模模块。
 
 #### 2.15.5 视觉编码器
 
-&emsp;&emsp;CLIP 采用双塔架构，包含一个图像编码器和一个文本编码器，两者相互独立但输出被投影到同一个高维语义空间。Kimi K3 的视觉编码器 MoonViT-V2 从零开始使用 next-token prediction 训练，无需对比预训练，在达到 SigLIP 初始化基线效果的同时获得了更稳定的优化过程。
 
 ---
 
@@ -3863,23 +5507,18 @@ $$
 
 #### 2.16.1 Kaplan Scaling
 
-&emsp;&emsp;Kaplan 等人（2020）的缩放定律认为，当计算预算增加 10 倍时，模型参数量应增加约 5.5 倍，而训练 token 数只需增加约 1.8 倍。这一结论直接指导了 GPT-3、Gopher、Jurassic-1 等模型的设计。
 
 #### 2.16.2 Chinchilla-optimal
 
-&emsp;&emsp;Chinchilla 论文通过对超过 400 个语言模型的系统实验，重新检验了 Kaplan 的结论。核心发现是：对于计算最优的训练，模型大小和训练 token 数应当等比例缩放——模型参数量每翻一倍，训练 token 数也应当翻一倍。Chinchilla 用 700 亿参数和 1.4 万亿 token，在相同计算预算下全面超越了 2800 亿参数的 Gopher。
 
 #### 2.16.3 训练时计算扩展
 
-&emsp;&emsp;GPT-3、Gopher、Chinchilla 等模型的核心优化方向是训练时效率——在给定计算预算下，如何通过数据规模、架构选择和训练流程优化来最大化模型能力。
 
 #### 2.16.4 推理时计算扩展
 
-&emsp;&emsp;o1 和 o3 的核心优化方向是推理时效率——在给定训练成本下，如何通过增加推理时的计算量来“解锁”更深层的推理能力。从 Kaplan Scaling 到 Chinchilla-optimal，再到 Inference-optimal，最终到 Test-time compute，LLM 的缩放范式从单一的训练规模维度逐步扩展到了训练效率、数据效率和推理计算的多维度优化。
 
 #### 2.16.5 Inference-optimal
 
-&emsp;&emsp;在推理成本成为主要瓶颈的场景下，继续扩大数据规模仍然有效，甚至比扩大参数量更具性价比。Qwen2.5-72B 以 LLaMA 3.1 405B 约五分之一的参数量，在多项基准上展现出与后者相当的性能。
 
 ---
 
@@ -3887,31 +5526,24 @@ $$
 
 #### 2.17.1 数据并行
 
-&emsp;&emsp;数据并行将同一模型复制到多个设备，每个设备处理不同批次的数据，然后汇总梯度。它是分布式训练的基础。
 
 #### 2.17.2 张量并行
 
-&emsp;&emsp;张量并行将单个 Transformer 层的权重矩阵切分到多个设备上。GPT-4 训练采用了 8 路张量并行，因为这是 NVLink 的限制——A100 的 NVLink 带宽支持 8 路全互联，超过 8 路后通信效率显著下降。
 
 #### 2.17.3 流水线并行
 
-&emsp;&emsp;流水线并行将模型的不同层放置在不同的设备上，数据以微批次的形式在设备之间流水线式传递。Falcon-180B 训练使用了 3D 并行策略（张量并行 + 流水线并行 + 数据并行）和 ZeRO 优化器。
 
 #### 2.17.4 3D 并行
 
-&emsp;&emsp;3D 并行同时使用张量并行、流水线并行和数据并行。Falcon-180B 在 4096 张 GPU 上使用 3D 并行策略和 ZeRO 优化器来管理 180B 参数的分布式训练。
 
 #### 2.17.5 ZeRO
 
-&emsp;&emsp;ZeRO 通过分片优化器状态、梯度和参数来降低单设备显存占用。Falcon-180B 训练使用了 ZeRO 优化器。
 
 #### 2.17.6 专家并行
 
-&emsp;&emsp;MoE 训练中，不同的专家通常被放置在不同的设备上，token 的路由需要跨设备通信。Kimi K3 开源了 MoonEP，为超大的细粒度 MoE 打造的高性能通信库，让专家并行的通信在不均衡的情况下仍然实现极致效率。
 
 #### 2.17.7 MoonEP / FlashKDA / AgentEnv
 
-&emsp;&emsp;Kimi K3 同步开源了三项支撑模型训练的关键 Infra 技术：MoonEP（高性能通信库）、FlashKDA（Kimi Delta Attention 的高性能算子，在英伟达 H20 上 prefill 速度提升 1.72-2.22 倍）、AgentEnv（与 KVCache.ai 合作开发的沙箱系统，用于大规模运行 Agent 环境）。
 
 ---
 
@@ -3919,47 +5551,35 @@ $$
 
 #### 2.18.1 WebText
 
-&emsp;&emsp;GPT-2 的训练数据 WebText 是从 Reddit 爬取构建的高质量网页文本数据集，约 40GB。设计哲学是“质量优先于数量”。
 
 #### 2.18.2 C4
 
-&emsp;&emsp;T5 构建并开源了 Colossal Clean Crawled Corpus（C4），约 750GB 的高质量英文网页文本数据集。C4 从 Common Crawl 的 2019 年 4 月快照中提取，经过多步清洗。
 
 #### 2.18.3 MassiveText
 
-&emsp;&emsp;Gopher 使用了 MassiveText，一个约 2.35 万亿 token 的英文为主语料库，来源涵盖网页、书籍、新闻、源代码、Wikipedia 和 C4。
 
 #### 2.18.4 RefinedWeb
 
-&emsp;&emsp;TII 构建了 RefinedWeb——一个完全基于 Common Crawl、经过严格过滤和去重的网页数据集，包含约 9.68 亿个网页，总计 2.8TB 的干净文本数据，约 5000 亿到 6500 亿 token。仅用 RefinedWeb 训练的模型在多个基准上达到或超过了 curated 混合语料训练的模型。
 
 #### 2.18.5 LAION-5B
 
-&emsp;&emsp;Stable Diffusion 使用了 LAION-5B 作为训练数据。
 
 #### 2.18.6 MinHash 去重
 
-&emsp;&emsp;RefinedWeb 使用 MinHash 进行模糊去重：为每篇文章计算 9000 个哈希值，使用 20 个桶、每桶 450 个值进行筛选，最后移除重复片段超过 50 个 token 的文章。
-
 #### 2.18.7 质量过滤
 
-&emsp;&emsp;LLaMA 3 数据预处理采用了基于启发式规则和基于模型的双重质量过滤策略：fastText 分类器用于语言识别和低质量内容过滤，基于 RoBERTa 的分类器用于判断内容的教育价值和信息密度。
 
 #### 2.18.8 合成数据与蒸馏
 
-&emsp;&emsp;LLaMA 3 代码训练采用三种合成数据方法：代码执行反馈、编程语言翻译、文档反向翻译。LLaMA 3.1 采用模型族蒸馏策略：用旗舰 405B 模型的输出来优化 8B 和 70B 小模型。DeepSeek-R1 蒸馏出六个小模型，将推理能力迁移到 1.5B 到 70B 的参数量范围。
 
 #### 2.18.9 代码执行反馈
 
-&emsp;&emsp;让模型生成代码，通过单元测试验证正确性后微调。
 
 #### 2.18.10 编程语言翻译
 
-&emsp;&emsp;将 Python 代码翻译为其他语言以扩充低资源语言的数据。
 
 #### 2.18.11 文档反向翻译
 
-&emsp;&emsp;从代码生成注释和文档，再反向生成代码。
 
 ---
 
@@ -3967,27 +5587,21 @@ $$
 
 #### 2.19.1 Encoder-only
 
-&emsp;&emsp;BERT 代表，双向注意力，擅长理解类任务。
 
 #### 2.19.2 Decoder-only
 
-&emsp;&emsp;GPT 系列、LLaMA 系列、Mistral、Qwen、DeepSeek、Kimi、GLM 等，因果注意力，擅长生成类任务，是当前 LLM 的主流范式。
 
 #### 2.19.3 Encoder-Decoder
 
-&emsp;&emsp;原始 Transformer、T5、BART 代表，编码器双向理解输入，解码器自回归生成输出。
 
 #### 2.19.4 MoE
 
-&emsp;&emsp;MoE 将 FFN 替换为多个专家，通过路由网络为每个 token 选择性地激活部分专家。MoE 已成为超大规模模型的主流选择。
 
 #### 2.19.5 统一系统
 
-&emsp;&emsp;GPT-5 采用统一系统，由快速模型、深度推理模型和实时路由器组成。
 
 #### 2.19.6 双轨发布
 
-&emsp;&emsp;Claude 5 包含 Claude Fable 5（安全对齐版）和 Claude Mythos 5（全能力版）双轨版本。
 
 ---
 
@@ -3995,43 +5609,33 @@ $$
 
 #### 2.20.1 零样本
 
-&emsp;&emsp;GPT-2 首次展示了零样本多任务学习能力：模型在没有任何显式监督的情况下识别并执行训练语料中自然出现的各种任务。
 
 #### 2.20.2 上下文学习
 
-&emsp;&emsp;GPT-3 系统展示并命名了上下文学习能力：模型在推理时接收一个“提示”，提示中包含任务描述和若干示例，模型直接输出答案，不进行任何梯度更新或微调。
 
 #### 2.20.3 涌现能力
 
-&emsp;&emsp;GPT-2 论文中首次系统记录了“涌现”现象：某些能力在规模达到阈值之前完全不可观测，之后突然出现。
 
 #### 2.20.4 对齐税
 
-&emsp;&emsp;RLHF 训练会导致模型在标准 NLP 基准上的性能退化，PPO-ptx 虽然缓解了这一问题，但并未完全消除。
 
 #### 2.20.5 奖励黑客
 
-&emsp;&emsp;奖励模型是对人类偏好的近似，而非人类偏好的精确表达。当策略模型学会利用奖励模型的缺陷来获取高分时，就会产生“奖励黑客”行为。
 
 #### 2.20.6 灾难性遗忘
 
-&emsp;&emsp;ControlNet 的训练过程中，零卷积的初始化策略和锁定副本的设计确保训练初期 ControlNet 的输出为零，原始 UNet 完全按照预训练的方式工作，模型不会经历“突然被大量噪声干扰”的灾难性遗忘。
 
 #### 2.20.7 双塔架构与 InfoNCE
 
-&emsp;&emsp;CLIP 采用双塔架构，包含一个图像编码器和一个文本编码器。对比学习预训练使用 InfoNCE 损失，本质上是把图文匹配任务转化成了一个批内检索问题。温度参数 $\tau$ 初始化为 0.07，可学习，控制相似度分布的尖锐程度。
 
 #### 2.20.8 缩放规律
 
-&emsp;&emsp;语言建模损失随模型规模、数据量和训练计算量的增加呈平滑的幂律下降。
 
 #### 2.20.9 计算最优训练
 
-&emsp;&emsp;Chinchilla 论文中提出的“计算最优训练”概念，使 LLM 的开发从“尽可能大”转向“在给定预算下尽可能优”。
 
 #### 2.20.10 推理时计算扩展
 
-&emsp;&emsp;从单一的训练时计算扩展到了“训练时 + 推理时”的联合优化。
 
 ---
 
