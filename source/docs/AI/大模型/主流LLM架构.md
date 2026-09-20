@@ -5338,17 +5338,642 @@ for vs in [32000, 64000, 128000, 256000]:
 
 #### 2.9.1 自回归语言建模
 
+&emsp;&emsp;自回归语言建模（Autoregressive Language Modeling, AR）是 Decoder-only 模型的标准训练目标。给定 token 序列 $x = (x_1, x_2, \dots, x_T)$，模型在每一步根据之前的所有 token 预测下一个 token，训练目标为最大化对数似然：
+
+$$
+\mathcal{L}_{\mathrm{AR}} = \sum_{t=1}^{T} \log P(x_t \mid x_{<t}; \theta)
+$$
+
+&emsp;&emsp;其中 $x_{<t} = (x_1, \dots, x_{t-1})$，$P(x_t \mid x_{<t})$ 由模型输出的 Softmax 分布给出。训练时使用因果掩码保证每个位置只能看到左侧上下文，损失为交叉熵：
+
+$$
+\mathcal{L} = -\frac{1}{T} \sum_{t=1}^{T} \log \frac{\exp(z_{t, x_t})}{\sum_{v=1}^{V} \exp(z_{t, v})}
+$$
+
+&emsp;&emsp;其中 $z_t$ 是模型在位置 $t$ 的 logits，$V$ 是词表大小。自回归语言建模的优点是训练目标与生成过程完全一致，模型可以直接用于逐 token 生成，且因果掩码使训练可以并行处理整个序列；缺点是每个位置只预测一个 token，监督信号密度较低，且只能利用左侧上下文，无法像双向模型那样同时利用右侧信息。
+
+&emsp;&emsp;从维度视角看，自回归语言建模在 token 维上施加因果约束，使关系矩阵为下三角，信息从过去流向未来。模型在每个位置输出对下一个 token 的预测，特征维上的表示被映射到词表分布。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出自回归语言建模的裸实现，包含因果自注意力、前馈网络和交叉熵损失：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class AutoregressiveLM(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads, num_layers, d_ff, max_len=512):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.vocab_size = vocab_size
+
+        self.token_emb = nn.Parameter(torch.empty(vocab_size, d_model))
+        self.pos_emb = nn.Parameter(torch.empty(max_len, d_model))
+        nn.init.normal_(self.token_emb, std=0.02)
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                "W_q": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_k": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_v": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_o": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_1": nn.Parameter(torch.empty(d_model, d_ff)),
+                "b_1": nn.Parameter(torch.zeros(d_ff)),
+                "W_2": nn.Parameter(torch.empty(d_ff, d_model)),
+                "b_2": nn.Parameter(torch.zeros(d_model)),
+                "ln1_w": nn.Parameter(torch.ones(d_model)),
+                "ln1_b": nn.Parameter(torch.zeros(d_model)),
+                "ln2_w": nn.Parameter(torch.ones(d_model)),
+                "ln2_b": nn.Parameter(torch.zeros(d_model)),
+            })
+            for _ in range(num_layers)
+        ])
+        for layer in self.layers:
+            for name, p in layer.items():
+                if "W_" in name:
+                    nn.init.xavier_uniform_(p)
+
+        self.ln_f_w = nn.Parameter(torch.ones(d_model))
+        self.ln_f_b = nn.Parameter(torch.zeros(d_model))
+        self.lm_head = nn.Parameter(torch.empty(d_model, vocab_size))
+        nn.init.normal_(self.lm_head, std=0.02)
+
+    def _ln(self, x, w, b):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + 1e-6) * w + b
+
+    def forward(self, input_ids):
+        B, L = input_ids.size()
+        x = self.token_emb[input_ids] + self.pos_emb[:L].unsqueeze(0)
+
+        causal_mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
+
+        for layer in self.layers:
+            Q = torch.matmul(x, layer["W_q"]).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            K = torch.matmul(x, layer["W_k"]).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            V = torch.matmul(x, layer["W_v"]).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+            scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            attn = torch.softmax(scores, dim=-1)
+            head_out = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, L, self.d_model)
+            attn_out = torch.matmul(head_out, layer["W_o"])
+            x = self._ln(x + attn_out, layer["ln1_w"], layer["ln1_b"])
+
+            ffn_out = torch.matmul(
+                torch.relu(torch.matmul(x, layer["W_1"]) + layer["b_1"]),
+                layer["W_2"]
+            ) + layer["b_2"]
+            x = self._ln(x + ffn_out, layer["ln2_w"], layer["ln2_b"])
+
+        x = self._ln(x, self.ln_f_w, self.ln_f_b)
+        logits = torch.matmul(x, self.lm_head)  # (B, L, vocab_size)
+        return logits
+
+    def loss(self, input_ids):
+        logits = self.forward(input_ids[:, :-1])
+        targets = input_ids[:, 1:]
+        return torch.nn.functional.cross_entropy(
+            logits.reshape(-1, self.vocab_size), targets.reshape(-1)
+        )
+```
+
+&emsp;&emsp;若输入 `input_ids` 形状为 $(B,L)$，`logits` 形状为 $(B,L-1,V)$，`loss` 为标量。
+
+---
 
 #### 2.9.2 掩码语言建模
 
+&emsp;&emsp;掩码语言建模（Masked Language Modeling, MLM）是 Encoder-only 模型（如 BERT）的预训练目标。它随机选择输入序列中的一部分 token 进行掩码，然后要求模型根据双向上下文预测这些被掩码的 token。设原始序列为 $x = (x_1, \dots, x_T)$，随机选择掩码位置集合 $\mathcal{M}$，将 $\mathcal{M}$ 中的 token 替换为特殊标记 `[MASK]`，得到损坏序列 $\tilde{x}$。训练目标为：
+
+$$
+\mathcal{L}_{\mathrm{MLM}} = \sum_{i \in \mathcal{M}} \log P(x_i \mid \tilde{x}; \theta)
+$$
+
+&emsp;&emsp;其中 $P(x_i \mid \tilde{x})$ 由模型在位置 $i$ 的输出 Softmax 给出。BERT 还采用了 80% 替换为 `[MASK]`、10% 替换为随机 token、10% 保持不变的策略，以缓解预训练与微调之间的不一致。掩码语言建模的优点是双向注意力使每个位置都能利用完整上下文，在理解类任务上表现优异；缺点是预训练时存在 `[MASK]` 标记而微调时没有，造成不一致，且无法直接用于自回归生成。
+
+&emsp;&emsp;从维度视角看，掩码语言建模在 token 维上使用全连接扩散，每个位置可以看到所有其他位置。模型需要在被破坏的 token 维上恢复原始信息，特征维表示被映射到词表分布。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出掩码语言建模的裸实现，包含随机掩码和交叉熵损失：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class MaskedLM(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads, num_layers, d_ff, max_len=512, mask_token_id=0):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.vocab_size = vocab_size
+        self.mask_token_id = mask_token_id
+
+        self.token_emb = nn.Parameter(torch.empty(vocab_size, d_model))
+        self.pos_emb = nn.Parameter(torch.empty(max_len, d_model))
+        nn.init.normal_(self.token_emb, std=0.02)
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                "W_q": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_k": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_v": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_o": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_1": nn.Parameter(torch.empty(d_model, d_ff)),
+                "b_1": nn.Parameter(torch.zeros(d_ff)),
+                "W_2": nn.Parameter(torch.empty(d_ff, d_model)),
+                "b_2": nn.Parameter(torch.zeros(d_model)),
+                "ln1_w": nn.Parameter(torch.ones(d_model)),
+                "ln1_b": nn.Parameter(torch.zeros(d_model)),
+                "ln2_w": nn.Parameter(torch.ones(d_model)),
+                "ln2_b": nn.Parameter(torch.zeros(d_model)),
+            })
+            for _ in range(num_layers)
+        ])
+        for layer in self.layers:
+            for name, p in layer.items():
+                if "W_" in name:
+                    nn.init.xavier_uniform_(p)
+
+        self.ln_f_w = nn.Parameter(torch.ones(d_model))
+        self.ln_f_b = nn.Parameter(torch.zeros(d_model))
+        self.lm_head = nn.Parameter(torch.empty(d_model, vocab_size))
+        nn.init.normal_(self.lm_head, std=0.02)
+
+    def _ln(self, x, w, b):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + 1e-6) * w + b
+
+    def forward(self, input_ids):
+        B, L = input_ids.size()
+        x = self.token_emb[input_ids] + self.pos_emb[:L].unsqueeze(0)
+
+        for layer in self.layers:
+            Q = torch.matmul(x, layer["W_q"]).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            K = torch.matmul(x, layer["W_k"]).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            V = torch.matmul(x, layer["W_v"]).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+            attn = torch.softmax(scores, dim=-1)
+            head_out = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, L, self.d_model)
+            attn_out = torch.matmul(head_out, layer["W_o"])
+            x = self._ln(x + attn_out, layer["ln1_w"], layer["ln1_b"])
+
+            ffn_out = torch.matmul(
+                torch.relu(torch.matmul(x, layer["W_1"]) + layer["b_1"]),
+                layer["W_2"]
+            ) + layer["b_2"]
+            x = self._ln(x + ffn_out, layer["ln2_w"], layer["ln2_b"])
+
+        x = self._ln(x, self.ln_f_w, self.ln_f_b)
+        logits = torch.matmul(x, self.lm_head)
+        return logits
+
+    def loss(self, input_ids, mask_prob=0.15):
+        B, L = input_ids.size()
+        # 随机选择掩码位置
+        mask = torch.rand(B, L, device=input_ids.device) < mask_prob
+        # 至少保留一个非掩码位置（简化处理）
+        corrupted = input_ids.clone()
+        corrupted[mask] = self.mask_token_id
+
+        logits = self.forward(corrupted)
+        # 只计算被掩码位置的损失
+        loss = torch.nn.functional.cross_entropy(
+            logits[mask], input_ids[mask]
+        )
+        return loss
+```
+
+&emsp;&emsp;若输入 `input_ids` 形状为 $(B,L)$，`loss` 为标量，仅在被掩码位置计算。
+
+---
 
 #### 2.9.3 Span Corruption
 
+&emsp;&emsp;Span Corruption 是 T5 提出的预训练目标，属于降噪自编码的一种。它随机选择输入序列中的连续片段（span），用哨兵 token 替换这些片段，然后要求解码器自回归地恢复被替换的 span 内容。设原始序列为 $x$，随机选择若干 span，将每个 span 替换为唯一的哨兵 token，得到损坏输入 $\tilde{x}$。目标序列由所有被替换的 span 内容组成，用哨兵 token 分隔。训练目标为：
+
+$$
+\mathcal{L}_{\mathrm{Span}} = \sum_{j=1}^{S} \log P(\mathrm{span}_j \mid \tilde{x}, \mathrm{span}_{<j}; \theta)
+$$
+
+&emsp;&emsp;其中 $S$ 是 span 数量，$\mathrm{span}_j$ 是第 $j$ 个被替换的片段。T5 通常使用 15% 的 token 被替换，平均 span 长度为 3。Span Corruption 的优点是训练目标更接近生成任务，适合编码器-解码器架构，能学习更长片段的重建，且哨兵 token 使解码器知道需要生成多少个片段；缺点是需要编码器-解码器结构，训练目标比 MLM 复杂，且哨兵 token 的引入增加了词表特殊标记。
+
+&emsp;&emsp;从维度视角看，Span Corruption 在 token 维上先破坏连续片段，再通过编码器双向建模损坏序列，解码器自回归恢复片段。这相当于在 token 维上做了一次局部信息的删除与重建。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Span Corruption 的裸实现，包含 span 选择、损坏输入构建和编码器-解码器损失：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class SpanCorruption(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads, num_layers, d_ff,
+                 max_len=512, sentinel_start=None):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.vocab_size = vocab_size
+        self.sentinel_start = sentinel_start if sentinel_start is not None else vocab_size - 100
+
+        self.token_emb = nn.Parameter(torch.empty(vocab_size, d_model))
+        self.pos_emb = nn.Parameter(torch.empty(max_len, d_model))
+        nn.init.normal_(self.token_emb, std=0.02)
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+        def make_layer():
+            return nn.ModuleDict({
+                "W_q": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_k": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_v": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_o": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_cq": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_ck": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_cv": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_co": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_1": nn.Parameter(torch.empty(d_model, d_ff)),
+                "b_1": nn.Parameter(torch.zeros(d_ff)),
+                "W_2": nn.Parameter(torch.empty(d_ff, d_model)),
+                "b_2": nn.Parameter(torch.zeros(d_model)),
+                "ln1_w": nn.Parameter(torch.ones(d_model)),
+                "ln1_b": nn.Parameter(torch.zeros(d_model)),
+                "ln2_w": nn.Parameter(torch.ones(d_model)),
+                "ln2_b": nn.Parameter(torch.zeros(d_model)),
+                "ln3_w": nn.Parameter(torch.ones(d_model)),
+                "ln3_b": nn.Parameter(torch.zeros(d_model)),
+            })
+
+        self.enc_layers = nn.ModuleList([make_layer() for _ in range(num_layers)])
+        self.dec_layers = nn.ModuleList([make_layer() for _ in range(num_layers)])
+
+        for layer in list(self.enc_layers) + list(self.dec_layers):
+            for name, p in layer.items():
+                if "W_" in name:
+                    nn.init.xavier_uniform_(p)
+
+        self.ln_f_w = nn.Parameter(torch.ones(d_model))
+        self.ln_f_b = nn.Parameter(torch.zeros(d_model))
+        self.lm_head = nn.Parameter(torch.empty(d_model, vocab_size))
+        nn.init.normal_(self.lm_head, std=0.02)
+
+    def _ln(self, x, w, b):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + 1e-6) * w + b
+
+    def _attn(self, Q, K, V, mask=None):
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask, float('-inf'))
+        attn = torch.softmax(scores, dim=-1)
+        return torch.matmul(attn, V)
+
+    def forward(self, src_ids, tgt_ids):
+        B, L_s = src_ids.size()
+        _, L_t = tgt_ids.size()
+
+        src = self.token_emb[src_ids] + self.pos_emb[:L_s].unsqueeze(0)
+        tgt = self.token_emb[tgt_ids] + self.pos_emb[:L_t].unsqueeze(0)
+
+        # 编码器
+        enc = src
+        for layer in self.enc_layers:
+            Q = torch.matmul(enc, layer["W_q"]).view(B, L_s, self.num_heads, self.d_k).transpose(1, 2)
+            K = torch.matmul(enc, layer["W_k"]).view(B, L_s, self.num_heads, self.d_k).transpose(1, 2)
+            V = torch.matmul(enc, layer["W_v"]).view(B, L_s, self.num_heads, self.d_k).transpose(1, 2)
+            attn_out = self._attn(Q, K, V)
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, L_s, self.d_model)
+            attn_out = torch.matmul(attn_out, layer["W_o"])
+            enc = self._ln(enc + attn_out, layer["ln1_w"], layer["ln1_b"])
+
+            ffn = torch.matmul(torch.relu(torch.matmul(enc, layer["W_1"]) + layer["b_1"]), layer["W_2"]) + layer["b_2"]
+            enc = self._ln(enc + ffn, layer["ln2_w"], layer["ln2_b"])
+
+        # 解码器
+        dec = tgt
+        causal_mask = torch.triu(torch.ones(L_t, L_t, device=dec.device), diagonal=1).bool()
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+
+        for layer in self.dec_layers:
+            Q = torch.matmul(dec, layer["W_q"]).view(B, L_t, self.num_heads, self.d_k).transpose(1, 2)
+            K = torch.matmul(dec, layer["W_k"]).view(B, L_t, self.num_heads, self.d_k).transpose(1, 2)
+            V = torch.matmul(dec, layer["W_v"]).view(B, L_t, self.num_heads, self.d_k).transpose(1, 2)
+            attn_out = self._attn(Q, K, V, causal_mask)
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, L_t, self.d_model)
+            attn_out = torch.matmul(attn_out, layer["W_o"])
+            dec = self._ln(dec + attn_out, layer["ln1_w"], layer["ln1_b"])
+
+            Q = torch.matmul(dec, layer["W_cq"]).view(B, L_t, self.num_heads, self.d_k).transpose(1, 2)
+            K = torch.matmul(enc, layer["W_ck"]).view(B, L_s, self.num_heads, self.d_k).transpose(1, 2)
+            V = torch.matmul(enc, layer["W_cv"]).view(B, L_s, self.num_heads, self.d_k).transpose(1, 2)
+            cross_out = self._attn(Q, K, V)
+            cross_out = cross_out.transpose(1, 2).contiguous().view(B, L_t, self.d_model)
+            cross_out = torch.matmul(cross_out, layer["W_co"])
+            dec = self._ln(dec + cross_out, layer["ln2_w"], layer["ln2_b"])
+
+            ffn = torch.matmul(torch.relu(torch.matmul(dec, layer["W_1"]) + layer["b_1"]), layer["W_2"]) + layer["b_2"]
+            dec = self._ln(dec + ffn, layer["ln3_w"], layer["ln3_b"])
+
+        dec = self._ln(dec, self.ln_f_w, self.ln_f_b)
+        logits = torch.matmul(dec, self.lm_head)
+        return logits
+
+    def build_corrupted(self, input_ids, span_len=3, corruption_rate=0.15):
+        """构建损坏输入和目标序列（简化版）"""
+        B, L = input_ids.size()
+        corrupted = input_ids.clone()
+        targets = []
+        for b in range(B):
+            seq = input_ids[b].tolist()
+            i = 0
+            tgt = []
+            sentinel_id = self.sentinel_start
+            while i < L:
+                if torch.rand(1).item() < corruption_rate:
+                    end = min(i + span_len, L)
+                    tgt.append(sentinel_id)
+                    tgt.extend(seq[i:end])
+                    corrupted[b, i:end] = sentinel_id
+                    sentinel_id += 1
+                    i = end
+                else:
+                    i += 1
+            tgt.append(self.sentinel_start + 99)  # EOS
+            targets.append(tgt)
+        max_tgt_len = max(len(t) for t in targets)
+        tgt_tensor = torch.full((B, max_tgt_len), 0, dtype=torch.long, device=input_ids.device)
+        for b, t in enumerate(targets):
+            tgt_tensor[b, :len(t)] = torch.tensor(t, device=input_ids.device)
+        return corrupted, tgt_tensor
+
+    def loss(self, input_ids):
+        corrupted, targets = self.build_corrupted(input_ids)
+        logits = self.forward(corrupted, targets[:, :-1])
+        return torch.nn.functional.cross_entropy(
+            logits.reshape(-1, self.vocab_size), targets[:, 1:].reshape(-1)
+        )
+```
+
+&emsp;&emsp;这个实现中，`build_corrupted` 随机选择 span 并用哨兵 token 替换，目标序列由哨兵 token 和原始 span 内容组成。`loss` 计算解码器交叉熵。
+
+---
 
 #### 2.9.4 多 Token 预测（MTP）
 
+&emsp;&emsp;多 Token 预测（Multi-Token Prediction, MTP）是一种增强自回归语言建模的训练目标，要求模型在每个位置不仅预测下一个 token，还预测未来多个 token。设预测未来 $K$ 个 token，训练目标为：
+
+$$
+\mathcal{L}_{\mathrm{MTP}} = \sum_{t=1}^{T} \sum_{k=1}^{K} \log P(x_{t+k} \mid x_{\leq t}; \theta)
+$$
+
+&emsp;&emsp;实现上，模型可以在每个位置使用多个输出头，第 $k$ 个头预测偏移 $k$ 的 token。所有头共享主干表示，但各自有独立的输出投影。MTP 的优点是增加了训练信号的密度，每个位置提供 $K$ 个监督信号，提升了样本效率，且迫使模型学习更长程的依赖关系；缺点是计算量随 $K$ 线性增加，且未来 token 的预测可能比下一个 token 更难，需要平衡各头的损失权重。
+
+&emsp;&emsp;从维度视角看，多 Token 预测在 token 维上将预测范围从下一个位置扩展到未来 $K$ 个位置，特征维上的表示需要同时编码多个未来 token 的信息。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出多 Token 预测的裸实现，使用多个输出头：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class MultiTokenLM(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads, num_layers, d_ff,
+                 max_len=512, num_future=4):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.vocab_size = vocab_size
+        self.num_future = num_future
+
+        self.token_emb = nn.Parameter(torch.empty(vocab_size, d_model))
+        self.pos_emb = nn.Parameter(torch.empty(max_len, d_model))
+        nn.init.normal_(self.token_emb, std=0.02)
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                "W_q": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_k": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_v": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_o": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_1": nn.Parameter(torch.empty(d_model, d_ff)),
+                "b_1": nn.Parameter(torch.zeros(d_ff)),
+                "W_2": nn.Parameter(torch.empty(d_ff, d_model)),
+                "b_2": nn.Parameter(torch.zeros(d_model)),
+                "ln1_w": nn.Parameter(torch.ones(d_model)),
+                "ln1_b": nn.Parameter(torch.zeros(d_model)),
+                "ln2_w": nn.Parameter(torch.ones(d_model)),
+                "ln2_b": nn.Parameter(torch.zeros(d_model)),
+            })
+            for _ in range(num_layers)
+        ])
+        for layer in self.layers:
+            for name, p in layer.items():
+                if "W_" in name:
+                    nn.init.xavier_uniform_(p)
+
+        self.ln_f_w = nn.Parameter(torch.ones(d_model))
+        self.ln_f_b = nn.Parameter(torch.zeros(d_model))
+
+        # 多个输出头
+        self.lm_heads = nn.ParameterList([
+            nn.Parameter(torch.empty(d_model, vocab_size)) for _ in range(num_future)
+        ])
+        for head in self.lm_heads:
+            nn.init.normal_(head, std=0.02)
+
+    def _ln(self, x, w, b):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + 1e-6) * w + b
+
+    def forward(self, input_ids):
+        B, L = input_ids.size()
+        x = self.token_emb[input_ids] + self.pos_emb[:L].unsqueeze(0)
+
+        causal_mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
+
+        for layer in self.layers:
+            Q = torch.matmul(x, layer["W_q"]).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            K = torch.matmul(x, layer["W_k"]).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            V = torch.matmul(x, layer["W_v"]).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+            scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            attn = torch.softmax(scores, dim=-1)
+            head_out = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, L, self.d_model)
+            attn_out = torch.matmul(head_out, layer["W_o"])
+            x = self._ln(x + attn_out, layer["ln1_w"], layer["ln1_b"])
+
+            ffn_out = torch.matmul(
+                torch.relu(torch.matmul(x, layer["W_1"]) + layer["b_1"]),
+                layer["W_2"]
+            ) + layer["b_2"]
+            x = self._ln(x + ffn_out, layer["ln2_w"], layer["ln2_b"])
+
+        x = self._ln(x, self.ln_f_w, self.ln_f_b)
+
+        # 每个头预测不同偏移
+        logits_list = []
+        for k, head in enumerate(self.lm_heads):
+            logits_list.append(torch.matmul(x, head))  # (B, L, vocab_size)
+        return logits_list
+
+    def loss(self, input_ids):
+        logits_list = self.forward(input_ids)
+        total_loss = 0.0
+        for k, logits in enumerate(logits_list):
+            offset = k + 1
+            if input_ids.size(1) <= offset:
+                continue
+            # 预测 x_{t+offset}
+            pred = logits[:, :-offset, :]
+            target = input_ids[:, offset:]
+            total_loss += torch.nn.functional.cross_entropy(
+                pred.reshape(-1, self.vocab_size), target.reshape(-1)
+            )
+        return total_loss / len(logits_list)
+```
+
+&emsp;&emsp;这个实现中，每个输出头预测一个未来偏移的 token，损失为各头交叉熵的平均。若输入形状为 $(B,L)$，输出为多个 logits 列表，每个形状 $(B,L,V)$。
+
+---
 
 #### 2.9.5 降噪自编码
+
+&emsp;&emsp;降噪自编码（Denoising Autoencoding, DAE）是一种通过向输入添加噪声并训练模型恢复原始输入的预训练目标。与 Span Corruption 类似，但噪声类型更灵活，可以包括 token 掩码、随机替换、删除、交换等。设原始序列为 $x$，噪声过程为 $\mathcal{N}$，损坏输入为 $\tilde{x} = \mathcal{N}(x)$，训练目标为最小化重构损失：
+
+$$
+\mathcal{L}_{\mathrm{DAE}} = -\sum_{t=1}^{T} \log P(x_t \mid \tilde{x}; \theta)
+$$
+
+&emsp;&emsp;降噪自编码的优点是模型学习到鲁棒的表示，能够从部分损坏的输入中恢复完整信息，适合预训练编码器或编码器-解码器模型；缺点是噪声类型和比例需要手动设计，不同任务下最优噪声策略不同，且重构目标可能使模型过度关注局部恢复而忽略全局语义。
+
+&emsp;&emsp;从维度视角看，降噪自编码在 token 维上引入噪声，破坏部分信息，模型需要从损坏的 token 维中恢复原始表示。这相当于在特征维上学习一个去噪映射，使表示对输入扰动具有鲁棒性。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出降噪自编码的裸实现，使用随机替换和删除作为噪声：
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class DenoisingAutoencoder(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads, num_layers, d_ff,
+                 max_len=512, noise_prob=0.15):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.vocab_size = vocab_size
+        self.noise_prob = noise_prob
+
+        self.token_emb = nn.Parameter(torch.empty(vocab_size, d_model))
+        self.pos_emb = nn.Parameter(torch.empty(max_len, d_model))
+        nn.init.normal_(self.token_emb, std=0.02)
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+        self.enc_layers = nn.ModuleList([
+            nn.ModuleDict({
+                "W_q": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_k": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_v": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_o": nn.Parameter(torch.empty(d_model, d_model)),
+                "W_1": nn.Parameter(torch.empty(d_model, d_ff)),
+                "b_1": nn.Parameter(torch.zeros(d_ff)),
+                "W_2": nn.Parameter(torch.empty(d_ff, d_model)),
+                "b_2": nn.Parameter(torch.zeros(d_model)),
+                "ln1_w": nn.Parameter(torch.ones(d_model)),
+                "ln1_b": nn.Parameter(torch.zeros(d_model)),
+                "ln2_w": nn.Parameter(torch.ones(d_model)),
+                "ln2_b": nn.Parameter(torch.zeros(d_model)),
+            })
+            for _ in range(num_layers)
+        ])
+        for layer in self.enc_layers:
+            for name, p in layer.items():
+                if "W_" in name:
+                    nn.init.xavier_uniform_(p)
+
+        self.ln_f_w = nn.Parameter(torch.ones(d_model))
+        self.ln_f_b = nn.Parameter(torch.zeros(d_model))
+        self.lm_head = nn.Parameter(torch.empty(d_model, vocab_size))
+        nn.init.normal_(self.lm_head, std=0.02)
+
+    def _ln(self, x, w, b):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + 1e-6) * w + b
+
+    def add_noise(self, input_ids):
+        """随机替换和删除 token"""
+        B, L = input_ids.size()
+        corrupted = input_ids.clone()
+        # 随机替换
+        replace_mask = torch.rand(B, L, device=input_ids.device) < self.noise_prob
+        random_tokens = torch.randint(0, self.vocab_size, (B, L), device=input_ids.device)
+        corrupted[replace_mask] = random_tokens[replace_mask]
+        # 随机删除（用 mask token 替代，简化处理）
+        delete_mask = torch.rand(B, L, device=input_ids.device) < self.noise_prob / 2
+        corrupted[delete_mask] = 0  # 假设 0 是 mask token
+        return corrupted
+
+    def forward(self, input_ids):
+        B, L = input_ids.size()
+        x = self.token_emb[input_ids] + self.pos_emb[:L].unsqueeze(0)
+
+        for layer in self.enc_layers:
+            Q = torch.matmul(x, layer["W_q"]).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            K = torch.matmul(x, layer["W_k"]).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            V = torch.matmul(x, layer["W_v"]).view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+            attn = torch.softmax(scores, dim=-1)
+            head_out = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, L, self.d_model)
+            attn_out = torch.matmul(head_out, layer["W_o"])
+            x = self._ln(x + attn_out, layer["ln1_w"], layer["ln1_b"])
+
+            ffn_out = torch.matmul(
+                torch.relu(torch.matmul(x, layer["W_1"]) + layer["b_1"]),
+                layer["W_2"]
+            ) + layer["b_2"]
+            x = self._ln(x + ffn_out, layer["ln2_w"], layer["ln2_b"])
+
+        x = self._ln(x, self.ln_f_w, self.ln_f_b)
+        logits = torch.matmul(x, self.lm_head)
+        return logits
+
+    def loss(self, input_ids):
+        corrupted = self.add_noise(input_ids)
+        logits = self.forward(corrupted)
+        return torch.nn.functional.cross_entropy(
+            logits.reshape(-1, self.vocab_size), input_ids.reshape(-1)
+        )
+```
+
+&emsp;&emsp;这个实现中，`add_noise` 随机替换和删除 token，模型需要从损坏输入中恢复原始序列。若输入形状为 $(B,L)$，`loss` 为标量。
 
 
 ---
@@ -5357,23 +5982,548 @@ for vs in [32000, 64000, 128000, 256000]:
 
 #### 2.10.1 Adam
 
+&emsp;&emsp;Adam（Adaptive Moment Estimation）由 Kingma 和 Ba 于 2015 年提出，是目前最广泛使用的自适应学习率优化器。它同时维护梯度的一阶矩估计（动量）和二阶矩估计（梯度平方的指数移动平均），并利用偏差校正使估计在训练初期无偏。
+
+&emsp;&emsp;设第 $t$ 步的梯度为 $g_t = \nabla_\theta f_t(\theta_{t-1})$，Adam 的计算为：
+
+$$
+m_t = \beta_1 m_{t-1} + (1-\beta_1) g_t
+$$
+
+$$
+v_t = \beta_2 v_{t-1} + (1-\beta_2) g_t^2
+$$
+
+&emsp;&emsp;其中 $\beta_1$ 和 $\beta_2$ 是一阶和二阶矩的衰减率，通常取 $\beta_1=0.9$，$\beta_2=0.999$。由于 $m_0$ 和 $v_0$ 初始化为零，早期估计偏向零，需要进行偏差校正：
+
+$$
+\hat{m}_t = \frac{m_t}{1-\beta_1^t}, \quad \hat{v}_t = \frac{v_t}{1-\beta_2^t}
+$$
+
+&emsp;&emsp;参数更新为：
+
+$$
+\theta_t = \theta_{t-1} - \eta \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+$$
+
+&emsp;&emsp;其中 $\eta$ 是学习率，$\epsilon$ 是防止除零的小常数，通常取 $10^{-8}$。Adam 的优点是自适应学习率使不同参数的更新幅度自动缩放，对超参数不敏感，收敛速度快，适合稀疏梯度和非平稳目标；缺点是二阶矩估计需要存储每个参数的梯度平方均值，显存开销是 SGD 的三倍，且 $\epsilon$ 在后期可能干扰收敛精度。
+
+&emsp;&emsp;从维度视角看，Adam 在特征维上为每个参数维护独立的自适应学习率。一阶矩在特征维上做动量平滑，二阶矩在特征维上估计梯度尺度，两者配合使每个特征维的更新步长自适应调整。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Adam 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class Adam(nn.Module):
+    def __init__(self, params, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8):
+        super().__init__()
+        self.params = list(params)
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.m = [torch.zeros_like(p) for p in self.params]
+        self.v = [torch.zeros_like(p) for p in self.params]
+        self.t = 0
+
+    def step(self):
+        self.t += 1
+        for i, p in enumerate(self.params):
+            if p.grad is None:
+                continue
+            g = p.grad.data
+            self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * g
+            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * g * g
+            m_hat = self.m[i] / (1 - self.beta1 ** self.t)
+            v_hat = self.v[i] / (1 - self.beta2 ** self.t)
+            p.data -= self.lr * m_hat / (torch.sqrt(v_hat) + self.eps)
+
+    def zero_grad(self):
+        for p in self.params:
+            if p.grad is not None:
+                p.grad.zero_()
+```
+
+&emsp;&emsp;这个实现中，一阶矩 `m` 和二阶矩 `v` 逐参数维护，偏差校正使用当前步数 `t`。
+
+---
 
 #### 2.10.2 AdamW
 
+&emsp;&emsp;AdamW 由 Loshchilov 和 Hutter 于 2019 年提出，核心改进是将权重衰减从梯度更新中解耦。在标准 Adam 中，L2 正则化通过将 $\lambda \theta$ 加到梯度 $g_t$ 上来实现，这使得权重衰减与自适应学习率耦合：自适应学习率会缩放权重衰减的效果，导致不同参数的衰减强度不一致。AdamW 将权重衰减直接作用于参数本身，与梯度更新解耦：
+
+$$
+\theta_t = \theta_{t-1} - \eta \left( \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon} + \lambda \theta_{t-1} \right)
+$$
+
+&emsp;&emsp;其中 $\lambda$ 是权重衰减系数。在解耦形式中，权重衰减项 $\lambda \theta_{t-1}$ 不经过 $1/\sqrt{\hat{v}_t}$ 的缩放，因此所有参数以相同比例衰减。权重衰减项按 $\lambda \eta$ 缩放，其中 $\eta$ 是学习率。这意味着当使用学习率调度时，权重衰减的实际强度会随学习率变化，通常在训练后期学习率降低时，权重衰减的绝对幅度也相应减小。
+
+&emsp;&emsp;AdamW 的优点是解耦权重衰减使正则化效果与自适应学习率独立，在 Transformer 训练中通常优于 Adam，且与学习率调度配合更自然；缺点是与 Adam 相比需要额外调优 $\lambda$，且在某些小模型或短训练任务上优势不明显。
+
+&emsp;&emsp;从维度视角看，AdamW 在特征维上分别处理梯度更新和权重衰减：梯度更新沿特征维做自适应缩放，权重衰减沿特征维做均匀收缩。两者解耦后，特征维上的每个参数可以独立地平衡拟合与正则化。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 AdamW 的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class AdamW(nn.Module):
+    def __init__(self, params, lr=1e-3, beta1=0.9, beta2=0.999,
+                 eps=1e-8, weight_decay=0.01):
+        super().__init__()
+        self.params = list(params)
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.m = [torch.zeros_like(p) for p in self.params]
+        self.v = [torch.zeros_like(p) for p in self.params]
+        self.t = 0
+
+    def step(self):
+        self.t += 1
+        for i, p in enumerate(self.params):
+            if p.grad is None:
+                continue
+            g = p.grad.data
+            self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * g
+            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * g * g
+            m_hat = self.m[i] / (1 - self.beta1 ** self.t)
+            v_hat = self.v[i] / (1 - self.beta2 ** self.t)
+            # 解耦权重衰减: 先衰减参数，再做梯度更新
+            p.data -= self.lr * (
+                m_hat / (torch.sqrt(v_hat) + self.eps)
+                + self.weight_decay * p.data
+            )
+
+    def zero_grad(self):
+        for p in self.params:
+            if p.grad is not None:
+                p.grad.zero_()
+```
+
+&emsp;&emsp;这个实现中，权重衰减项 `weight_decay * p.data` 与梯度更新项相加后统一乘以学习率 `lr`，实现了 AdamW 的解耦权重衰减。
+
+---
 
 #### 2.10.3 Muon
 
+&emsp;&emsp;Muon（MomentUm Orthogonalized by Newton-schulz）由 Keller Jordan 于 2024 年提出，是一种专门针对矩阵参数（如线性层的权重矩阵）的优化器。其核心思想是对动量矩阵进行正交化，使更新方向在谱范数下具有最优性。与 Adam 逐元素处理梯度不同，Muon 将整个权重矩阵作为一个整体，利用矩阵的谱结构来指导更新。
+
+&emsp;&emsp;Muon 的算法流程为：首先对梯度矩阵进行标准 SGD 动量累积：
+
+$$
+M_t = \beta M_{t-1} + (1-\beta) G_t
+$$
+
+&emsp;&emsp;其中 $G_t$ 是第 $t$ 步的梯度矩阵。然后对动量矩阵 $M_t$ 进行正交化：
+
+$$
+O_t = \mathrm{Ortho}(M_t)
+$$
+
+&emsp;&emsp;正交化通过 Newton-Schulz 迭代近似计算。设 $M \in \mathbb{R}^{m \times n}$ 的奇异值分解为 $M = U\Sigma V^\top$，其正交化结果为 $O = UV^\top$。实际中 Newton-Schulz 迭代用矩阵乘法近似这个正交极因子：
+
+$$
+X_{k+1} = X_k \left( \frac{3}{2} I - \frac{1}{2} X_k^\top X_k \right)
+$$
+
+&emsp;&emsp;通常只需 5 步迭代即可达到足够精度。收敛性分析表明，Muon 使用 Newton-Schulz 的收敛速率与精确 SVD 极因子分解相同，误差随迭代步数 $q$ 双指数收敛到 1。参数更新为：
+
+$$
+W_t = W_{t-1} - \eta \cdot O_t
+$$
+
+&emsp;&emsp;Muon 的优点是矩阵正交化更新利用了权重矩阵的谱结构，在 LLM 预训练中比 AdamW 具有更高的 token 效率，且 Newton-Schulz 迭代只需矩阵乘法，硬件效率高；缺点是仅适用于二维矩阵参数，偏置和 LayerNorm 参数仍需用 Adam 处理，且正交化在极端规模下可能出现数值不稳定。
+
+&emsp;&emsp;从维度视角看，Muon 在特征维上利用了矩阵的奇异值结构：正交化使更新方向的奇异值全部为 1，相当于在谱范数约束下做最速下降。这比 Adam 的逐元素自适应缩放更能捕捉矩阵参数的整体几何结构。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 Muon 的裸实现，包含 SGD 动量和 Newton-Schulz 正交化：
+
+```python
+import torch
+import torch.nn as nn
+
+class Muon(nn.Module):
+    def __init__(self, params, lr=0.02, momentum=0.95, ns_steps=5):
+        super().__init__()
+        self.params = [p for p in params if p.dim() == 2]
+        self.lr = lr
+        self.momentum = momentum
+        self.ns_steps = ns_steps
+        self.m = [torch.zeros_like(p) for p in self.params]
+
+    def _newton_schulz(self, M):
+        """Newton-Schulz 迭代近似正交化"""
+        X = M / (M.norm() + 1e-8)  # 归一化
+        for _ in range(self.ns_steps):
+            A = X.transpose(-2, -1) @ X
+            X = X @ (1.5 * torch.eye(A.size(-1), device=A.device) - 0.5 * A)
+        return X
+
+    def step(self):
+        for i, p in enumerate(self.params):
+            if p.grad is None:
+                continue
+            g = p.grad.data
+            self.m[i] = self.momentum * self.m[i] + (1 - self.momentum) * g
+            O = self._newton_schulz(self.m[i])
+            p.data -= self.lr * O
+
+    def zero_grad(self):
+        for p in self.params:
+            if p.grad is not None:
+                p.grad.zero_()
+```
+
+&emsp;&emsp;这个实现中，`_newton_schulz` 通过迭代矩阵乘法近似正交化动量矩阵，无需 SVD。注意 Muon 仅作用于二维矩阵参数，偏置和一维参数需用 Adam 单独处理。
+
+---
 
 #### 2.10.4 MuonClip
 
+&emsp;&emsp;MuonClip 由 Kimi 团队在 Kimi K2 训练中提出，是 Muon 的稳定性增强版本。Kimi 团队在将 Muon 扩展到万亿参数规模时发现，Muon 的正交化更新会导致注意力 logits 爆炸，进而引起模型发散。MuonClip 通过引入 QK-Clip 机制解决了这一问题。
+
+&emsp;&emsp;QK-Clip 的核心思想是监控注意力中 Query 和 Key 的点积幅度，当 logits 超过预设阈值时，对 Q 和 K 的投影矩阵进行缩放：
+
+$$
+\mathrm{logits} = QK^\top, \quad \text{if } \|\mathrm{logits}\|_\infty > \tau: \quad Q \leftarrow Q \cdot \sqrt{\frac{\tau}{\|\mathrm{logits}\|_\infty}}
+$$
+
+&emsp;&emsp;其中 $\tau$ 是 logits 的阈值。这种缩放直接作用于注意力计算的 Q 和 K，不影响 Muon 的矩阵正交化更新。MuonClip 在 Kimi K2 的 15.5 万亿 token 预训练中实现了零损失尖峰，同时保持了 Muon 的 token 效率优势，计算效率是传统 AdamW 的 2 倍。
+
+&emsp;&emsp;MuonClip 的优点是解决了 Muon 在大规模训练中的 logits 爆炸问题，使万亿参数级训练稳定，同时保持了 Muon 的 token 效率；缺点是引入了额外的 QK 监控和缩放计算，且阈值 $\tau$ 需要根据模型规模调整。
+
+&emsp;&emsp;从维度视角看，MuonClip 在 Muon 的谱范数正交化基础上，增加了对注意力 logits 的幅度约束。这相当于在特征维上同时约束了权重矩阵的谱范数和注意力输出的数值范围，双重保障训练稳定。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 MuonClip 的裸实现，包含 Muon 优化和 QK-Clip：
+
+```python
+import torch
+import torch.nn as nn
+
+class MuonClip(nn.Module):
+    def __init__(self, params, lr=0.02, momentum=0.95, ns_steps=5,
+                 qk_clip_threshold=30.0):
+        super().__init__()
+        self.params = [p for p in params if p.dim() == 2]
+        self.lr = lr
+        self.momentum = momentum
+        self.ns_steps = ns_steps
+        self.qk_clip_threshold = qk_clip_threshold
+        self.m = [torch.zeros_like(p) for p in self.params]
+
+    def _newton_schulz(self, M):
+        X = M / (M.norm() + 1e-8)
+        for _ in range(self.ns_steps):
+            A = X.transpose(-2, -1) @ X
+            X = X @ (1.5 * torch.eye(A.size(-1), device=A.device) - 0.5 * A)
+        return X
+
+    def qk_clip(self, Q, K):
+        """QK-Clip: 当 logits 超过阈值时缩放 Q 和 K"""
+        logits = Q @ K.transpose(-2, -1)
+        max_logit = logits.abs().max()
+        if max_logit > self.qk_clip_threshold:
+            scale = torch.sqrt(
+                self.qk_clip_threshold / (max_logit + 1e-8)
+            )
+            Q = Q * scale
+            K = K * scale
+        return Q, K
+
+    def step(self):
+        for i, p in enumerate(self.params):
+            if p.grad is None:
+                continue
+            g = p.grad.data
+            self.m[i] = self.momentum * self.m[i] + (1 - self.momentum) * g
+            O = self._newton_schulz(self.m[i])
+            p.data -= self.lr * O
+
+    def zero_grad(self):
+        for p in self.params:
+            if p.grad is not None:
+                p.grad.zero_()
+```
+
+&emsp;&emsp;这个实现中，`qk_clip` 在注意力计算前检查 logits 幅度，超过阈值时缩放 Q 和 K。实际使用中需在注意力层中调用 `qk_clip`。
+
+---
 
 #### 2.10.5 L-BFGS
 
+&emsp;&emsp;L-BFGS（Limited-memory BFGS）是一种拟牛顿优化方法，通过近似 Hessian 矩阵的逆来加速收敛。与 BFGS 需要存储 $n \times n$ 的完整 Hessian 近似不同，L-BFGS 只存储最近 $m$ 步的位移向量 $s_k = \theta_{k+1} - \theta_k$ 和梯度变化 $y_k = g_{k+1} - g_k$，利用两循环递归计算 Hessian 逆与梯度的乘积，将存储从 $O(n^2)$ 降到 $O(mn)$。
+
+&emsp;&emsp;两循环递归的计算过程为：给定当前梯度 $g_k$ 和历史对 $\{(s_i, y_i)\}_{i=k-m}^{k-1}$，首先向前循环计算中间变量 $\alpha_i$，然后向后循环累积更新方向。设初始 Hessian 逆近似为 $H_k^0 = \frac{s_{k-1}^\top y_{k-1}}{y_{k-1}^\top y_{k-1}} I$，两循环递归的计算为：
+
+$$
+q = g_k
+$$
+
+$$
+\text{for } i = k-1, \dots, k-m: \quad \alpha_i = \rho_i s_i^\top q, \quad q = q - \alpha_i y_i
+$$
+
+$$
+r = H_k^0 q
+$$
+
+$$
+\text{for } i = k-m, \dots, k-1: \quad \beta = \rho_i y_i^\top r, \quad r = r + s_i(\alpha_i - \beta)
+$$
+
+&emsp;&emsp;其中 $\rho_i = 1/(y_i^\top s_i)$。最终更新方向为 $-r$。L-BFGS 的优点是收敛速度快，在光滑目标函数上具有超线性收敛，无需手动设置学习率（通过线搜索确定步长），适合中小规模参数的精细调优；缺点是内存和计算开销随历史步数 $m$ 线性增长，对随机梯度的噪声敏感，不适合大规模深度学习训练中常见的非凸、随机优化场景。
+
+&emsp;&emsp;从维度视角看，L-BFGS 在特征维上利用历史梯度信息构建曲率近似，通过两循环递归隐式地沿特征维做二次型缩放。它不逐维维护自适应学习率，而是捕捉特征维之间的相关性。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 L-BFGS 两循环递归的裸实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class LBFGS(nn.Module):
+    def __init__(self, params, lr=1.0, history_size=10):
+        super().__init__()
+        self.params = list(params)
+        self.lr = lr
+        self.history_size = history_size
+        self.s_history = []  # s_k = theta_{k+1} - theta_k
+        self.y_history = []  # y_k = g_{k+1} - g_k
+        self.rho_history = []  # 1/(y^T s)
+
+    def _two_loop_recursion(self, grad):
+        """L-BFGS 两循环递归"""
+        q = grad.clone()
+        alphas = []
+        # 向前循环
+        for s, y, rho in zip(reversed(self.s_history),
+                              reversed(self.y_history),
+                              reversed(self.rho_history)):
+            alpha = rho * torch.sum(s * q)
+            alphas.append(alpha)
+            q = q - alpha * y
+
+        # 初始 Hessian 逆近似: H0 = (s^T y) / (y^T y) I
+        if len(self.s_history) > 0:
+            s_last = self.s_history[-1]
+            y_last = self.y_history[-1]
+            gamma = torch.sum(s_last * y_last) / (
+                torch.sum(y_last * y_last) + 1e-10
+            )
+        else:
+            gamma = 1.0
+
+        r = gamma * q
+
+        # 向后循环
+        for s, y, alpha in zip(self.s_history,
+                                self.y_history,
+                                reversed(alphas)):
+            beta = self.rho_history[self.s_history.index(s)] * torch.sum(y * r)
+            r = r + s * (alpha - beta)
+
+        return r
+
+    def step(self, closure=None):
+        """closure 返回 loss，并计算梯度"""
+        loss = closure()
+        grad = torch.cat([p.grad.data.view(-1) for p in self.params
+                          if p.grad is not None])
+        theta = torch.cat([p.data.view(-1) for p in self.params
+                           if p.grad is not None])
+
+        if len(self.s_history) > 0:
+            direction = self._two_loop_recursion(grad)
+            # 线搜索确定步长（简化: 固定学习率）
+            new_theta = theta - self.lr * direction
+        else:
+            new_theta = theta - self.lr * grad
+
+        # 更新参数
+        offset = 0
+        for p in self.params:
+            if p.grad is not None:
+                numel = p.numel()
+                p.data.copy_(new_theta[offset:offset+numel].view_as(p))
+                offset += numel
+
+        return loss
+
+    def update_history(self, s, y):
+        """在参数更新后调用，记录 s 和 y"""
+        if torch.sum(y * s) > 1e-10:
+            self.s_history.append(s)
+            self.y_history.append(y)
+            self.rho_history.append(1.0 / torch.sum(y * s))
+            if len(self.s_history) > self.history_size:
+                self.s_history.pop(0)
+                self.y_history.pop(0)
+                self.rho_history.pop(0)
+
+    def zero_grad(self):
+        for p in self.params:
+            if p.grad is not None:
+                p.grad.zero_()
+```
+
+&emsp;&emsp;这个实现中，`_two_loop_recursion` 通过向前和向后两个循环计算 Hessian 逆与梯度的乘积。实际使用中需要配合线搜索确定步长。
+
+---
 
 #### 2.10.6 FP8 混合精度训练
 
+&emsp;&emsp;FP8 混合精度训练使用 8 位浮点数进行矩阵乘法和部分激活值存储，同时保留 FP32 或 BF16 的主权重副本。FP8 有两种格式：E4M3 和 E5M2。E4M3 使用 4 位指数和 3 位尾数，精度更高但动态范围有限，范围约 $\pm 448$；E5M2 使用 5 位指数和 2 位尾数，动态范围更宽，约 $\pm 57344$，但精度更低。实践中通常采用混合格式：前向传播的激活和权重使用 E4M3，反向传播的梯度使用 E5M2。
+
+&emsp;&emsp;FP8 训练的核心挑战是张量的动态范围可能超出 FP8 的表示范围，需要通过缩放因子将张量归一化到 FP8 可表示的区间。常见的缩放策略包括三种。逐张量缩放（Per-Tensor Scaling）为整个张量计算一个缩放因子，使用张量的绝对最大值进行归一化，实现简单但精度有限。分块缩放（Blockwise FP8）将激活和梯度按 $128\times 128$ 的瓦片量化，权重按 $1\times 128$ 的块量化，采用 E4M3 格式，在 Hopper 平台上推荐使用，已在 DeepSeek-V3 等大规模 MoE 模型中验证有效。MXFP8 在 Blackwell 平台上使用 $1\times 32$ 的更细粒度量化，缩放因子使用 E8M0 格式，由第五代 Tensor Core 原生支持。
+
+&emsp;&emsp;FP8 混合精度训练的优点是相比 BF16 矩阵乘法吞吐量翻倍，显存占用和带宽需求降低约一半，且在大规模模型中已被验证可以保持与 BF16 相当的收敛性；缺点是 FP8 的动态范围有限，需要精细的缩放策略，数值不稳定风险较高，且不同硬件平台的 FP8 支持程度和最优配方不同。
+
+&emsp;&emsp;从维度视角看，FP8 混合精度在特征维上以更低的位宽表示张量，通过缩放因子将特征维的数值范围压缩到 FP8 的可表示区间。这相当于在特征维上做了一次有损压缩，但通过保留 FP32 主权重和精细的缩放策略，将精度损失控制在可接受范围内。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 FP8 混合精度训练核心逻辑的模拟实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class FP8Linear(nn.Module):
+    """FP8 混合精度线性层模拟: 权重 FP8，计算 FP32，主权重 FP32"""
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+        # 主权重副本（FP32）
+        self.register_buffer("weight_master", self.weight.data.clone())
+
+    def _quantize_fp8(self, x, scale):
+        """将张量量化为 FP8 模拟格式并反量化"""
+        x_scaled = x / scale
+        x_clamped = torch.clamp(x_scaled, -448.0, 448.0)  # E4M3 范围
+        # 模拟 FP8 精度: 量化到 3 位尾数
+        x_fp8 = x_clamped * scale
+        return x_fp8
+
+    def _compute_scale(self, x):
+        """逐张量缩放: amax 归一化"""
+        amax = x.abs().max()
+        return amax / 448.0 if amax > 0 else torch.tensor(1.0, device=x.device)
+
+    def forward(self, x):
+        # 量化权重
+        w_scale = self._compute_scale(self.weight)
+        w_fp8 = self._quantize_fp8(self.weight, w_scale)
+
+        # 量化激活
+        x_scale = self._compute_scale(x)
+        x_fp8 = self._quantize_fp8(x, x_scale)
+
+        # FP8 矩阵乘法（模拟: 反量化后做 FP32 乘法）
+        out = torch.matmul(x_fp8, w_fp8.T)
+        return out
+```
+
+&emsp;&emsp;这个实现模拟了 FP8 的量化-反量化流程。实际中需使用 Tensor Core 原生 FP8 支持（如 Transformer Engine）获得加速。
+
+---
 
 #### 2.10.7 BF16 与 INT4 量化
+
+&emsp;&emsp;BF16（Brain Floating Point 16）和 INT4 是两种不同定位的低精度格式。BF16 用于训练，INT4 用于推理量化。
+
+&emsp;&emsp;BF16 使用 8 位指数和 7 位尾数，与 FP32 具有相同的指数范围，因此不会出现梯度上溢或下溢，通常不需要损失缩放。FP16 使用 5 位指数和 10 位尾数，精度更高但动态范围窄，训练时需要损失缩放来防止梯度下溢。BF16 的优点是训练稳定性好，无需损失缩放，与 FP32 的切换几乎无损，在 A100 及以上 GPU 上原生支持；缺点是尾数精度低于 FP16，在某些对精度敏感的任务上可能需要 FP32 回退。
+
+&emsp;&emsp;INT4 量化将权重从 16 位压缩到 4 位，模型大小减少约 75%，使 70B 模型可以在单张消费级 GPU 上运行。GPTQ 和 AWQ 是两种主流的 INT4 训练后量化方法。GPTQ 基于逐层重构，使用 Hessian 矩阵的二阶信息来最小化量化误差，在真实任务上通常优于 AWQ。AWQ 基于激活感知的权重缩放，通过保护重要权重通道来减少量化损失，在多语言检索任务上对低资源语言的保护更好。INT4 量化通常只量化权重（W4A16），激活保持 FP16 或 BF16，因为激活的异常值对量化更敏感。DeepSeek-V4 Flash 在 INT4 量化后可在单张 80GB H100 上运行，质量损失约 5%。
+
+&emsp;&emsp;BF16 与 INT4 量化的优点是 BF16 使大规模训练无需损失缩放，INT4 使大模型可以在消费级硬件上部署，两者配合实现了从训练到推理的完整低精度方案；缺点是 INT4 量化对激活异常值敏感，需要 GPTQ 或 AWQ 等算法精心处理，且量化后的模型在长上下文和低资源语言任务上性能下降更明显。
+
+&emsp;&emsp;从维度视角看，BF16 在训练时以 16 位精度表示特征维，保留了 FP32 的动态范围但降低了精度；INT4 在推理时将权重压缩到 4 位，在特征维上以极低精度存储权重，通过缩放因子和分组量化来最小化信息损失。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+&emsp;&emsp;下面给出 BF16 训练和 INT4 量化推理的模拟实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class BF16Linear(nn.Module):
+    """BF16 混合精度线性层: 权重 BF16，计算 FP32"""
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, x):
+        # 权重转为 BF16，计算时转回 FP32
+        w_bf16 = self.weight.to(torch.bfloat16).to(torch.float32)
+        x_bf16 = x.to(torch.bfloat16).to(torch.float32)
+        return torch.matmul(x_bf16, w_bf16.T)
+
+
+class INT4Linear(nn.Module):
+    """INT4 量化线性层模拟: 权重 4 位，分组量化"""
+    def __init__(self, in_features, out_features, group_size=128):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+        self.register_buffer("q_weight", None)
+        self.register_buffer("scales", None)
+        self.register_buffer("zeros", None)
+
+    def quantize(self):
+        """分组 INT4 量化"""
+        w = self.weight.data
+        out_f, in_f = w.shape
+        num_groups = in_f // self.group_size
+
+        w_grouped = w.view(out_f, num_groups, self.group_size)
+        # 每组计算 min/max
+        w_min = w_grouped.min(dim=-1, keepdim=True).values
+        w_max = w_grouped.max(dim=-1, keepdim=True).values
+
+        # 非对称量化: scale = (max - min) / 15, zero = round(-min / scale)
+        scale = (w_max - w_min) / 15.0
+        scale = torch.clamp(scale, min=1e-8)
+        zero = torch.round(-w_min / scale).clamp(0, 15)
+
+        # 量化到 [0, 15]
+        q = torch.round(w_grouped / scale + zero).clamp(0, 15)
+
+        self.q_weight = q.to(torch.uint8)
+        self.scales = scale
+        self.zeros = zero
+
+    def forward(self, x):
+        if self.q_weight is None:
+            self.quantize()
+        # 反量化
+        w_deq = (self.q_weight.float() - self.zeros) * self.scales
+        w_deq = w_deq.view(self.out_features, self.in_features)
+        return torch.matmul(x, w_deq.T)
+```
+
+&emsp;&emsp;这个实现中，`BF16Linear` 模拟 BF16 训练的前向计算，`INT4Linear` 使用分组非对称量化将权重压缩到 4 位，推理时反量化回 FP32 进行计算。
 
 
 ---
@@ -5382,36 +6532,432 @@ for vs in [32000, 64000, 128000, 256000]:
 
 #### 2.11.1 监督微调（SFT）
 
+&emsp;&emsp;监督微调（Supervised Fine-Tuning, SFT）是在预训练模型基础上，使用高质量的输入-输出对进行有监督训练，使模型学会遵循指令、完成特定任务。设训练数据为 $\mathcal{D} = \{(x^{(i)}, y^{(i)})\}_{i=1}^{N}$，其中 $x^{(i)}$ 是输入指令，$y^{(i)}$ 是目标回答。SFT 的损失为标准自回归交叉熵，但通常只对回答部分计算损失：
+
+$$
+\mathcal{L}_{\mathrm{SFT}} = -\sum_{i=1}^{N} \sum_{t=1}^{|y^{(i)}|} \log P(y_t^{(i)} \mid x^{(i)}, y_{<t}^{(i)}; \theta)
+$$
+
+&emsp;&emsp;输入部分的 token 被掩码，不参与损失计算。SFT 的优点是训练目标明确、稳定，直接教模型“什么样的回答是好的”，且实现简单，只需标准的自回归训练流程；缺点是依赖高质量标注数据，标注成本高，容易过拟合到训练数据的风格，且无法学习到训练数据中未出现的更优回答。从维度视角看，SFT 在 token 维上做因果扩散，特征维上的表示被调整以匹配目标回答的分布，相当于在预训练表示的基础上做了一次有监督的定向微调。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn as nn
+
+def sft_loss(logits, labels, prompt_mask):
+    """
+    logits: (B, L, V)
+    labels: (B, L)
+    prompt_mask: (B, L) 1 表示回答部分，0 表示输入部分
+    """
+    B, L, V = logits.size()
+    logits_flat = logits[:, :-1].reshape(-1, V)
+    labels_flat = labels[:, 1:].reshape(-1)
+    mask_flat = prompt_mask[:, 1:].reshape(-1)
+
+    loss = torch.nn.functional.cross_entropy(
+        logits_flat, labels_flat, reduction='none'
+    )
+    loss = (loss * mask_flat).sum() / (mask_flat.sum() + 1e-8)
+    return loss
+```
+
+&emsp;&emsp;若输入形状为 $(B,L)$，损失仅对回答部分的 token 计算。
+
+---
 
 #### 2.11.2 RLHF
 
+&emsp;&emsp;RLHF（Reinforcement Learning from Human Feedback，基于人类反馈的强化学习）是一种将人类偏好引入语言模型训练的方法，最早由 Christiano 等人于 2017 年提出，后在 InstructGPT 中被系统化。RLHF 的流程分为三个阶段：第一阶段是 SFT，用人工标注的示范数据微调预训练模型；第二阶段是训练奖励模型，用人类对模型输出的偏好排序数据训练一个打分模型；第三阶段是用强化学习算法（通常是 PPO）优化策略模型，使其输出获得更高的奖励。
+
+&emsp;&emsp;第三阶段的优化目标为：
+
+$$
+\mathcal{L}_{\mathrm{RLHF}} = \mathbb{E}_{x \sim \mathcal{D}, y \sim \pi_\theta(\cdot|x)} \left[ r_\phi(x, y) - \beta \cdot \mathrm{KL}\left(\pi_\theta(y|x) \| \pi_{\mathrm{ref}}(y|x)\right) \right]
+$$
+
+&emsp;&emsp;其中 $r_\phi$ 是奖励模型，$\pi_{\mathrm{ref}}$ 是 SFT 后的参考模型，$\beta$ 是 KL 惩罚系数。KL 项防止策略偏离参考模型太远，避免奖励黑客。RLHF 的优点是直接优化人类偏好，能显著提升模型的有用性和安全性；缺点是流程复杂，需要训练多个模型，PPO 训练不稳定，且奖励模型可能被过优化。
+
+&emsp;&emsp;从维度视角看，RLHF 在特征维上通过奖励信号调整策略模型的输出分布，KL 惩罚约束了分布偏移的幅度，相当于在参考模型的特征空间中做有约束的定向优化。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn as nn
+
+def rlhf_loss(policy_logprobs, ref_logprobs, rewards, beta=0.1):
+    """
+    policy_logprobs: (B, L) 策略模型的对数概率
+    ref_logprobs: (B, L) 参考模型的对数概率
+    rewards: (B,) 序列级奖励
+    """
+    # KL 惩罚: 逐 token 的 log 概率差
+    kl = policy_logprobs - ref_logprobs
+    # 序列级 KL
+    kl_seq = kl.sum(dim=-1)
+    # RLHF 目标: 最大化 reward - beta * KL
+    loss = -(rewards - beta * kl_seq).mean()
+    return loss
+```
+
+---
 
 #### 2.11.3 奖励模型（RM）
 
+&emsp;&emsp;奖励模型（Reward Model, RM）是 RLHF 中的关键组件，用于对模型输出进行打分，代替人类偏好。奖励模型通常在 SFT 模型的基础上，将最后的语言模型头替换为标量输出头，输入 (prompt, response) 对，输出一个实数奖励。训练数据为人类对同一 prompt 的多个回答的偏好排序。
+
+&emsp;&emsp;常用的奖励模型训练目标是 Bradley-Terry 模型，对于一对回答 $y_w$（更优）和 $y_l$（更差），偏好概率为：
+
+$$
+P(y_w \succ y_l \mid x) = \sigma\left(r_\phi(x, y_w) - r_\phi(x, y_l)\right)
+$$
+
+&emsp;&emsp;训练损失为负对数似然：
+
+$$
+\mathcal{L}_{\mathrm{RM}} = -\mathbb{E}_{(x, y_w, y_l) \sim \mathcal{D}} \log \sigma\left(r_\phi(x, y_w) - r_\phi(x, y_l)\right)
+$$
+
+&emsp;&emsp;奖励模型的优点是提供了可扩展的偏好信号，使 RL 优化可以大规模进行，且相比直接让人类参与训练循环，成本大幅降低；缺点是奖励模型容易被过优化，模型可能找到获得高奖励但实际质量差的输出，即奖励黑客，且偏好数据存在噪声和标注者偏差。
+
+&emsp;&emsp;从维度视角看，奖励模型在特征维上将序列表示映射为一个标量，通过比较两个回答的奖励差来学习偏好。这相当于在特征维上学习一个排序函数。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn as nn
+
+class RewardModel(nn.Module):
+    def __init__(self, backbone, d_model):
+        super().__init__()
+        self.backbone = backbone
+        self.reward_head = nn.Parameter(torch.empty(d_model, 1))
+        nn.init.normal_(self.reward_head, std=0.02)
+
+    def forward(self, input_ids):
+        hidden = self.backbone(input_ids)  # (B, L, d_model)
+        # 取最后一个 token 的表示
+        last_hidden = hidden[:, -1, :]  # (B, d_model)
+        reward = torch.matmul(last_hidden, self.reward_head).squeeze(-1)
+        return reward
+
+def rm_loss(reward_chosen, reward_rejected):
+    """Bradley-Terry 损失"""
+    return -torch.nn.functional.logsigmoid(
+        reward_chosen - reward_rejected
+    ).mean()
+```
+
+---
 
 #### 2.11.4 PPO
 
+&emsp;&emsp;PPO（Proximal Policy Optimization，近端策略优化）是 RLHF 第三阶段使用的强化学习算法，由 Schulman 等人于 2017 年提出。PPO 的核心思想是限制每次策略更新的幅度，避免策略更新过大导致训练崩溃。PPO 使用裁剪的替代目标函数：
+
+$$
+\mathcal{L}_{\mathrm{PPO}} = \mathbb{E}_t \left[ \min\left( \rho_t \hat{A}_t, \mathrm{clip}(\rho_t, 1-\epsilon, 1+\epsilon) \hat{A}_t \right) \right]
+$$
+
+&emsp;&emsp;其中 $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\theta_{\mathrm{old}}}(a_t|s_t)$ 是重要性采样比率，$\hat{A}_t$ 是优势函数估计，$\epsilon$ 是裁剪范围，通常取 0.2。在 RLHF 中，动作是每个 token，状态是 prompt 和已生成的 token，奖励由奖励模型给出，优势函数通常用 GAE（Generalized Advantage Estimation）计算。
+
+&emsp;&emsp;PPO 的优点是训练稳定，裁剪机制防止策略更新过大，且可以直接优化奖励信号；缺点是需要同时维护策略模型、参考模型、奖励模型和值函数模型，显存开销大，超参数敏感，训练速度慢。从维度视角看，PPO 在特征维上通过裁剪的重要性采样比率约束策略更新的幅度，优势函数在 token 维上传播奖励信号。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn as nn
+
+def ppo_loss(logprobs, old_logprobs, advantages, clip_epsilon=0.2):
+    """
+    logprobs: (B, L) 当前策略的对数概率
+    old_logprobs: (B, L) 旧策略的对数概率
+    advantages: (B, L) 优势函数
+    """
+    ratio = torch.exp(logprobs - old_logprobs)
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon) * advantages
+    policy_loss = -torch.min(surr1, surr2).mean()
+    return policy_loss
+```
+
+---
 
 #### 2.11.5 DPO
 
+&emsp;&emsp;DPO（Direct Preference Optimization，直接偏好优化）由 Rafailov 等人于 2023 年提出，其核心洞察是：RLHF 中带 KL 约束的奖励最大化问题存在闭式最优解，该解可以用策略模型和参考模型的对数概率比表示：
+
+$$
+r(x, y) = \beta \log \frac{\pi_\theta(y|x)}{\pi_{\mathrm{ref}}(y|x)} + \beta \log Z(x)
+$$
+
+&emsp;&emsp;将这一关系代入 Bradley-Terry 偏好模型，奖励模型被消去，得到直接基于偏好数据的损失：
+
+$$
+\mathcal{L}_{\mathrm{DPO}} = -\mathbb{E}_{(x, y_w, y_l)} \log \sigma\left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{\mathrm{ref}}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{\mathrm{ref}}(y_l|x)} \right)
+$$
+
+&emsp;&emsp;DPO 的优点是无需训练奖励模型，也无需在线采样，直接在偏好数据上优化策略，训练稳定且实现简单，计算成本远低于 PPO；缺点是 DPO 是离线方法，无法像 PPO 那样在线探索，且对偏好数据的质量依赖更强。从维度视角看，DPO 在特征维上直接比较优选和次选回答的对数概率比，通过参考模型的比值约束来调整策略分布。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn.functional as F
+
+def dpo_loss(policy_chosen_logps, policy_rejected_logps,
+             ref_chosen_logps, ref_rejected_logps, beta=0.1):
+    """
+    各参数形状: (B,)
+    """
+    chosen_ratio = policy_chosen_logps - ref_chosen_logps
+    rejected_ratio = policy_rejected_logps - ref_rejected_logps
+    logits = beta * (chosen_ratio - rejected_ratio)
+    loss = -F.logsigmoid(logits).mean()
+    return loss
+```
+
+---
 
 #### 2.11.6 GRPO
 
+&emsp;&emsp;GRPO（Group Relative Policy Optimization，组相对策略优化）由 DeepSeek 团队于 2024 年提出，用于 DeepSeekMath 和 DeepSeek-R1 的训练。GRPO 的核心改进是去掉了 PPO 中的值函数模型，改用同一 prompt 下多个采样回答的组内相对奖励作为优势估计。对于每个 prompt $x$，采样 $G$ 个回答 $\{y_1, \dots, y_G\}$，每个回答获得奖励 $r_i$，则第 $i$ 个回答的优势为：
+
+$$
+\hat{A}_i = \frac{r_i - \mathrm{mean}(\{r_1, \dots, r_G\})}{\mathrm{std}(\{r_1, \dots, r_G\})}
+$$
+
+&emsp;&emsp;GRPO 的损失为：
+
+$$
+\mathcal{L}_{\mathrm{GRPO}} = \mathbb{E} \left[ \frac{1}{G} \sum_{i=1}^{G} \min\left( \rho_i \hat{A}_i, \mathrm{clip}(\rho_i, 1-\epsilon, 1+\epsilon) \hat{A}_i \right) - \beta \cdot \mathrm{KL}(\pi_\theta \| \pi_{\mathrm{ref}}) \right]
+$$
+
+&emsp;&emsp;GRPO 的优点是省去了值函数模型，显存占用大幅降低，组内相对奖励自然实现了基线估计，无需额外训练 Critic，且与奖励模型的配合更简单；缺点是组内采样数量 $G$ 需要权衡，$G$ 太小优势估计方差大，$G$ 太大采样成本高。从维度视角看，GRPO 在特征维上通过组内归一化计算优势，去掉了值函数这一额外的特征维映射，直接用组内奖励的统计量作为基线。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn.functional as F
+
+def grpo_loss(logprobs, old_logprobs, rewards, ref_logprobs,
+              clip_epsilon=0.2, beta=0.01):
+    """
+    logprobs: (G, L) 当前策略对数概率
+    old_logprobs: (G, L) 旧策略对数概率
+    rewards: (G,) 组内奖励
+    ref_logprobs: (G, L) 参考模型对数概率
+    """
+    # 组内相对优势
+    mean_r = rewards.mean()
+    std_r = rewards.std() + 1e-8
+    advantages = (rewards - mean_r) / std_r  # (G,)
+    advantages = advantages.unsqueeze(-1)  # (G, 1)
+
+    ratio = torch.exp(logprobs - old_logprobs)  # (G, L)
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon) * advantages
+    policy_loss = -torch.min(surr1, surr2).mean()
+
+    # KL 惩罚
+    kl = (logprobs - ref_logprobs).mean()
+    return policy_loss + beta * kl
+```
 
 #### 2.11.7 拒绝采样
 
+&emsp;&emsp;拒绝采样（Rejection Sampling）在语言模型对齐中是一种简单而有效的数据筛选方法。其基本流程是：对每个提示 $x$，从当前策略模型 $\pi_\theta$ 中采样 $K$ 个候选回答 $\{y_1, \dots, y_K\}$，然后用奖励模型或规则对每个回答打分，只保留得分最高的一个或若干个回答，作为新的监督数据用于 SFT 或偏好学习。形式化地，选中的回答为：
+
+$$
+y^* = \arg\max_{y_i \sim \pi_\theta(\cdot|x)} r_\phi(x, y_i)
+$$
+
+&emsp;&emsp;拒绝采样的优点是实现简单，无需修改训练目标，仅通过筛选高质量样本就能提升数据质量，且可以与 SFT、DPO 等方法无缝结合；缺点是采样成本随 $K$ 线性增长，且只保留最高分样本会导致模式崩溃，模型可能失去多样性，同时奖励模型的偏差会被放大。从维度视角看，拒绝采样在 token 维上从同一提示生成多条路径，再根据奖励在特征维上的投影选择最优路径，相当于在输出空间中做了一次基于奖励的离散筛选。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn.functional as F
+
+def rejection_sampling(policy_logits, reward_fn, num_samples=4):
+    """
+    policy_logits: (B, L, V) 策略模型输出
+    reward_fn: 接受 (B, L, V) 返回 (B, num_samples) 奖励
+    """
+    B, L, V = policy_logits.size()
+    samples = []
+    rewards = []
+    for _ in range(num_samples):
+        # 从策略分布中采样
+        probs = F.softmax(policy_logits, dim=-1)
+        sampled = torch.multinomial(
+            probs.view(-1, V), 1
+        ).view(B, L)
+        samples.append(sampled)
+        rewards.append(reward_fn(sampled))
+    rewards = torch.stack(rewards, dim=-1)  # (B, num_samples)
+    best_idx = rewards.argmax(dim=-1)  # (B,)
+    best_samples = torch.stack(samples, dim=1)  # (B, num_samples, L)
+    best_samples = best_samples[torch.arange(B), best_idx]  # (B, L)
+    return best_samples, rewards
+```
+
+&emsp;&emsp;这个实现中，对每个提示采样多个回答，选择奖励最高的一个作为输出。实际中奖励函数可以是训练好的奖励模型。
+
+---
 
 #### 2.11.8 RLAIF
 
+&emsp;&emsp;RLAIF（Reinforcement Learning from AI Feedback）用 AI 反馈替代人类反馈来训练奖励模型或直接提供奖励信号。其流程与 RLHF 类似，但偏好标注由强大的 LLM 完成：给定提示 $x$ 和两个回答 $y_a, y_b$，让 AI 判断哪个更好，生成偏好标签，再用这些标签训练奖励模型或直接用于 DPO。RLAIF 的核心优势在于可扩展性：人类标注成本高且速度慢，而 AI 标注可以大规模并行生成。RLAIF 的优点是显著降低标注成本，可以快速迭代，且在某些任务上 AI 反馈与人类反馈高度一致；缺点是 AI 反馈可能继承并放大基座模型的偏见，且对于超出 AI 能力的任务，反馈质量无法保证。从维度视角看，RLAIF 在特征维上用 AI 的偏好判断替代人类的偏好判断，奖励信号来自另一个模型的输出分布，相当于用模型间的知识蒸馏来指导策略优化。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn.functional as F
+
+def rlaif_preference_loss(policy_chosen_logps, policy_rejected_logps,
+                          ref_chosen_logps, ref_rejected_logps,
+                          ai_confidence, beta=0.1):
+    """
+    ai_confidence: (B,) AI 对偏好判断的置信度
+    """
+    chosen_ratio = policy_chosen_logps - ref_chosen_logps
+    rejected_ratio = policy_rejected_logps - ref_rejected_logps
+    logits = beta * (chosen_ratio - rejected_ratio)
+    # 用 AI 置信度加权
+    loss = -F.logsigmoid(logits) * ai_confidence
+    return loss.mean()
+```
+
+&emsp;&emsp;这个实现中，AI 置信度用于加权偏好损失，置信度高的样本对训练贡献更大。
+
+---
 
 #### 2.11.9 宪法 AI 与自我纠正
 
+&emsp;&emsp;宪法 AI（Constitutional AI）由 Anthropic 提出，核心思想是让模型根据一套书面原则（宪法）进行自我批评和修正，减少对人类标注的依赖。流程分为两个阶段。第一阶段是监督学习：模型对提示生成初始回答，然后根据宪法原则进行自我批评，指出回答中违反原则的地方，再生成修正后的回答。用修正后的回答进行 SFT。第二阶段是强化学习：模型对同一提示生成多个回答，用 AI 根据宪法判断哪个更好，生成偏好数据训练奖励模型，再用 RLAIF 优化策略。自我纠正的形式化过程为：给定初始回答 $y_0$，批评 $c = \mathrm{Critique}(x, y_0, \mathcal{C})$，修正 $y_1 = \mathrm{Revise}(x, y_0, c, \mathcal{C})$，其中 $\mathcal{C}$ 是宪法原则集合。宪法 AI 的优点是减少人类标注，过程透明可审计，且可以通过修改宪法快速调整模型行为；缺点是宪法原则的设计需要大量人工，模型可能学会表面迎合原则而忽略深层意图，且自我批评可能引入新的错误。从维度视角看，宪法 AI 在特征维上引入了一个基于原则的批评信号，模型需要根据这个信号调整输出分布，相当于在策略空间中沿宪法约束的方向做投影。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn.functional as F
+
+def constitutional_self_correction(policy_logits, critique_scores, beta=0.5):
+    """
+    policy_logits: (B, L, V) 初始回答的 logits
+    critique_scores: (B,) 批评分数，越低表示越违反宪法
+    """
+    # 用批评分数调整 logits: 违反原则的回答被抑制
+    adjusted_logits = policy_logits - beta * critique_scores.view(-1, 1, 1)
+    return adjusted_logits
+
+def constitutional_loss(policy_logits, revised_logits):
+    """让修正后的分布接近理想分布"""
+    log_probs = F.log_softmax(policy_logits, dim=-1)
+    target_probs = F.softmax(revised_logits, dim=-1)
+    return -(target_probs * log_probs).sum(dim=-1).mean()
+```
+
+&emsp;&emsp;这个实现中，批评分数用于调整 logits，修正后的分布作为监督目标。
+
+---
 
 #### 2.11.10 可验证奖励
 
+&emsp;&emsp;可验证奖励（Verifiable Rewards）是一类无需训练奖励模型、直接用程序化验证器给出奖励信号的奖励机制，广泛应用于数学、代码、逻辑推理等答案可自动判定正确性的任务。对于数学题，验证器可以检查最终答案是否与标准答案一致；对于代码题，验证器可以运行测试用例判断代码是否正确。设回答 $y$ 的最终答案为 $a(y)$，标准答案为 $a^*$，则奖励为：
+
+$$
+r(x, y) = \begin{cases}
+1 & \text{if } \mathrm{Verify}(a(y), a^*) = \text{True} \\
+0 & \text{otherwise}
+\end{cases}
+$$
+
+&emsp;&emsp;在 RLVR（Reinforcement Learning with Verifiable Rewards）中，这个 0/1 奖励直接用于 PPO 或 GRPO 的优势估计，无需训练奖励模型。可验证奖励的优点是奖励绝对准确，不存在奖励黑客问题，训练信号干净，且可以大规模自动生成；缺点是仅适用于答案可验证的领域，对于开放式生成、创意写作等任务无法使用，且 0/1 奖励稀疏，需要配合组内相对优势等方法才能有效训练。从维度视角看，可验证奖励在特征维上用确定性验证函数替代了学习的奖励模型，奖励信号是二值的、无偏的，但覆盖范围有限。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+
+def verifiable_reward(predicted_answers, ground_truth_answers):
+    """
+    predicted_answers: list of str
+    ground_truth_answers: list of str
+    返回 0/1 奖励
+    """
+    rewards = []
+    for pred, gt in zip(predicted_answers, ground_truth_answers):
+        # 简单字符串比较，实际中可以是数学等价判断或代码执行
+        if pred.strip() == gt.strip():
+            rewards.append(1.0)
+        else:
+            rewards.append(0.0)
+    return torch.tensor(rewards)
+
+def grpo_with_verifiable_reward(logprobs, old_logprobs, rewards,
+                                 clip_epsilon=0.2):
+    """用可验证奖励做 GRPO"""
+    mean_r = rewards.mean()
+    std_r = rewards.std() + 1e-8
+    advantages = (rewards - mean_r) / std_r
+    advantages = advantages.unsqueeze(-1)
+    ratio = torch.exp(logprobs - old_logprobs)
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon) * advantages
+    return -torch.min(surr1, surr2).mean()
+```
+
+&emsp;&emsp;这个实现中，验证器直接比较答案，返回 0/1 奖励，然后用于 GRPO 的优势计算。
+
+---
 
 #### 2.11.11 思考预算
 
+&emsp;&emsp;思考预算（Thinking Budget）是控制模型推理时计算量的机制，在具备思维链（Chain-of-Thought）能力的模型中尤为重要。模型在回答前会生成一段思考过程，思考预算限制了这段过程的长度或计算量。设思考预算为 $B$，模型生成的思考 token 数为 $T_{\mathrm{think}}$，则约束为 $T_{\mathrm{think}} \leq B$。在训练时，可以通过在数据中混合不同预算的样本，让模型学会在给定预算下分配推理资源；在推理时，可以动态设置预算，简单问题用低预算，复杂问题用高预算。思考预算的优点是显著降低推理成本，使模型可以根据任务难度自适应地分配计算，且高预算通常能提升复杂推理任务的准确率；缺点是预算过低会导致模型无法完成复杂推理，预算分配策略需要额外训练或启发式规则，且思考过程的可解释性可能随预算压缩而下降。从维度视角看，思考预算在 token 维上限制了思维链的长度，相当于在序列生成过程中对 token 维扩散的步数施加了上限，模型需要在有限步数内完成信息聚合。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn.functional as F
+
+def thinking_budget_loss(policy_logits, budget, eos_token_id):
+    """
+    policy_logits: (B, L, V)
+    budget: 最大思考 token 数
+    惩罚超过预算的生成
+    """
+    B, L, V = policy_logits.size()
+    probs = F.softmax(policy_logits, dim=-1)
+    # 计算生成 EOS 的概率
+    eos_prob = probs[:, :, eos_token_id]  # (B, L)
+    # 超过预算的 token 被惩罚
+    if L > budget:
+        over_budget = torch.arange(L, device=policy_logits.device) >= budget
+        penalty = -eos_prob[:, over_budget].sum(dim=-1).mean()
+    else:
+        penalty = torch.tensor(0.0, device=policy_logits.device)
+    return penalty
+
+def apply_budget_mask(logits, budget, eos_token_id):
+    """推理时强制在预算处生成 EOS"""
+    B, L, V = logits.size()
+    if L >= budget:
+        # 将预算之后的位置的 EOS 概率设为无穷大
+        logits[:, budget:, eos_token_id] = float('inf')
+    return logits
+```
+
+&emsp;&emsp;这个实现中，`thinking_budget_loss` 惩罚超过预算的生成，`apply_budget_mask` 在推理时强制在预算处结束思考。
 
 ---
 
@@ -5419,23 +6965,427 @@ for vs in [32000, 64000, 128000, 256000]:
 
 #### 2.12.1 思维链（CoT）
 
+&emsp;&emsp;思维链（Chain-of-Thought, CoT）由 Wei 等人于 2022 年提出，核心思想是让模型在给出最终答案之前，先生成一段中间推理步骤。对于数学题、逻辑推理、多跳问答等需要多步推理的任务，直接输出答案往往容易出错，而生成推理过程可以显著提升准确率。CoT 的形式化表示为：给定问题 $x$，模型生成推理链 $z = (z_1, \dots, z_m)$ 和最终答案 $y$，训练目标为：
+
+$$
+\mathcal{L}_{\mathrm{CoT}} = -\sum_{t=1}^{m} \log P(z_t \mid x, z_{<t}) - \log P(y \mid x, z)
+$$
+
+&emsp;&emsp;CoT 的触发方式包括少样本提示（在提示中给出几个带推理步骤的示例）、零样本提示（直接要求模型“一步一步思考”）、以及通过 SFT 在训练数据中显式加入推理过程。CoT 的优点是显著提升多步推理任务的准确率，推理过程可解释，便于人工检查错误；缺点是推理过程增加了输出长度和推理成本，且模型可能生成看似合理但实际错误的推理链，即“错误推理得到正确答案”。从维度视角看，CoT 在 token 维上扩展了生成序列的长度，将原本单步的答案映射扩展为多步的推理路径，使模型在特征维上有更多中间计算步骤来完成复杂变换。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn.functional as F
+
+def cot_loss(logits, input_ids, cot_start, answer_start):
+    """
+    logits: (B, L, V)
+    input_ids: (B, L)
+    cot_start: 思维链起始位置
+    answer_start: 答案起始位置
+    """
+    B, L, V = logits.size()
+    logits_flat = logits[:, :-1].reshape(-1, V)
+    labels_flat = input_ids[:, 1:].reshape(-1)
+
+    # 构建掩码: 只对思维链和答案部分计算损失
+    mask = torch.zeros(B, L - 1, device=logits.device)
+    mask[:, cot_start-1:answer_start-1] = 1.0  # 思维链部分
+    mask[:, answer_start-1:] = 1.0             # 答案部分
+    mask_flat = mask.reshape(-1)
+
+    loss = F.cross_entropy(logits_flat, labels_flat, reduction='none')
+    return (loss * mask_flat).sum() / (mask_flat.sum() + 1e-8)
+```
+
+&emsp;&emsp;这个实现中，损失只对思维链和答案部分计算，输入问题部分的 token 被掩码。
+
+---
 
 #### 2.12.2 隐藏思维链
 
+&emsp;&emsp;隐藏思维链（Latent Chain-of-Thought）是指模型在内部隐式地进行多步推理，而不在输出中显式生成推理 token。与显式 CoT 不同，隐藏思维链不占用输出序列长度，而是在特征维上通过多层变换完成推理。实现方式包括：在模型内部增加额外的计算层（如循环块、深度循环），使用连续向量而非离散 token 作为中间状态，或通过特殊训练目标让模型在特定位置进行额外计算。设隐藏状态为 $h$，隐藏思维链可以表示为：
+
+$$
+h^{(0)} = \mathrm{Encoder}(x), \quad h^{(k+1)} = \mathrm{Block}(h^{(k)}), \quad y = \mathrm{Decoder}(h^{(K)})
+$$
+
+&emsp;&emsp;其中 $K$ 是内部推理步数。隐藏思维链的优点是推理成本不随推理复杂度线性增长（输出长度不变），且中间状态是连续向量，避免了离散 token 的信息瓶颈；缺点是内部推理过程不可解释，难以调试，且需要特殊的训练目标或架构设计才能有效学习多步推理。从维度视角看，隐藏思维链在特征维上增加了额外的变换步数，相当于在特征空间中做多次迭代，而非在 token 维上展开推理路径。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn as nn
+
+class LatentCoTBlock(nn.Module):
+    """隐藏思维链: 在特征维上做 K 步内部推理"""
+    def __init__(self, d_model, num_heads, d_ff, num_steps):
+        super().__init__()
+        self.num_steps = num_steps
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=num_heads,
+                dim_feedforward=d_ff, batch_first=True
+            ) for _ in range(num_steps)
+        ])
+
+    def forward(self, x):
+        # 在内部重复 K 步，不生成新 token
+        for layer in self.layers:
+            x = layer(x)
+        return x
+```
+
+&emsp;&emsp;这个实现中，模型在内部对隐藏状态做 K 步变换，不生成额外的 token，推理过程完全隐藏在特征维中。
+
+---
 
 #### 2.12.3 推理时计算扩展
 
+&emsp;&emsp;推理时计算扩展（Inference-Time Compute Scaling）是指在推理阶段通过增加计算量来提升模型性能的策略。与训练时扩展（增加参数量或训练数据）不同，推理时扩展在模型固定后，通过调整推理过程来分配更多计算资源给困难问题。主要方法包括：增加思维链长度（让模型生成更长的推理过程）、多次采样后投票（best-of-N 或 majority voting）、树搜索（在推理路径上做搜索）、以及自适应计算（根据问题难度动态分配计算量）。设单次推理成本为 $C$，采样 $N$ 次的成本为 $NC$，多数投票的输出为：
+
+$$
+y^* = \arg\max_{y} \sum_{i=1}^{N} \mathbf{1}\{y_i = y\}
+$$
+
+&emsp;&emsp;推理时计算扩展的优点是无需重新训练模型，仅通过推理策略就能提升性能，且可以根据任务难度灵活调整计算量；缺点是计算成本随采样数或推理长度线性甚至超线性增长，且对于简单问题过度扩展会造成浪费。从维度视角看，推理时计算扩展在 token 维上增加了生成的步数，或在输出空间中探索了多条路径，相当于用更多 token 维的计算来补偿模型固定的特征维容量。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn.functional as F
+
+def self_consistency_vote(policy, input_ids, num_samples=8):
+    """自一致性投票: 多次采样后多数投票"""
+    samples = []
+    for _ in range(num_samples):
+        # 采样生成
+        logits = policy(input_ids)
+        probs = F.softmax(logits[:, -1, :], dim=-1)
+        sampled = torch.multinomial(probs, 1)
+        samples.append(sampled)
+
+    # 多数投票
+    stacked = torch.stack(samples, dim=-1)  # (B, 1, num_samples)
+    votes = stacked.squeeze(1)  # (B, num_samples)
+    # 简单多数投票
+    result = []
+    for b in range(votes.size(0)):
+        values, counts = votes[b].unique(return_counts=True)
+        result.append(values[counts.argmax()])
+    return torch.stack(result)
+
+def best_of_n_rerank(policy, reward_model, input_ids, num_samples=8):
+    """Best-of-N: 采样 N 个，选奖励最高的"""
+    best_sample = None
+    best_reward = float('-inf')
+    for _ in range(num_samples):
+        logits = policy(input_ids)
+        probs = F.softmax(logits[:, -1, :], dim=-1)
+        sampled = torch.multinomial(probs, 1)
+        reward = reward_model(sampled)
+        if reward > best_reward:
+            best_reward = reward
+            best_sample = sampled
+    return best_sample
+```
+
+&emsp;&emsp;这个实现中，`self_consistency_vote` 多次采样后投票，`best_of_n_rerank` 选择奖励最高的样本。
+
+---
 
 #### 2.12.4 reasoning_effort
 
+&emsp;&emsp;`reasoning_effort` 是 OpenAI o 系列和 GPT-5 系列模型中引入的推理努力控制参数，允许用户在推理时指定模型投入多少计算资源进行推理。该参数通常取值为 `low`、`medium`、`high`，对应不同的推理深度和思考 token 预算。在 API 层面，`reasoning_effort` 控制模型在生成最终答案前进行内部推理的程度：`low` 适用于简单问答和事实检索，`medium` 适用于一般推理任务，`high` 适用于复杂数学、代码和逻辑推理。其背后的机制是模型在训练时学会了根据不同的努力级别调整推理行为，推理努力越高，生成的思考 token 越多，内部计算步数越多。设努力级别为 $e \in \{e_1, e_2, \dots, e_K\}$，对应的思考预算为 $B(e)$，则推理过程为：
+
+$$
+z \sim \pi_\theta(\cdot \mid x, e), \quad y \sim \pi_\theta(\cdot \mid x, z)
+$$
+
+&emsp;&emsp;`reasoning_effort` 的优点是用户可以按需权衡推理质量和成本，简单问题用低努力快速回答，复杂问题用高努力获得更好结果，且同一模型可以在不同努力级别下服务不同场景；缺点是努力级别与任务难度的匹配需要用户判断，过高努力浪费计算，过低努力可能无法解决复杂问题。从维度视角看，`reasoning_effort` 在 token 维上控制思维链的展开长度，相当于在推理时动态调节 token 维扩散的步数预算。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn.functional as F
+
+class ReasoningEffortController:
+    """reasoning_effort 控制: 不同努力级别对应不同思考预算"""
+    EFFORT_BUDGETS = {
+        "low": 256,
+        "medium": 1024,
+        "high": 4096,
+    }
+
+    def __init__(self, policy, tokenizer):
+        self.policy = policy
+        self.tokenizer = tokenizer
+
+    def generate_with_effort(self, input_ids, effort="medium", max_new_tokens=2048):
+        budget = self.EFFORT_BUDGETS.get(effort, 1024)
+        max_new_tokens = min(max_new_tokens, budget)
+
+        generated = input_ids
+        for _ in range(max_new_tokens):
+            logits = self.policy(generated)
+            next_logits = logits[:, -1, :]
+
+            # 如果达到预算上限，强制生成结束符
+            if generated.size(1) - input_ids.size(1) >= budget:
+                next_logits[:, self.tokenizer.eos_token_id] = float('inf')
+
+            probs = F.softmax(next_logits, dim=-1)
+            next_token = torch.multinomial(probs, 1)
+            generated = torch.cat([generated, next_token], dim=-1)
+
+            if next_token.item() == self.tokenizer.eos_token_id:
+                break
+
+        return generated
+```
+
+&emsp;&emsp;这个实现中，不同努力级别对应不同的思考 token 预算，预算耗尽时强制结束推理。
+
+---
 
 #### 2.12.5 MCTS 与 Q*
 
+&emsp;&emsp;MCTS（Monte Carlo Tree Search，蒙特卡洛树搜索）是一种在决策空间中通过随机模拟来评估动作价值的搜索算法，在 AlphaGo 等博弈系统中取得巨大成功。在语言模型推理中，MCTS 将每个推理步骤视为一个动作，通过选择、扩展、模拟、回溯四个阶段构建搜索树。选择阶段使用 UCB 公式平衡探索与利用：
+
+$$
+a^* = \arg\max_a \left( Q(s, a) + c \cdot \sqrt{\frac{\ln N(s)}{N(s, a)}} \right)
+$$
+
+&emsp;&emsp;其中 $Q(s,a)$ 是动作价值估计，$N(s)$ 是状态访问次数，$N(s,a)$ 是动作访问次数，$c$ 是探索常数。Q*（Q-star）是 OpenAI 在 o 系列模型中探索的推理搜索框架，结合了 MCTS 和 Q-learning 的思想，通过在推理路径上做树搜索和价值估计来提升复杂推理的准确性。Q* 的核心是将推理过程建模为马尔可夫决策过程，每一步推理是一个动作，最终答案的正确性作为奖励。MCTS 与 Q* 的优点是能够在推理时系统性地探索多条路径，避免贪心解码陷入局部最优，对数学和逻辑推理任务提升显著；缺点是搜索成本高，需要多次调用模型评估状态，且价值估计的准确性直接影响搜索质量。从维度视角看，MCTS 在 token 维上构建了一棵推理路径树，通过树搜索在多个可能的 token 序列之间做选择，相当于将单路径的 token 维扩散扩展为多路径的树状探索。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import math
+import torch
+import torch.nn.functional as F
+
+class MCTSNode:
+    def __init__(self, state, parent=None):
+        self.state = state
+        self.parent = parent
+        self.children = {}
+        self.visits = 0
+        self.value = 0.0
+
+    def ucb_score(self, c=1.414):
+        if self.visits == 0:
+            return float('inf')
+        exploit = self.value / self.visits
+        explore = c * math.sqrt(math.log(self.parent.visits) / self.visits)
+        return exploit + explore
+
+def mcts_search(policy, value_fn, root_state, num_simulations=50,
+                max_depth=10):
+    """简化的 MCTS 推理搜索"""
+    root = MCTSNode(root_state)
+
+    for _ in range(num_simulations):
+        node = root
+        # 选择
+        while node.children and len(node.children) > 0:
+            node = max(node.children.values(), key=lambda n: n.ucb_score())
+
+        # 扩展
+        if node.visits > 0:
+            logits = policy(node.state)
+            probs = F.softmax(logits[:, -1, :], dim=-1)
+            topk_probs, topk_ids = probs.topk(5)
+            for prob, tid in zip(topk_probs[0], topk_ids[0]):
+                new_state = torch.cat([node.state, tid.view(1, 1)], dim=-1)
+                node.children[tid.item()] = MCTSNode(new_state, node)
+
+        # 模拟: 用价值函数估计
+        value = value_fn(node.state)
+
+        # 回溯
+        while node is not None:
+            node.visits += 1
+            node.value += value
+            node = node.parent
+
+    # 选择访问次数最多的子节点
+    best_child = max(root.children.values(), key=lambda n: n.visits)
+    return best_child.state
+```
+
+&emsp;&emsp;这个实现中，MCTS 通过 UCB 选择、扩展、价值估计和回溯四个阶段构建搜索树，最终选择访问次数最多的路径。
+
+---
 
 #### 2.12.6 路由器与统一系统
 
+&emsp;&emsp;路由器与统一系统（Router and Unified System）在推理架构中指的是一个统一的模型系统，通过路由器根据任务类型或难度动态选择不同的推理模式。在 DeepSeek-V4 等系统中，统一系统包含多个推理模式：快速模式（直接输出答案，无思维链）、思考模式（生成完整思维链）、以及介于两者之间的混合模式。路由器根据输入的特征或任务类型决定使用哪种模式。
+
+&emsp;&emsp;设输入为 $x$，路由器输出模式选择 $m = \mathrm{Router}(x)$，其中 $m \in \{\text{fast}, \text{think}, \text{hybrid}\}$。不同模式对应不同的推理预算和生成策略：
+
+$$
+y = \begin{cases}
+\pi_{\text{fast}}(y \mid x) & m = \text{fast} \\
+\pi_{\text{think}}(y \mid x, z) & m = \text{think} \\
+\pi_{\text{hybrid}}(y \mid x, z_{1:k}) & m = \text{hybrid}
+\end{cases}
+$$
+
+&emsp;&emsp;路由器的训练可以通过监督学习（用标注的任务难度标签）或强化学习（根据最终答案质量和计算成本的权衡）。路由器与统一系统的优点是单一模型可以同时服务简单和复杂任务，简单任务快速响应，复杂任务深度推理，资源分配更高效；缺点是路由器的决策可能出错，将复杂任务误判为简单任务会导致质量下降，且统一系统需要在训练时同时优化多种推理模式，训练复杂度更高。从维度视角看，路由器在特征维上根据输入特征选择不同的 token 维扩散策略：快速模式跳过或极短思维链，思考模式展开完整思维链，混合模式在两者之间动态调整。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ReasoningRouter(nn.Module):
+    """推理路由器: 根据输入选择推理模式"""
+    def __init__(self, d_model, num_modes=3):
+        super().__init__()
+        self.num_modes = num_modes
+        self.classifier = nn.Parameter(torch.empty(num_modes, d_model))
+        nn.init.normal_(self.classifier, std=0.02)
+
+    def forward(self, x):
+        """
+        x: (B, L, d_model)
+        返回每个样本的模式概率
+        """
+        # 取平均池化作为输入表示
+        pooled = x.mean(dim=1)  # (B, d_model)
+        logits = torch.matmul(pooled, self.classifier.T)  # (B, num_modes)
+        probs = F.softmax(logits, dim=-1)
+        return probs
+
+    def route(self, x):
+        """选择模式"""
+        probs = self.forward(x)
+        mode = probs.argmax(dim=-1)  # (B,)
+        return mode, probs
+
+
+class UnifiedReasoningSystem(nn.Module):
+    """统一推理系统: 路由器 + 多模式生成"""
+    def __init__(self, policy, d_model):
+        super().__init__()
+        self.policy = policy
+        self.router = ReasoningRouter(d_model)
+        self.mode_budgets = {
+            0: 0,     # fast: 无思维链
+            1: 512,   # think: 中等思维链
+            2: 2048,  # deep: 长思维链
+        }
+
+    def forward(self, input_ids, hidden_states):
+        mode, probs = self.router.route(hidden_states)
+        outputs = []
+        for b in range(input_ids.size(0)):
+            budget = self.mode_budgets[mode[b].item()]
+            # 根据预算生成
+            out = self.policy.generate(input_ids[b:b+1], max_new_tokens=budget + 256)
+            outputs.append(out)
+        return outputs, mode, probs
+```
+
+&emsp;&emsp;这个实现中，`ReasoningRouter` 根据输入表示选择推理模式，`UnifiedReasoningSystem` 根据模式分配不同的思维链预算。
+
+---
 
 #### 2.12.7 推测解码
+
+&emsp;&emsp;推测解码（Speculative Decoding）由 Leviathan 等人于 2023 年提出，是一种加速自回归生成的技术。其核心思想是用一个小而快的草稿模型（Draft Model）快速生成多个候选 token，然后用大模型（Target Model）并行验证这些候选 token 是否可接受。由于大模型的前向传播可以并行处理整个候选序列，而自回归生成是串行的，推测解码将多次串行前向合并为一次并行前向，从而加速生成。
+
+&emsp;&emsp;设草稿模型为 $q$，目标模型为 $p$。草稿模型自回归生成 $\gamma$ 个候选 token $\tilde{x}_1, \dots, \tilde{x}_\gamma$，然后目标模型并行计算这些位置的概率分布。对于每个候选 token $\tilde{x}_t$，接受概率为：
+
+$$
+\min\left(1, \frac{p(\tilde{x}_t \mid x, \tilde{x}_{<t})}{q(\tilde{x}_t \mid x, \tilde{x}_{<t})}\right)
+$$
+
+&emsp;&emsp;若候选 token 被拒绝，则从修正分布中重新采样：
+
+$$
+p'(x) = \mathrm{norm}\left(\max(0, p(x \mid x, \tilde{x}_{<t}) - q(x \mid x, \tilde{x}_{<t}))\right)
+$$
+
+&emsp;&emsp;推测解码的优点是理论上保证输出分布与目标模型完全一致，即无损加速，实际加速比可达 2-3 倍，且可以与量化、批处理等技术叠加；缺点是草稿模型的质量直接影响加速比，草稿模型太差会导致大量拒绝，反而增加开销，且需要额外显存加载草稿模型。从维度视角看，推测解码在 token 维上并行验证多个候选 token，将串行的 token 维扩散转化为并行的批量验证，用草稿模型的快速生成换取目标模型的并行计算。
+
+**&emsp;&emsp;PyTorch 实现示例**
+
+```python
+import torch
+import torch.nn.functional as F
+
+def speculative_decoding(draft_model, target_model, input_ids,
+                         gamma=5, max_new_tokens=100):
+    """
+    draft_model: 草稿模型
+    target_model: 目标模型
+    gamma: 每次草稿生成的 token 数
+    """
+    generated = input_ids
+    tokens_generated = 0
+
+    while tokens_generated < max_new_tokens:
+        # 草稿模型自回归生成 gamma 个候选
+        draft_tokens = []
+        draft_probs = []
+        draft_input = generated
+        for _ in range(gamma):
+            logits = draft_model(draft_input)
+            probs = F.softmax(logits[:, -1, :], dim=-1)
+            token = torch.multinomial(probs, 1)
+            draft_tokens.append(token)
+            draft_probs.append(probs)
+            draft_input = torch.cat([draft_input, token], dim=-1)
+
+        draft_tokens = torch.cat(draft_tokens, dim=-1)  # (B, gamma)
+
+        # 目标模型并行验证
+        candidate = torch.cat([generated, draft_tokens], dim=-1)
+        target_logits = target_model(candidate)
+        target_probs = F.softmax(target_logits, dim=-1)
+
+        # 逐个验证
+        accepted = 0
+        for t in range(gamma):
+            p = target_probs[:, generated.size(1) + t - 1, :]
+            q = draft_probs[t]
+            token = draft_tokens[:, t]
+
+            # 接受概率
+            p_token = p.gather(1, token.unsqueeze(-1)).squeeze(-1)
+            q_token = q.gather(1, token.unsqueeze(-1)).squeeze(-1)
+            accept_prob = torch.minimum(
+                torch.ones_like(p_token), p_token / (q_token + 1e-8)
+            )
+
+            if torch.rand(1).item() < accept_prob.item():
+                accepted += 1
+            else:
+                # 拒绝: 从修正分布重新采样
+                corrected = torch.clamp(p - q, min=0)
+                corrected = corrected / (corrected.sum(dim=-1, keepdim=True) + 1e-8)
+                new_token = torch.multinomial(corrected, 1)
+                generated = torch.cat([generated, draft_tokens[:, :accepted], new_token], dim=-1)
+                tokens_generated += accepted + 1
+                break
+        else:
+            # 全部接受
+            generated = torch.cat([generated, draft_tokens], dim=-1)
+            tokens_generated += gamma
+
+    return generated
+```
+
+&emsp;&emsp;这个实现中，草稿模型自回归生成 $\gamma$ 个候选 token，目标模型并行验证，接受则保留，拒绝则从修正分布重新采样。理论上输出分布与目标模型完全一致。
 
 
 ---
