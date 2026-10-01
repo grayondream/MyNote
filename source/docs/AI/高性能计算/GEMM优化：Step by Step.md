@@ -124,39 +124,6 @@ $$
 
 ### 2.2 朴素实现
 
-&emsp;&emsp;在讨论各种优化手段之前，先来看 GEMM 最直接的实现方式。按照定义 $C[i,j]=\sum_k A[i,k]B[k,j]$，用三重循环逐元素计算即可：
-
-```c
-for (int i = 0; i < M; i++)
-  for (int j = 0; j < N; j++) {
-    float sum = 0.0f;
-    for (int k = 0; k < K; k++)
-      sum += A[i][k] * B[k][j];
-    C[i][j] = sum;
-  }
-```
-
-&emsp;&emsp;这段代码逻辑上完全正确，但性能通常极差。以行主序存储为例，内层循环沿 k 累加时，`A[i][k]` 是连续的，而 `B[k][j]` 的地址步长为 N。每次 k 增加 1，B 的访问就跳到下一行，跨越 N 个元素。若 N 较大，一个缓存行中往往只有一个元素被用到，其余部分被浪费。更严重的是，对于固定的 (i,j)，A 的第 i 行和 B 的第 j 列在 k 循环中被反复读取，但每次只使用一次，没有跨 (i,j) 的复用。整个计算过程中，A 被读取了 N 次，B 被读取了 M 次，C 被写入一次，总访存量约为 $4MNK+4MNK+4MN$ 字节，而浮点运算量只有 $2MNK$。算术强度约为 $2MNK/(8MNK+4MN)\approx 0.25$ FLOP/Byte，远低于 Roofline 转折点。因此，朴素实现几乎总是受内存带宽限制，而非计算能力限制。
-
-&emsp;&emsp;即便不考虑缓存，单累加器的依赖链也会严重限制 FMA 流水线。内层循环中，`sum` 是唯一的累加变量，每次 FMA 都必须等待上一次 FMA 的结果。若 FMA 延迟为 4 周期，吞吐为每周期 2 条，则理想情况下需要 8 条独立 FMA 才能填满流水线，而这里只有 1 条。实际发射率可能只有峰值的几分之一甚至更低。编译器在 `-O3` 下可能尝试展开和向量化，但循环携带的依赖以及潜在的别名问题常常使优化效果有限。简单交换循环顺序，例如改为 i-k-j：
-
-```c
-for (int i = 0; i < M; i++)
-  for (int k = 0; k < K; k++) {
-    float a = A[i][k];
-    for (int j = 0; j < N; j++)
-      C[i][j] += a * B[k][j];
-  }
-```
-
-&emsp;&emsp;这种形式下，内层 j 循环中 `B[k][j]` 和 `C[i][j]` 都是连续访问，适合向量化，`a` 可以广播。但 C 的更新需要读-改-写，且每次 k 迭代都要重新加载 C 的一整行，数据复用依然有限。同时，C 的累加存在跨 k 的依赖，但内层 j 的多次更新彼此独立，可以部分隐藏延迟。尽管如此，i-k-j 仍然没有解决 A 和 B 的全局复用问题，当矩阵规模超过缓存容量时，性能依旧受限于内存带宽。
-
-![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20260929_ddcc62.svg)
-
-&emsp;&emsp;朴素实现的价值在于它清晰地暴露了 GEMM 的两个核心瓶颈：一是访存模式不友好导致有效带宽利用率低，二是单累加器依赖链导致 FMA 流水线无法填满。后续的分块、打包、寄存器分块和微内核等技术，本质上都是围绕这两个问题展开：通过提高数据复用率来提升算术强度，通过增加独立累加器来隐藏指令延迟。因此，朴素实现虽然慢，却是理解所有优化方法的重要起点。
-
-### 2.2 朴素实现
-
 &emsp;&emsp;GEMM 的数学定义为 \(C[i,j]=\sum_{k=0}^{K-1}A[i,k]B[k,j]\)。最直接的实现就是三重循环，逐元素计算 C：
 
 ```c
@@ -201,6 +168,40 @@ void gemm_ikj(int M, int N, int K,
 
 &emsp;&emsp;然而 i-k-j 仍然没有解决 A 和 B 的全局复用问题。固定 i、k 时，B 的一行被读一次，A 的一个标量被读一次，随后便不再使用。若矩阵规模超过 L2/L3，A 和 B 会被反复从内存拉取，实际算术强度依然远低于 Roofline 转折点。
 
+&emsp;&emsp;交换循环顺序后，虽然引入了C矩阵的频繁WRW,但是B矩阵不会再跨行读取也大幅度提升了矩阵A的缓存命中，从下面的结果能够看出来这一举措是非常有效的。
+![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261001_16ac4c.svg)
+
+&emsp;&emsp;为了证明我们关于缓存的猜想，我们来看下v1和v2两个版本实际运行的缓存命中率。
+```cpp
+ Performance counter stats for './build/bench_gemm --benchmark_filter=BM_sgemm/naive_v1/2048x2048x2048':
+
+   229,945,405,766      cycles                                                                
+    41,355,866,464      instructions                                                          
+    11,890,377,327      L1-dcache-loads                                                       
+     9,581,403,250      L1-dcache-load-misses                                                 
+                                                
+      49.306694882 seconds time elapsed
+
+      50.302657000 seconds user
+       0.578283000 seconds sys
+
+ Performance counter stats for './build/bench_gemm --benchmark_filter=BM_sgemm/naive_v2/2048x2048x2048':
+
+    10,267,046,352      cycles                                                                
+    10,354,571,319      instructions                                                          
+     5,639,068,447      L1-dcache-loads                                                       
+       610,572,828      L1-dcache-load-misses                                                 
+
+       1.196446940 seconds time elapsed
+
+       2.240820000 seconds user
+       0.370506000 seconds sys
+```
+
+&emsp;&emsp;从 `perf stat` 的采集结果来看，naive_v1 在 2048³ 规模下的 L1-dcache miss 率高达 **80.6%**（96 亿次 miss / 119 亿次 load），而循环交换后的 naive_v2 只有 **10.8%**（6.1 亿次 miss / 56 亿次 load），相差约 7.5 倍。这正是朴素实现中 B 矩阵跨列访问的典型特征：内层 k 循环每次访问 `B[k*N+j]` 都要跨越 N 个元素，一个 64 字节缓存行往往只用到其中 1 个 float，其余 15 个被白白浪费；同时 A 的第 i 行和 B 的第 j 列在 (i,j) 双重循环中被反复加载，没有跨迭代的寄存器复用。循环交换把 k 提到中间层后，内层 j 循环连续访问 B 和 C，缓存行利用率大幅提升，总 load 次数也从 119 亿降到 56 亿。
+
+&emsp;&emsp;更关键的是，访存瓶颈进一步压低了指令级并行。naive_v1 的 IPC 只有 **0.18**（413 亿条指令 / 2300 亿周期），意味着每 5.6 个周期才 retire 一条指令，CPU 绝大部分时间在等内存，FMA 流水线大量空转；naive_v2 的 IPC 回升到 **1.01**，虽然离理论峰值仍有距离，但已是 v1 的 5.6 倍。两者叠加的结果是：2048³ 下 naive_v1 耗时 48.76 秒、GFLOPS 仅 0.354，而 naive_v2 耗时 0.67 秒、GFLOPS 达 25.66，**性能差距被放大到 72 倍**。这组数据清楚地说明，GEMM 优化的第一步不是急着上向量化或分块，而是先通过循环交换把访存模式从“跨列跳跃”改成“连续扫描”——仅此一步就能收回两个数量级的性能。
+
 ### 2.4 分块
 
 &emsp;&emsp;要突破全局复用的限制，必须让数据在更靠近计算单元的地方被多次复用。由于矩阵计算本身就具备局部独立性，可以通过分块局部计算最后再合并。把 C 划分为 \(MC\times NC\) 的块，A 划分为 \(MC\times KC\)，B 划分为 \(KC\times NC\)。对每个 C 块，遍历 K 维的 \(KC\) 块，将对应的 A、B 子块加载到缓存中，再在缓存内完成多次乘加。这样，A 子块的每一行和 B 子块的每一列都能在 L2/L3 中被多个 C 元素复用。
@@ -235,6 +236,8 @@ void gemm_blocked(int M, int N, int K,
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/deepseek_svg_20261001_b59684.svg)
 
 &emsp;&emsp;但分块后的内层循环仍然每次从 A 取一个标量、从 B 取一行，数据加载频率较高。如果把 A、B 的子块预先复制到连续缓冲区中，就能让内层循环以更紧凑的方式读取。
+
+
 
 ### 2.5 打包
 
