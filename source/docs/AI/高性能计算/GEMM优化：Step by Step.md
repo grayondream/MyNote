@@ -83,331 +83,327 @@ $$
 
 ## 2 GEMM CPU优化
 
-## 3 GEMM GPU优化
+### 2.2 朴素实现
 
-
-# GEMM 优化：Step by Step —— 从硬件出发的根本分析
-
-## 0. 为什么要从硬件出发
-
-GEMM（通用矩阵乘）是 BLAS 中最核心、也最容易被“写对但写不快”的算子。很多人优化 GEMM 的路径是：先写三重循环 → 改循环顺序 → 加分块 → 加 SIMD → 加多线程。这个路径能跑通，但每一步“为什么有效”往往说不清。
-
-真正决定 GEMM 性能的不是代码结构，而是硬件资源的约束：
-
-- **算力从哪来**：ALU/FMA 端口数量、SIMD 宽度、频率。
-- **数据从哪来**：寄存器、L1/L2/L3、主存，每一层的容量、延迟、带宽。
-- **数据怎么流动**：cache line、预取、TLB、NUMA。
-- **指令怎么发射**：乱序窗口、流水线深度、端口冲突、依赖链。
-
-GEMM 优化的本质，是**在给定硬件上，把计算强度（Compute Intensity）推到 Roofline 的拐点之上，同时让数据搬运不成为瓶颈**。下面按硬件层次逐层展开。
-
----
-
-## 1. 硬件基础：存储层次与算力
-
-### 1.1 典型 x86 CPU 的存储层次（以 Skylake-SP / Zen 为例）
-
-| 层级 | 容量 | 延迟（周期） | 带宽（每周期） | 备注 |
-|---|---|---|---|---|
-| 寄存器 | 16/32 个向量寄存器 | 0 | 2×FMA（每周期 2 条 512-bit FMA） | 真正的算力来源 |
-| L1D | 32–48 KB | 4–5 | 2×64 B load + 1×64 B store | 每核私有 |
-| L2 | 512 KB–1 MB | 12–15 | 64 B/cycle | 每核私有 |
-| L3 | 8–32 MB | 40–70 | ~32 B/cycle/核 | 多核共享 |
-| DRAM | GB 级 | 200–400 | 几十 GB/s | 全局瓶颈 |
-
-关键数字（Skylake-SP，单核，AVX-512）：
-- 2 条 512-bit FMA/cycle = 2 × 16 × 2 = **64 FLOP/cycle**
-- L1 带宽：2 × 64 B load = **128 B/cycle**
-- 计算强度拐点：64 FLOP / 128 B = **0.5 FLOP/B**（对 L1）
-
-也就是说：**只要每从 L1 搬 1 字节能产生 ≥0.5 FLOP，就不会被 L1 带宽卡住**。GEMM 天然计算强度极高，所以问题从来不在“算不动”，而在“数据没及时送到 FMA 端口”。
-
-### 1.2 延迟 vs 带宽：两个不同的敌人
-
-- **带宽**决定稳态吞吐上限。
-- **延迟**决定流水线能否填满。
-
-FMA 延迟约 4 周期。若一条 FMA 依赖上一条的结果，则每 4 周期才能发一条，算力利用率只有 1/8（假设 2 条/周期）。解决靠 **ILP（指令级并行）**：同时维护 8–12 条独立 FMA 链，让乱序引擎填满端口。
-
-这就是为什么微内核里要开 **多个累加器**（比如 8×8 或 16×6 的 C 块），而不是只算一个数。
-
-### 1.3 SIMD：算力的真正来源
-
-标量 FMA 每周期只能算 1 个乘加。AVX2 是 8 个 float，AVX-512 是 16 个 float。**不做向量化，等于把 93% 的算力扔掉**。
-
-但向量化有前提：
-- 数据在内存中连续（或可 stride 访问）。
-- 寄存器足够容纳多个向量累加器。
-- 编译器愿意生成 FMA 而不是分离的 mul+add。
-
-这直接导出了后面“打包（packing）”的必要性。
-
----
-
-## 2. Roofline：GEMM 的性能天花板
-
-Roofline 模型：
-
-```
-P = min( P_peak, I × BW )
-```
-
-其中 `I` 是计算强度（FLOP/Byte），`BW` 是某层带宽。
-
-对 GEMM（M=N=K=n，单精度）：
-
-- 总 FLOP = 2n³
-- 若从 DRAM 读，最少数据量 = 3n²（A、B、C 各一遍）
-- 计算强度 = 2n³ / (3n² × 4 B) = n/6 FLOP/B
-
-当 n = 1000，I ≈ 167 FLOP/B，远高于 DRAM 拐点（约 10–20 FLOP/B）。**所以大矩阵 GEMM 天然是 compute-bound，理论上可以逼近峰值。**
-
-但小矩阵（n < 100）计算强度低，容易 memory-bound。这就是为什么 GEMM 要分块：**把大矩阵切成能塞进 cache 的小块，让每一层都工作在 compute-bound 区域**。
-
----
-
-## 3. GEMM 的计算特征
-
-```
-C[M,N] = A[M,K] × B[K,N] + C[M,N]
-```
-
-三重循环，6 种排列。不同排列对应不同的数据复用模式：
-
-| 循环顺序 | 内层复用 | 问题 |
-|---|---|---|
-| i-j-k | C 复用 | A、B 反复从内存取 |
-| i-k-j | A 复用 | B 按列访问，不连续 |
-| j-i-k | C 复用 | 同 i-j-k |
-| k-i-j | A 复用 | B 不连续 |
-| j-k-i | B 复用 | A 按列访问 |
-| k-j-i | B 复用 | A 不连续 |
-
-**核心矛盾**：内层循环要连续访问，同时要最大化寄存器/缓存复用。单靠循环顺序无法同时满足，必须引入**分块 + 打包**。
-
----
-
-## 4. 优化路线：Step by Step
-
-### Step 1：朴素三重循环
+&emsp;&emsp;GEMM 的数学定义为 \(C[i,j]=\sum_{k=0}^{K-1}A[i,k]B[k,j]\)。最直接的实现就是三重循环，逐元素计算 C：
 
 ```c
-for (i = 0; i < M; i++)
-  for (j = 0; j < N; j++)
-    for (k = 0; k < K; k++)
-      C[i][j] += A[i][k] * B[k][j];
-```
-
-问题：
-- B 按列访问，cache line 利用率 1/16（float）。
-- 每次 C[i][j] 都要 load/store，寄存器未复用。
-- 无 SIMD。
-
-性能：约峰值的 1–3%。
-
-### Step 2：循环重排 + 寄存器累加
-
-把 k 放最内，用临时变量累加：
-
-```c
-for (i = 0; i < M; i++)
-  for (j = 0; j < N; j++) {
-    float acc = 0;
-    for (k = 0; k < K; k++)
-      acc += A[i][k] * B[k][j];
-    C[i][j] = acc;
-  }
-```
-
-- C 的 load/store 从 K 次降到 1 次。
-- 但 B 仍按列访问。
-
-性能：约 5–10%。
-
-### Step 3：Cache 分块（Blocking）
-
-把矩阵切成块，使 A 块、B 块、C 块能同时驻留 L1/L2：
-
-```
-for jj in N step NC:
-  for kk in K step KC:
-    for i in M:
-      for j in jj..jj+NC:
-        for k in kk..kk+KC:
-          C[i][j] += A[i][k] * B[k][j]
-```
-
-典型参数（单精度，L1 32KB，L2 256KB）：
-- KC ≈ 256（B 块 256×64×4 = 64KB，放 L2）
-- NC ≈ 64–128（A 块 64×256×4 = 64KB）
-- MC ≈ 64–128
-
-分块后，每层数据在对应 cache 中被复用 `NC`、`MC`、`KC` 次。**这是从 memory-bound 走向 compute-bound 的关键一步。**
-
-性能：约 30–50%。
-
-### Step 4：寄存器分块与微内核（Micro-kernel）
-
-分块解决了 cache，但寄存器还没用满。微内核的思想：
-
-- 一次计算 `MR × NR` 的 C 块（如 8×8、16×6）。
-- 把 `MR` 个 A 元素和 `NR` 个 B 元素读进寄存器。
-- 做 `MR × NR` 次 FMA，只从 L1 读 `MR + NR` 个元素。
-- 计算强度 = `2·MR·NR / (MR+NR)`，对 8×8 是 8 FLOP/元素，远超 L1 拐点。
-
-典型微内核（AVX2，8×8）：
-
-```c
-// C[0..7][0..7] 累加器，16 个 __m256
-for (k = 0; k < KC; k++) {
-  __m256 a0 = _mm256_broadcast_ss(&A[0*K + k]);
-  __m256 a1 = _mm256_broadcast_ss(&A[1*K + k]);
-  // ...
-  __m256 b = _mm256_load_ps(&B[k*N + j]);
-  c00 = _mm256_fmadd_ps(a0, b, c00);
-  c01 = _mm256_fmadd_ps(a1, b, c01);
-  // ...
+void gemm_naive(int M, int N, int K, const float *A, const float *B, float *C) {
+    for (int i = 0; i < M; i++)
+        for (int j = 0; j < N; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++)
+                sum += A[i*K+k] * B[k*N+j];
+            C[i*N+j] = sum;
+        }
 }
 ```
 
-- 每个 k 迭代：8 次 A 广播 + 1 次 B load + 8 次 FMA。
-- 8 个独立 FMA 链，ILP 充足。
-- 累加器占 16 个 ymm，剩下 0 个给 A/B——刚好卡满。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/deepseek_svg_20261001_adec77.svg)
 
-性能：约 60–80%。
+&emsp;&emsp;这段代码逻辑正确，但性能极差。原因有两个：
+- 内层 k 循环访问 `B[k * N + j]` 时，地址步长为 N。每次 k 增加 1，B 的访问就跳到下一行，跨越 N 个元素。若 N 较大，一个缓存行中往往只有一个元素被用到，其余部分被浪费。同时，A 的第 i 行和 B 的第 j 列在 k 循环中被反复读取，但每次只使用一次，没有跨 (i,j) 的复用。整个计算过程中，A 被读取了 N 次，B 被读取了 M 次，总访存量约为 \(4MNK+4MNK+4MN\) 字节，而浮点运算量只有 \(2MNK\)。算术强度约为 \(2MNK/(8MNK+4MN)\approx 0.25\) FLOP/Byte，远低于 Roofline 转折点，因此性能受内存带宽限制。
+- 内层循环中 `sum` 是唯一的累加变量，导致前后指令存在数据依赖，每次 FMA 都必须等待上一次 FMA 的结果。若 FMA 延迟为 4 周期、吞吐为每周期 2 条，则理想情况下需要 8 条独立 FMA 才能填满流水线，而这里只有 1 条。实际发射率可能只有峰值的几分之一甚至更低。编译器在 `-O3` 下可能尝试展开和向量化，但循环携带的依赖以及潜在的别名问题常常使优化效果有限。
 
-### Step 5：打包（Packing）
+### 2.3 循环交换
 
-微内核要求：
-- A 按行连续（便于 broadcast）。
-- B 按行连续（便于 load）。
+&emsp;&emsp;朴素实现中 B 的跨列访问是主要瓶颈。把 k 循环放到中间，让内层 j 循环连续访问 B 和 C，可以显著改善访存模式：
 
-但原始矩阵不保证。打包就是**把 A、B 的块重排成微内核友好的连续缓冲区**：
-
+```c
+void gemm_ikj(int M, int N, int K,
+              const float *A, const float *B, float *C) {
+    for (int i = 0; i < M; i++)
+        for (int k = 0; k < K; k++) {
+            float a = A[i*K+k];
+            const float *Brow = B + k*N;
+            float *Crow = C + i*N;
+            for (int j = 0; j < N; j++)
+                Crow[j] += a * Brow[j];
+        }
+}
 ```
-A_pack: MC × KC，按 MR 行分块，行内连续
-B_pack: KC × NC，按 NR 列分块，行内连续
+
+&emsp;&emsp;交换后，内层 j 循环中 `B[k * N + j]` 和 `C[i * N + j]` 都是连续访问，适合向量化，`a` 可以广播。更重要的是，内层 j 的多次更新彼此独立，不同 j 的 FMA 之间没有依赖，可以部分隐藏 FMA 延迟。这相当于把原来的“逐元素内积”改成了“逐行外积累加”：固定 i、k 时，用 A 的一个标量乘以 B 的一整行，累加到 C 的一整行。此时 C 的更新需要读-改-写，但内层 j 的连续访问使得每次读写都能利用整个缓存行。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/deepseek_svg_20261001_1b4158.svg)
+
+&emsp;&emsp;然而 i-k-j 仍然没有解决 A 和 B 的全局复用问题。固定 i、k 时，B 的一行被读一次，A 的一个标量被读一次，随后便不再使用。若矩阵规模超过 L2/L3，A 和 B 会被反复从内存拉取，实际算术强度依然远低于 Roofline 转折点。
+
+### 2.4 分块
+
+&emsp;&emsp;要突破全局复用的限制，必须让数据在更靠近计算单元的地方被多次复用。由于矩阵计算本身就具备局部独立性，可以通过分块局部计算最后再合并。把 C 划分为 \(MC\times NC\) 的块，A 划分为 \(MC\times KC\)，B 划分为 \(KC\times NC\)。对每个 C 块，遍历 K 维的 \(KC\) 块，将对应的 A、B 子块加载到缓存中，再在缓存内完成多次乘加。这样，A 子块的每一行和 B 子块的每一列都能在 L2/L3 中被多个 C 元素复用。
+
+```c
+void gemm_blocked(int M, int N, int K,
+                  const float *A, const float *B, float *C,
+                  int MC, int NC, int KC) {
+    for (int jc = 0; jc < N; jc += NC) {
+        int n = (jc + NC <= N) ? NC : N - jc;
+        for (int pc = 0; pc < K; pc += KC) {
+            int kc = (pc + KC <= K) ? KC : K - pc;
+            for (int ic = 0; ic < M; ic += MC) {
+                int mc = (ic + MC <= M) ? MC : M - ic;
+                for (int i = ic; i < ic + mc; i++) {
+                    for (int p = pc; p < pc + kc; p++) {
+                        float a = A[i*K+p];
+                        const float *Brow = B + p*N + jc;
+                        float *Crow = C + i*N + jc;
+                        for (int j = 0; j < n; j++)
+                            Crow[j] += a * Brow[j];
+                    }
+                }
+            }
+        }
+    }
+}
 ```
 
-打包的代价是额外的内存拷贝，但它把“不连续访问”从内层循环（执行 K×MR×NR 次）移到外层（执行 M×N×K/(MR·NR·KC) 次），**摊销后可以忽略**。
+&emsp;&emsp;这里的三层分块循环对应着不同的缓存级别：最外层 jc、pc、ic 控制 L3/L2 分块，保证 A、B 面板在 L2/L3 中复用；内层 i、p、j 则是分块内的计算。分块大小需要根据缓存容量选择，例如 \(MC=64\)、\(NC=64\)、\(KC=256\)。分块后，算术强度从仅按 DRAM 计算的 \(n/6\) 提升到按缓存容量计算的水平，性能通常能再提升 2–5 倍。
 
-同时打包可以做：
-- 转置 B，使内层连续。
-- 对齐到 cache line / SIMD 边界。
-- 预取（prefetch）下一块。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/deepseek_svg_20261001_b59684.svg)
 
-性能：约 80–90%。
+&emsp;&emsp;但分块后的内层循环仍然每次从 A 取一个标量、从 B 取一行，数据加载频率较高。如果把 A、B 的子块预先复制到连续缓冲区中，就能让内层循环以更紧凑的方式读取。
 
-### Step 6：SIMD 与 FMA 指令选择
+### 2.5 打包
 
-- 用 `_mm256_fmadd_ps` / `_mm512_fmadd_ps` 而不是 `mul + add`。
-- 注意 FMA 改变舍入行为，需允许 `-ffast-math` 或显式 intrinsic。
-- AVX-512 有 32 个 zmm，可以做 16×14 甚至 16×16 的微内核。
-- 避免 denormal、避免跨 cache line 的 unaligned load。
+&emsp;&emsp;打包是把原本行主序或列主序的子块复制到连续缓冲区中，使得内层循环可以按顺序读取。对 A，把 \(MC\times KC\) 的子块按行打包；对 B，把 \(KC\times NC\) 的子块按列打包成连续面板。这样，内层每次都能取到连续的内存，消除了大步长访问，降低了 TLB 压力，也让硬件预取器能更准确地识别访问模式。
 
-### Step 7：多线程
+```c
+void gemm_packed(int M, int N, int K,
+                 const float *A, const float *B, float *C,
+                 int MC, int NC, int KC) {
+    float *Ap = malloc((size_t)MC*KC*sizeof(float));
+    float *Bp = malloc((size_t)KC*NC*sizeof(float));
 
-- 按 M/N 维划分任务，**不要按 K 维**（K 维需要归约，同步开销大）。
-- 每个线程独立打包自己的 A/B 块，避免 false sharing。
-- 注意 NUMA：线程绑核，数据本地分配（first-touch）。
-- 典型：M 维分块给线程，N 维留给单线程微内核。
+    for (int jc = 0; jc < N; jc += NC) {
+        int n = (jc + NC <= N) ? NC : N - jc;
+        for (int pc = 0; pc < K; pc += KC) {
+            int kc = (pc + KC <= K) ? KC : K - pc;
 
-### Step 8：缓存友好的并行与调度
+            /* 打包 B 的 KC×NC 子块为连续面板 */
+            for (int p = 0; p < kc; p++)
+                for (int j = 0; j < n; j++)
+                    Bp[p*n + j] = B[(pc+p)*N + jc + j];
 
-- L3 共享，线程数多时 L3 带宽成为瓶颈。
-- 用 `MC × NC` 块作为任务粒度，保证每个线程的工作集落在 L2。
-- 避免所有线程同时读同一块 B（可用 B 的复制或分块）。
+            for (int ic = 0; ic < M; ic += MC) {
+                int mc = (ic + MC <= M) ? MC : M - ic;
 
----
+                /* 打包 A 的 MC×KC 子块为连续面板 */
+                for (int i = 0; i < mc; i++)
+                    for (int p = 0; p < kc; p++)
+                        Ap[i*kc + p] = A[(ic+i)*K + pc + p];
 
-## 5. 微内核设计：硬件约束下的取舍
+                for (int i = 0; i < mc; i++) {
+                    for (int p = 0; p < kc; p++) {
+                        float a = Ap[i*kc + p];
+                        const float *Brow = Bp + p*n;
+                        float *Crow = C + (ic+i)*N + jc;
+                        for (int j = 0; j < n; j++)
+                            Crow[j] += a * Brow[j];
+                    }
+                }
+            }
+        }
+    }
+    free(Ap); free(Bp);
+}
+```
 
-以 AVX2（16 ymm）、单精度、8×8 微内核为例：
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/deepseek_svg_20261001_5fc5d7.svg)
 
-| 资源 | 占用 |
-|---|---|
-| 累加器 | 16 ymm（8×8 / 8） |
-| A 广播 | 1 ymm（临时） |
-| B load | 1 ymm（临时） |
-| 总计 | 18 ymm > 16 |
+&emsp;&emsp;打包后，A 和 B 的子块在内存中连续排列，内层循环的加载模式变得非常规则。此时，代码的访存效率已经接近最优，但内层仍然每次只做一个标量与一行的乘加，FMA 的发射效率还有提升空间。
 
-超了。所以实际常用 **8×6**（12 累加器 + 2 临时 = 14）或 **6×8**。AVX-512 有 32 zmm，可以做 **16×14**（28 累加器 + 2 临时 = 30）。
+### 2.6 寄存器分块与微内核
 
-设计原则：
-1. 累加器数量 = MR × NR / SIMD_WIDTH，必须 ≤ 寄存器数 - 2。
-2. ILP：累加器链数 ≥ FMA 延迟 × 发射率 = 4 × 2 = 8。
-3. L1 读带宽：每 k 迭代读 `MR + NR` 个元素，需 ≤ 2 × SIMD_WIDTH。
-4. 尽量让 MR、NR 是 SIMD_WIDTH 的整数倍。
+&emsp;&emsp;经过分块和打包，A、B 子块已能以连续方式读取，但内层循环每次仍然只更新 C 的一行，累加器数量不足，FMA 依赖链依然存在。解决办法是取 \(MR\times NR\) 的小块，例如 \(MR=8\)、\(NR=6\)，用 48 个寄存器保存 C 的累加值。微内核沿 K 维循环，每次加载 A 的 \(MR\) 个元素和 B 的 \(NR\) 个元素，执行 \(MR\times NR\) 次 FMA。这 48 个累加器彼此独立，FMA 之间没有依赖链，可以持续填满流水线。
 
----
+```c
+#define MR 8
+#define NR 6
 
-## 6. 实测与验证
+void micro_kernel(int kc, int n,
+                  const float *Ap, const float *Bp,
+                  float *C, int ldc) {
+    for (int i = 0; i < MR; i++) {
+        float c[NR];
+        for (int j = 0; j < NR; j++) c[j] = C[i*ldc + j];
+        for (int p = 0; p < kc; p++) {
+            float a = Ap[i*kc + p];
+            const float *Brow = Bp + p*n;
+            for (int j = 0; j < NR; j++)
+                c[j] += a * Brow[j];
+        }
+        for (int j = 0; j < NR; j++) C[i*ldc + j] = c[j];
+    }
+}
+```
 
-优化效果参考（单精度，M=N=K=4096，Skylake 2.5GHz，单核）：
+&emsp;&emsp;调用微内核的主循环如下：
 
-| 阶段 | GFLOPS | 峰值占比 |
-|---|---|---|
-| 朴素 | ~2 | 1% |
-| 循环重排 | ~10 | 6% |
-| 分块 | ~40 | 25% |
-| 微内核 | ~90 | 56% |
-| 打包 + SIMD | ~130 | 81% |
-| 多线程（16 核） | ~1800 | 87% |
+```c
+void gemm_micro(int M, int N, int K,
+                const float *A, const float *B, float *C,
+                int MC, int NC, int KC) {
+    float *Ap = malloc((size_t)MC*KC*sizeof(float));
+    float *Bp = malloc((size_t)KC*NC*sizeof(float));
 
-峰值 = 2.5 GHz × 64 FLOP = 160 GFLOPS/核。
+    for (int jc = 0; jc < N; jc += NC) {
+        int n = (jc + NC <= N) ? NC : N - jc;
+        for (int pc = 0; pc < K; pc += KC) {
+            int kc = (pc + KC <= K) ? KC : K - pc;
+            for (int p = 0; p < kc; p++)
+                for (int j = 0; j < n; j++)
+                    Bp[p*n + j] = B[(pc+p)*N + jc + j];
+            for (int ic = 0; ic < M; ic += MC) {
+                int mc = (ic + MC <= M) ? MC : M - ic;
+                for (int i = 0; i < mc; i++)
+                    for (int p = 0; p < kc; p++)
+                        Ap[i*kc + p] = A[(ic+i)*K + pc + p];
 
-验证方法：
-- `perf stat` 看 IPC、L1/L2/L3 miss、FMA 端口利用率。
-- `likwid` 看内存带宽。
-- 对比 OpenBLAS / MKL 的 sgemm。
+                for (int ir = 0; ir + MR <= mc; ir += MR)
+                    for (int jr = 0; jr + NR <= n; jr += NR)
+                        micro_kernel(kc, n,
+                                     Ap + ir*kc,
+                                     Bp + jr,
+                                     C + (ic+ir)*N + (jc+jr),
+                                     N);
 
----
+                /* 处理 MR 和 NR 的边角 */
+                for (int ir = (mc/MR)*MR; ir < mc; ir++)
+                    for (int p = 0; p < kc; p++) {
+                        float a = Ap[ir*kc + p];
+                        const float *Brow = Bp + p*n;
+                        float *Crow = C + (ic+ir)*N + jc;
+                        for (int j = 0; j < n; j++)
+                            Crow[j] += a * Brow[j];
+                    }
+            }
+        }
+    }
+    free(Ap); free(Bp);
+}
+```
 
-## 7. 从 CPU 到 GPU：同样的硬件逻辑
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/deepseek_svg_20261001_465a90.svg)
 
-GPU 的层次不同，但逻辑一致：
+&emsp;&emsp;微内核通过 48 个独立累加器填满了 FMA 流水线。若 FMA 延迟为 4 周期、吞吐为 2 条/周期，理论上只需要 8 条独立 FMA，而 48 个累加器提供的并行度远远超过这一要求。此时单核性能已经接近标量峰值，但每个 FMA 仍然只处理一个浮点数。
 
-| CPU | GPU |
-|---|---|
-| 寄存器 | 寄存器文件 |
-| L1 | Shared Memory / L1 |
-| L2 | L2 |
-| DRAM | HBM |
-| SIMD | Warp / Thread Block |
-| 乱序 | 大量并发 warp 隐藏延迟 |
+### 2.7 SIMD 向量化
 
-CUDA GEMM 的经典分块：
-- Thread Block 算 `BM × BN` 的 C 块。
-- 每个线程算 `TM × TN` 的微块（对应 CPU 的寄存器分块）。
-- Shared Memory 存 A、B 的块（对应 CPU 的 L1 分块）。
-- 用 `float4` / `__ldg` 做向量化。
-- 双缓冲隐藏 global memory 延迟。
+&emsp;&emsp;现代 x86 CPU 支持 AVX2 或 AVX-512，单条 FMA 指令可以作用在 8 个或 16 个单精度浮点数上。把微内核中的 NR 设为 SIMD 宽度的整数倍，用 `_mm256_fmadd_ps` 等内在函数替代标量 FMA，可以让吞吐成倍提升。以下代码使用 AVX2，编译时需加 `-mavx2 -mfma`。
 
-同样的 Roofline、同样的计算强度分析、同样的“把数据搬到离计算单元最近的地方”。
+```c
+#include <immintrin.h>
 
----
+#define MR 8
+#define NR 8
 
-## 8. 总结：硬件约束驱动的优化清单
+void micro_kernel_avx2(int kc, int n,
+                       const float *Ap, const float *Bp,
+                       float *C, int ldc) {
+    __m256 c[MR];
+    for (int i = 0; i < MR; i++)
+        c[i] = _mm256_loadu_ps(C + i*ldc);
 
-| 硬件资源 | 约束 | 优化手段 |
-|---|---|---|
-| FMA 端口 | 峰值算力 | SIMD、FMA、ILP |
-| 寄存器 | 容量有限 | 寄存器分块、微内核尺寸 |
-| L1 | 带宽 + 容量 | 微内核、打包、连续访问 |
-| L2 | 容量 | KC、MC 分块 |
-| L3 | 共享带宽 | NC 分块、线程划分 |
-| DRAM | 带宽 + 延迟 | 大块分块、预取、NUMA |
-| 流水线 | 延迟 | 多累加器、独立 FMA 链 |
-| 多核 | 同步 + 带宽 | M/N 维并行、绑核、避免 false sharing |
+    for (int p = 0; p < kc; p++) {
+        const float *Brow = Bp + p*n;
+        __m256 b = _mm256_loadu_ps(Brow);
+        for (int i = 0; i < MR; i++) {
+            __m256 a = _mm256_set1_ps(Ap[i*kc + p]);
+            c[i] = _mm256_fmadd_ps(a, b, c[i]);
+        }
+    }
 
-**一句话**：GEMM 优化 = 在每一层存储层次上，把数据复用次数推到该层带宽所能支撑的计算强度之上，同时用足够的 ILP 填满 FMA 流水线。
+    for (int i = 0; i < MR; i++)
+        _mm256_storeu_ps(C + i*ldc, c[i]);
+}
+```
 
----
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/deepseek_svg_20261001_b692d2.svg)
 
-如果你希望我：
-1. 针对你文档已有的章节做**衔接/补全**，请把现有内容粘贴过来；
-2. 补充**具体代码**（C + intrinsic 的完整微内核、OpenMP 并行版）；
-3. 补充**ARM NEON / SVE** 或 **GPU CUDA** 的对应分析；
-4. 加入**性能计数器实测数据模板**；
+&emsp;&emsp;调用 AVX2 微内核的主循环与 2.6 类似，只需把 `micro_kernel` 替换为 `micro_kernel_avx2`，并把 NR 改为 8。AVX2 版本通常能在标量微内核基础上再提升 3–6 倍。至此单核性能已接近峰值，剩下的问题是单个核心的算力有限，需要把工作分摊到多个核心上。
 
-告诉我方向，我继续写。
+### 2.8 多线程与 NUMA
+
+&emsp;&emsp;GEMM 的并行性天然存在于 M 和 N 方向，可以把 C 的不同块分配给不同线程。线程应尽量绑定到 NUMA 节点本地内存，避免远端访问；同时要防止多个线程写同一缓存行造成伪共享。以下代码用 OpenMP 对最外层 jc 循环并行化，编译时需加 `-fopenmp`。
+
+```c
+#include <omp.h>
+#include <immintrin.h>
+#include <stdlib.h>
+
+#define MR 8
+#define NR 8
+
+void micro_kernel_avx2(int kc, int n,
+                       const float *Ap, const float *Bp,
+                       float *C, int ldc) {
+    __m256 c[MR];
+    for (int i = 0; i < MR; i++)
+        c[i] = _mm256_loadu_ps(C + i*ldc);
+    for (int p = 0; p < kc; p++) {
+        const float *Brow = Bp + p*n;
+        __m256 b = _mm256_loadu_ps(Brow);
+        for (int i = 0; i < MR; i++) {
+            __m256 a = _mm256_set1_ps(Ap[i*kc + p]);
+            c[i] = _mm256_fmadd_ps(a, b, c[i]);
+        }
+    }
+    for (int i = 0; i < MR; i++)
+        _mm256_storeu_ps(C + i*ldc, c[i]);
+}
+
+void gemm_mt(int M, int N, int K,
+             const float *A, const float *B, float *C,
+             int MC, int NC, int KC) {
+    #pragma omp parallel
+    {
+        float *Ap = malloc((size_t)MC*KC*sizeof(float));
+        float *Bp = malloc((size_t)KC*NC*sizeof(float));
+
+        #pragma omp for schedule(dynamic)
+        for (int jc = 0; jc < N; jc += NC) {
+            int n = (jc + NC <= N) ? NC : N - jc;
+            for (int pc = 0; pc < K; pc += KC) {
+                int kc = (pc + KC <= K) ? KC : K - pc;
+                for (int p = 0; p < kc; p++)
+                    for (int j = 0; j < n; j++)
+                        Bp[p*n + j] = B[(pc+p)*N + jc + j];
+
+                for (int ic = 0; ic < M; ic += MC) {
+                    int mc = (ic + MC <= M) ? MC : M - ic;
+                    for (int i = 0; i < mc; i++)
+                        for (int p = 0; p < kc; p++)
+                            Ap[i*kc + p] = A[(ic+i)*K + pc + p];
+
+                    for (int ir = 0; ir + MR <= mc; ir += MR)
+                        for (int jr = 0; jr + NR <= n; jr += NR)
+                            micro_kernel_avx2(kc, n,
+                                              Ap + ir*kc,
+                                              Bp + jr,
+                                              C + (ic+ir)*N + (jc+jr),
+                                              N);
+
+                    for (int ir = (mc/MR)*MR; ir < mc; ir++)
+                        for (int p = 0; p < kc; p++) {
+                            float a = Ap[ir*kc + p];
+                            const float *Brow = Bp + p*n;
+                            float *Crow = C + (ic+ir)*N + jc;
+                            for (int j = 0; j < n; j++)
+                                Crow[j] += a * Brow[j];
+                        }
+                }
+            }
+        }
+        free(Ap); free(Bp);
+    }
+}
+```
+
+&emsp;&emsp;并行化后，性能通常能接近单核的 N 倍，但受限于共享 L3 和内存带宽，扩展比会略低于核数。若系统为 NUMA 架构，可用 `numactl --localalloc` 或 `OMP_PROC_BIND` 绑定线程到本地节点，进一步减少远端访问。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/deepseek_svg_20261001_d317e3.svg)
+
+&emsp;&emsp;至此，从朴素实现到多线程 SIMD 微内核的完整路径已经走完。每一步都在解决前一步遗留的瓶颈：循环交换解决 B 的跨步访问，分块解决全局复用，打包解决微内核加载效率，寄存器分块解决 FMA 延迟，SIMD 提升单指令吞吐，多线程突破单核算力限制。硬件峰值和带宽决定了性能上界，而这些优化方法的作用，就是让实际性能不断逼近这一上界。
+
+## 3 GEMM GPU优化
