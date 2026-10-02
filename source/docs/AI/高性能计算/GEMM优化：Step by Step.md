@@ -81,6 +81,18 @@ $$
 
 &emsp;&emsp;与CPU那节的结论对应：CPU上GEMM优化主要关注"如何让流水线不断流"（指令级并行、缓存预取、SIMD），而GPU上GEMM优化主要关注"如何用并行度隐藏延迟、如何让数据在存储层次间高效流动"（分块、共享内存、Tensor Core、Occupancy）。两者共享同一个底层逻辑——局部性原理和延迟隐藏——但具体手段因硬件架构而异。
 
+> 硬件平台：
+- RTX 3050
+- AMD 5600X
+    - Caches (sum of all):         
+        - L1d:                       192 KiB (6 instances)
+        - L1i:                       192 KiB (6 instances)
+        - L2:                        3 MiB (6 instances)
+        - L3:                        32 MiB (1 instance)
+    - NUMA:                        
+        - NUMA 节点：                1
+        - NUMA 节点0 CPU：           0-11
+
 ## 2 GEMM CPU优化
 ### 2.1 CPU GEMM性能模型和优化方法
 
@@ -124,7 +136,7 @@ $$
 
 ### 2.2 朴素实现
 
-&emsp;&emsp;GEMM 的数学定义为 \(C[i,j]=\sum_{k=0}^{K-1}A[i,k]B[k,j]\)。最直接的实现就是三重循环，逐元素计算 C：
+&emsp;&emsp;GEMM 的数学定义为 $C[i,j]=\sum_{k=0}^{K-1}A[i,k]B[k,j]$。最直接的实现就是三重循环，逐元素计算 C：
 
 ```c
 void gemm_naive(int M, int N, int K, const float *A, const float *B, float *C) {
@@ -141,7 +153,7 @@ void gemm_naive(int M, int N, int K, const float *A, const float *B, float *C) {
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/deepseek_svg_20261001_adec77.svg)
 
 &emsp;&emsp;这段代码逻辑正确，但性能极差。原因有两个：
-- 内层 k 循环访问 `B[k * N + j]` 时，地址步长为 N。每次 k 增加 1，B 的访问就跳到下一行，跨越 N 个元素。若 N 较大，一个缓存行中往往只有一个元素被用到，其余部分被浪费。同时，A 的第 i 行和 B 的第 j 列在 k 循环中被反复读取，但每次只使用一次，没有跨 (i,j) 的复用。整个计算过程中，A 被读取了 N 次，B 被读取了 M 次，总访存量约为 \(4MNK+4MNK+4MN\) 字节，而浮点运算量只有 \(2MNK\)。算术强度约为 \(2MNK/(8MNK+4MN)\approx 0.25\) FLOP/Byte，远低于 Roofline 转折点，因此性能受内存带宽限制。
+- 内层 k 循环访问 `B[k * N + j]` 时，地址步长为 N。每次 k 增加 1，B 的访问就跳到下一行，跨越 N 个元素。若 N 较大，一个缓存行中往往只有一个元素被用到，其余部分被浪费。同时，A 的第 i 行和 B 的第 j 列在 k 循环中被反复读取，但每次只使用一次，没有跨 (i,j) 的复用。整个计算过程中，A 被读取了 N 次，B 被读取了 M 次，总访存量约为 $4MNK+4MNK+4MN$ 字节，而浮点运算量只有 $2MNK$。算术强度约为 $2MNK/(8MNK+4MN)\approx 0.25$ FLOP/Byte，远低于 Roofline 转折点，因此性能受内存带宽限制。
 - 内层循环中 `sum` 是唯一的累加变量，导致前后指令存在数据依赖，每次 FMA 都必须等待上一次 FMA 的结果。若 FMA 延迟为 4 周期、吞吐为每周期 2 条，则理想情况下需要 8 条独立 FMA 才能填满流水线，而这里只有 1 条。实际发射率可能只有峰值的几分之一甚至更低。编译器在 `-O3` 下可能尝试展开和向量化，但循环携带的依赖以及潜在的别名问题常常使优化效果有限。
 
 ### 2.3 循环交换
@@ -204,24 +216,28 @@ void gemm_ikj(int M, int N, int K,
 
 ### 2.4 分块
 
-&emsp;&emsp;要突破全局复用的限制，必须让数据在更靠近计算单元的地方被多次复用。由于矩阵计算本身就具备局部独立性，可以通过分块局部计算最后再合并。把 C 划分为 \(MC\times NC\) 的块，A 划分为 \(MC\times KC\)，B 划分为 \(KC\times NC\)。对每个 C 块，遍历 K 维的 \(KC\) 块，将对应的 A、B 子块加载到缓存中，再在缓存内完成多次乘加。这样，A 子块的每一行和 B 子块的每一列都能在 L2/L3 中被多个 C 元素复用。
+&emsp;&emsp;要突破全局复用的限制，必须让数据在更靠近计算单元的地方被多次复用。由于矩阵计算本身就具备局部独立性，可以通过分块局部计算最后再合并。把 C 划分为 $MC\times NC$ 的块，A 划分为 $MC\times KC$，B 划分为 $KC\times NC$。对每个 C 块，遍历 K 维的 $KC$ 块，将对应的 A、B 子块加载到缓存中，再在缓存内完成多次乘加。这样，A 子块的每一行和 B 子块的每一列都能在 L2/L3 中被多个 C 元素复用。
 
 ```c
-void gemm_blocked(int M, int N, int K,
-                  const float *A, const float *B, float *C,
-                  int MC, int NC, int KC) {
-    for (int jc = 0; jc < N; jc += NC) {
-        int n = (jc + NC <= N) ? NC : N - jc;
-        for (int pc = 0; pc < K; pc += KC) {
-            int kc = (pc + KC <= K) ? KC : K - pc;
-            for (int ic = 0; ic < M; ic += MC) {
-                int mc = (ic + MC <= M) ? MC : M - ic;
-                for (int i = ic; i < ic + mc; i++) {
-                    for (int p = pc; p < pc + kc; p++) {
-                        float a = A[i*K+p];
-                        const float *Brow = B + p*N + jc;
-                        float *Crow = C + i*N + jc;
-                        for (int j = 0; j < n; j++)
+// 外层分块顺序：ic -> jc -> pc（M 方向最外）
+static void gemm_naive_v3_block(int M, int N, int K,
+                                const float *A, const float *B, float *C,
+                                int MC, int NC, int KC) {
+    for (int ic = 0; ic < M; ic += MC) {
+        const int mc = (ic + MC <= M) ? MC : M - ic;
+        for (int jc = 0; jc < N; jc += NC) {
+            const int n = (jc + NC <= N) ? NC : N - jc;
+            for (int pc = 0; pc < K; pc += KC) {
+                const int kc = (pc + KC <= K) ? KC : K - pc;
+
+                // 内层 ikj：j 连续访问 B 和 C，与 V2 相同
+                for (int i = ic; i < ic + mc; ++i) {
+                    const float *Arow = A + i * K + pc;
+                    float *Crow = C + i * N + jc;
+                    for (int p = 0; p < kc; ++p) {
+                        const float a = Arow[p];
+                        const float *Brow = B + (pc + p) * N + jc;
+                        for (int j = 0; j < n; ++j)
                             Crow[j] += a * Brow[j];
                     }
                 }
@@ -229,19 +245,36 @@ void gemm_blocked(int M, int N, int K,
         }
     }
 }
+
+void gemm_naive_v3(int M, int N, int K, const float *A, const float *B, float *C) {
+    gemm_naive_v3_block(M, N, K, A, B, C, 256, 256, 64);
+}
 ```
 
-&emsp;&emsp;这里的三层分块循环对应着不同的缓存级别：最外层 jc、pc、ic 控制 L3/L2 分块，保证 A、B 面板在 L2/L3 中复用；内层 i、p、j 则是分块内的计算。分块大小需要根据缓存容量选择，例如 \(MC=64\)、\(NC=64\)、\(KC=256\)。分块后，算术强度从仅按 DRAM 计算的 \(n/6\) 提升到按缓存容量计算的水平，性能通常能再提升 2–5 倍。
+&emsp;&emsp;这里的三层分块循环对应着不同的缓存级别：最外层 jc、pc、ic 控制 L3/L2 分块，保证 A、B 面板在 L2/L3 中复用；内层 i、p、j 则是分块内的计算。分块大小需要根据缓存容量选择，例如 $MC=64$、$NC=64$、$KC=256$。分块后，算术强度从仅按 DRAM 计算的 $n/6$ 提升到按缓存容量计算的水平，性能通常能再提升 2–5 倍。
 
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/deepseek_svg_20261001_b59684.svg)
 
-&emsp;&emsp;但分块后的内层循环仍然每次从 A 取一个标量、从 B 取一行，数据加载频率较高。如果把 A、B 的子块预先复制到连续缓冲区中，就能让内层循环以更紧凑的方式读取。
+&emsp;&emsp;但分块后的内层循环仍然每次从 A 取一个标量、从 B 取一行，数据加载频率较高。如果把 A、B 的子块预先复制到连续缓冲区中，就能让内层循环以更紧凑的方式读取——这正是 packing 的作用。理论上 V2 在缓存读写上几乎已经达到最优，V3 把矩阵分块再计算反而让逻辑更复杂了。
 
+&emsp;实际运行也印证了这一点。V3 的 L2 缓存命中率恶化到了约 16%，perf 采集到的数据如下：
 
+```
+ Performance counter stats for './build/bench_gemm --benchmark_filter=BM_sgemm/naive_v3/2048x2048x2048':
+
+    11,213,735,498      cycles
+    11,322,406,868      instructions
+     6,859,088,356      L1-dcache-loads
+       694,658,089      L1-dcache-load-misses
+```
+
+&emsp;L1 miss 率约为 10.1%（694M / 6859M），虽然和 V2 的 10.8% 接近，但 V3 的 L1 load 总数比 V2 多了约 22%（6859M vs 5639M），cycles 也多了约 9%。这说明分块并没有减少访存次数，反而因为三层额外循环的边界判断和地址计算引入了更多指令。**在 V2 已经解决 L1 访存模式的前提下，分块带来的 L2/L3 复用收益不足以抵消这些额外开销，所以 V3 无法超过 V2。**
+
+![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261002_075224.svg)
 
 ### 2.5 打包
 
-&emsp;&emsp;打包是把原本行主序或列主序的子块复制到连续缓冲区中，使得内层循环可以按顺序读取。对 A，把 \(MC\times KC\) 的子块按行打包；对 B，把 \(KC\times NC\) 的子块按列打包成连续面板。这样，内层每次都能取到连续的内存，消除了大步长访问，降低了 TLB 压力，也让硬件预取器能更准确地识别访问模式。
+&emsp;&emsp;打包是把原本行主序或列主序的子块复制到连续缓冲区中，使得内层循环可以按顺序读取。对 A，把 $MC\times KC$ 的子块按行打包；对 B，把 $KC\times NC$ 的子块按列打包成连续面板。这样，内层每次都能取到连续的内存，消除了大步长访问，降低了 TLB 压力，也让硬件预取器能更准确地识别访问模式。
 
 ```c
 void gemm_packed(int M, int N, int K,
@@ -290,7 +323,7 @@ void gemm_packed(int M, int N, int K,
 
 ### 2.6 寄存器分块与微内核
 
-&emsp;&emsp;经过分块和打包，A、B 子块已能以连续方式读取，但内层循环每次仍然只更新 C 的一行，累加器数量不足，FMA 依赖链依然存在。解决办法是取 \(MR\times NR\) 的小块，例如 \(MR=8\)、\(NR=6\)，用 48 个寄存器保存 C 的累加值。微内核沿 K 维循环，每次加载 A 的 \(MR\) 个元素和 B 的 \(NR\) 个元素，执行 \(MR\times NR\) 次 FMA。这 48 个累加器彼此独立，FMA 之间没有依赖链，可以持续填满流水线。
+&emsp;&emsp;经过分块和打包，A、B 子块已能以连续方式读取，但内层循环每次仍然只更新 C 的一行，累加器数量不足，FMA 依赖链依然存在。解决办法是取 $MR\times NR$ 的小块，例如 $MR=8$、$NR=6$，用 48 个寄存器保存 C 的累加值。微内核沿 K 维循环，每次加载 A 的 $MR$ 个元素和 B 的 $NR$ 个元素，执行 $MR\times NR$ 次 FMA。这 48 个累加器彼此独立，FMA 之间没有依赖链，可以持续填满流水线。
 
 ```c
 #define MR 8
