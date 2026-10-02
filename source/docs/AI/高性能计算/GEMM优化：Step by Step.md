@@ -277,49 +277,106 @@ void gemm_naive_v3(int M, int N, int K, const float *A, const float *B, float *C
 &emsp;&emsp;打包是把原本行主序或列主序的子块复制到连续缓冲区中，使得内层循环可以按顺序读取。对 A，把 $MC\times KC$ 的子块按行打包；对 B，把 $KC\times NC$ 的子块按列打包成连续面板。这样，内层每次都能取到连续的内存，消除了大步长访问，降低了 TLB 压力，也让硬件预取器能更准确地识别访问模式。
 
 ```c
-void gemm_packed(int M, int N, int K,
-                 const float *A, const float *B, float *C,
-                 int MC, int NC, int KC) {
-    float *Ap = malloc((size_t)MC*KC*sizeof(float));
-    float *Bp = malloc((size_t)KC*NC*sizeof(float));
+// ---------- 分块 + 打包 ----------
+// 外层分块顺序：jc -> pc -> ic（与 V3 一致）
+// 内层：从 Ap、Bp 中按连续地址读取，ikj 顺序
+static void gemm_naive_v4_block(int M, int N, int K,
+                                const float *A, const float *B, float *C,
+                                int MC, int NC, int KC) {
+    // 打包缓冲区：A 块 MC×KC，B 块 KC×NC
+    float *Ap = (float *)malloc((size_t)MC * KC * sizeof(float));
+    float *Bp = (float *)malloc((size_t)KC * NC * sizeof(float));
+    if (!Ap || !Bp) {
+        free(Ap);
+        free(Bp);
+        return;
+    }
 
     for (int jc = 0; jc < N; jc += NC) {
-        int n = (jc + NC <= N) ? NC : N - jc;
+        const int n = (jc + NC <= N) ? NC : N - jc;
         for (int pc = 0; pc < K; pc += KC) {
-            int kc = (pc + KC <= K) ? KC : K - pc;
+            const int kc = (pc + KC <= K) ? KC : K - pc;
 
-            /* 打包 B 的 KC×NC 子块为连续面板 */
-            for (int p = 0; p < kc; p++)
-                for (int j = 0; j < n; j++)
-                    Bp[p*n + j] = B[(pc+p)*N + jc + j];
+            // ---- 打包 B 的 KC×NC 子块 ----
+            // Bp[p*n + j] = B[(pc+p)*N + jc+j]
+            for (int p = 0; p < kc; ++p) {
+                const float *Brow = B + (pc + p) * N + jc;
+                float *Bprow = Bp + p * n;
+                for (int j = 0; j < n; ++j) {
+                    Bprow[j] = Brow[j]; 
+                }
+            }
 
             for (int ic = 0; ic < M; ic += MC) {
-                int mc = (ic + MC <= M) ? MC : M - ic;
+                const int mc = (ic + MC <= M) ? MC : M - ic;
 
-                /* 打包 A 的 MC×KC 子块为连续面板 */
-                for (int i = 0; i < mc; i++)
-                    for (int p = 0; p < kc; p++)
-                        Ap[i*kc + p] = A[(ic+i)*K + pc + p];
+                // ---- 打包 A 的 MC×KC 子块 ----
+                // Ap[i*kc + p] = A[(ic+i)*K + pc+p]
+                for (int i = 0; i < mc; ++i) {
+                    const float *Arow = A + (ic + i) * K + pc;
+                    float *Aprow = Ap + i * kc;
+                    for (int p = 0; p < kc; ++p) {
+                        Aprow[p] = Arow[p];
+                    }
+                }
 
-                for (int i = 0; i < mc; i++) {
-                    for (int p = 0; p < kc; p++) {
-                        float a = Ap[i*kc + p];
-                        const float *Brow = Bp + p*n;
-                        float *Crow = C + (ic+i)*N + jc;
-                        for (int j = 0; j < n; j++)
+                // ---- 内层计算：从 Ap、Bp 读取 ----
+                for (int i = 0; i < mc; ++i) {
+                    const float *Arow = Ap + i * kc;
+                    float *Crow = C + (ic + i) * N + jc;
+                    for (int p = 0; p < kc; ++p) {
+                        const float a = Arow[p];
+                        const float *Brow = Bp + p * n;
+                        for (int j = 0; j < n; ++j) {
                             Crow[j] += a * Brow[j];
+                        }
                     }
                 }
             }
         }
     }
-    free(Ap); free(Bp);
+
+    free(Ap);
+    free(Bp);
+}
+
+// ---------- V4 入口 ----------
+void gemm_naive_v4(int M, int N, int K, const float *A, const float *B, float *C) {
+    std::fill(C, C + M * N, 0.0f);
+    int MC = 256;
+    int NC = 256;
+    int KC = 256;
+
+    if (MC > M) MC = M;
+    if (NC > N) NC = N;
+    if (KC > K) KC = K;
+
+    gemm_naive_v4_block(M, N, K, A, B, C, MC, NC, KC);
 }
 ```
 
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/deepseek_svg_20261001_5fc5d7.svg)
 
 &emsp;&emsp;打包后，A 和 B 的子块在内存中连续排列，内层循环的加载模式变得非常规则。此时，代码的访存效率已经接近最优，但内层仍然每次只做一个标量与一行的乘加，FMA 的发射效率还有提升空间。
+
+&emsp;&emsp;V3和V4看起来很像但是还是有区别的。V3 和 V4 的区别，用一个比喻来说：V3 像在一个散装仓库里取货，工人每次要拿一个零件，然后走到仓库另一头，从一排跳跃的货架上取一列零件——每取一个就要跨过一大片用不到的货，走的路很长。V4 则是在开工之前，先把要用的 A 子块和 B 子块从散装货架上搬到一块连续的托盘上，之后内层计算只需要在托盘上顺序取货，不用再满仓库跑。搬运本身要花力气，但搬一次能让后续成百上千次取货都变快，这就是打包（packing）的作用。
+
+&emsp;&emsp;从 perf 数据看，V4 的优化点非常具体。V3 的 L1-dcache-loads 是 68.6 亿次，V4 降到 52.4 亿次，少了 23.7%；instructions 从 113.2 亿降到 86.8 亿，少了 23.4%；cycles 从 112.1 亿降到 102.5 亿，少了 8.6%。这三项下降说明 V4 并没有减少真正的计算量——FMA 次数始终是 2048³ ≈ 85.9 亿次——但每条 FMA 周围的地址计算和循环控制指令明显减少了。V3 的内层每次都要重新计算 `B + (pc+p)*N + jc` 这种跨步地址，乘法 `(pc+p)*N` 在循环里反复出现；V4 的地址变成 `Bp + p*n`，基址固定、步长小，编译器更容易做强度削弱，硬件预取器也能识别出连续访问模式。
+
+&emsp;&emsp;有一个反直觉的点值得注意：V4 的 IPC 从 V3 的 1.01 掉到了 0.85，L1 miss 率还从 10.1% 略升到 11.3%。但这不代表 V4 变差了。V4 的 L1 load 总数少了近四分之一，所以绝对 miss 次数反而从 6.95 亿降到 5.91 亿，少了 14.9%。miss 率的分母变小，比率略升是正常的。更重要的是，打包后的连续访问让硬件预取器能提前把下一段数据拉进 L1，即使 miss 率略高，每次 miss 的代价也更低——V3 的跨步访问让预取器无从下手，每次 miss 都是实打实的停顿。IPC 降低也不是性能退化，而是因为省下来的指令主要是地址计算和循环控制这类“辅助指令”，有效 FMA 在总指令中的占比提高了。
+
+```cpp
+ Performance counter stats for './build/bench_gemm --benchmark_filter=BM_sgemm/naive_v4/2048x2048x2048':
+
+    10,245,820,387      cycles                                                                
+     8,676,657,713      instructions                                                          
+     5,236,363,202      L1-dcache-loads                                                       
+       590,886,887      L1-dcache-load-misses 
+```
+
+&emsp;&emsp;最终结果印证了这些微观变化：2048³ 下 V3 的 GFLOPS 只有 22.12、耗时 776.6ms，V4 达到 39.60 GFLOPS、耗时 433.8ms，性能提升约 79%。V3 解决了“数据放在哪一级缓存”的问题，但内层仍在原始矩阵里跨步取数；V4 在此基础上解决了“数据以什么布局被读取”的问题，把子块搬到连续缓冲区，让内层循环的地址计算更简单、访存更连续。代价是打包复制本身的开销，收益是 load 次数和指令数各降约四分之一，最终换来接近翻倍的性能。
+
+![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261002_ec00bf.svg)
 
 ### 2.6 寄存器分块与微内核
 

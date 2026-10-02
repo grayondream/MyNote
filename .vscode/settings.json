@@ -1,0 +1,36 @@
+{
+    "highlight.configuration.colors": [
+        {
+            "light": "#b3d9ff",
+            "dark": "#F5B041"
+        },
+        {
+            "light": "#e6ffb3",
+            "dark": "#FF9933"
+        },
+        {
+            "light": "#b3b3ff",
+            "dark": "#85C1E9"
+        },
+        {
+            "light": "#ffd9b3",
+            "dark": "#CD6155"
+        },
+        {
+            "light": "#ffb3ff",
+            "dark": "#AF7AC5"
+        },
+        {
+            "light": "#b3ffb3",
+            "dark": "#48C9B0"
+        },
+        {
+            "light": "#ffff80",
+            "dark": "#52BE80"
+        },
+        {
+            "light": "#d1e0e0",
+            "dark": "#F4D03F"
+        }
+    ]
+}
