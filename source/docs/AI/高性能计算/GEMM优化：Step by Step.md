@@ -382,111 +382,274 @@ void gemm_naive_v4(int M, int N, int K, const float *A, const float *B, float *C
 
 &emsp;&emsp;经过分块和打包，A、B 子块已能以连续方式读取，但内层循环每次仍然只更新 C 的一行，累加器数量不足，FMA 依赖链依然存在。解决办法是取 $MR\times NR$ 的小块，例如 $MR=8$、$NR=6$，用 48 个寄存器保存 C 的累加值。微内核沿 K 维循环，每次加载 A 的 $MR$ 个元素和 B 的 $NR$ 个元素，执行 $MR\times NR$ 次 FMA。这 48 个累加器彼此独立，FMA 之间没有依赖链，可以持续填满流水线。
 
-```c
-#define MR 8
-#define NR 6
-
-void micro_kernel(int kc, int n,
-                  const float *Ap, const float *Bp,
-                  float *C, int ldc) {
-    for (int i = 0; i < MR; i++) {
-        float c[NR];
-        for (int j = 0; j < NR; j++) c[j] = C[i*ldc + j];
-        for (int p = 0; p < kc; p++) {
-            float a = Ap[i*kc + p];
-            const float *Brow = Bp + p*n;
-            for (int j = 0; j < NR; j++)
-                c[j] += a * Brow[j];
-        }
-        for (int j = 0; j < NR; j++) C[i*ldc + j] = c[j];
+```cpp
+// ---------- 主循环：分块 + 打包 + 微内核 ----------
+static void gemm_micro(int M, int N, int K,
+                       const float *A, const float *B, float *C,
+                       int MC, int NC, int KC) {
+    float *Ap = (float *)malloc((size_t)MC * KC * sizeof(float));
+    float *Bp = (float *)malloc((size_t)KC * NC * sizeof(float));
+    if (!Ap || !Bp) {
+        free(Ap);
+        free(Bp);
+        return;
     }
-}
-```
-
-&emsp;&emsp;调用微内核的主循环如下：
-
-```c
-void gemm_micro(int M, int N, int K,
-                const float *A, const float *B, float *C,
-                int MC, int NC, int KC) {
-    float *Ap = malloc((size_t)MC*KC*sizeof(float));
-    float *Bp = malloc((size_t)KC*NC*sizeof(float));
 
     for (int jc = 0; jc < N; jc += NC) {
-        int n = (jc + NC <= N) ? NC : N - jc;
+        const int n = (jc + NC <= N) ? NC : N - jc;
         for (int pc = 0; pc < K; pc += KC) {
-            int kc = (pc + KC <= K) ? KC : K - pc;
-            for (int p = 0; p < kc; p++)
-                for (int j = 0; j < n; j++)
-                    Bp[p*n + j] = B[(pc+p)*N + jc + j];
+            const int kc = (pc + KC <= K) ? KC : K - pc;
+
+            // ---- 打包 B 的 KC×NC 子块 ----
+            for (int p = 0; p < kc; ++p) {
+                const float *Brow = B + (pc + p) * N + jc;
+                float *Bprow = Bp + p * n;
+                for (int j = 0; j < n; ++j)
+                    Bprow[j] = Brow[j];
+            }
+
             for (int ic = 0; ic < M; ic += MC) {
-                int mc = (ic + MC <= M) ? MC : M - ic;
-                for (int i = 0; i < mc; i++)
-                    for (int p = 0; p < kc; p++)
-                        Ap[i*kc + p] = A[(ic+i)*K + pc + p];
+                const int mc = (ic + MC <= M) ? MC : M - ic;
 
-                for (int ir = 0; ir + MR <= mc; ir += MR)
-                    for (int jr = 0; jr + NR <= n; jr += NR)
+                // ---- 打包 A 的 MC×KC 子块 ----
+                for (int i = 0; i < mc; ++i) {
+                    const float *Arow = A + (ic + i) * K + pc;
+                    float *Aprow = Ap + i * kc;
+                    for (int p = 0; p < kc; ++p)
+                        Aprow[p] = Arow[p];
+                }
+
+                // ---- 微内核主块 ----
+                int ir = 0;
+                for (; ir + MR <= mc; ir += MR) {
+                    int jr = 0;
+                    for (; jr + NR <= n; jr += NR) {
                         micro_kernel(kc, n,
-                                     Ap + ir*kc,
+                                     Ap + ir * kc,
                                      Bp + jr,
-                                     C + (ic+ir)*N + (jc+jr),
+                                     C + (ic + ir) * N + (jc + jr),
                                      N);
+                    }
+                    // NR 方向的边角：用标量处理
+                    for (; jr < n; ++jr) {
+                        float *Ccol = C + (ic + ir) * N + (jc + jr);
+                        for (int ii = 0; ii < MR; ++ii) {
+                            const float *Arow = Ap + (ir + ii) * kc;
+                            float acc = Ccol[ii * N];
+                            for (int p = 0; p < kc; ++p)
+                                acc += Arow[p] * Bp[p * n + jr];
+                            Ccol[ii * N] = acc;
+                        }
+                    }
+                }
 
-                /* 处理 MR 和 NR 的边角 */
-                for (int ir = (mc/MR)*MR; ir < mc; ir++)
-                    for (int p = 0; p < kc; p++) {
-                        float a = Ap[ir*kc + p];
-                        const float *Brow = Bp + p*n;
-                        float *Crow = C + (ic+ir)*N + jc;
-                        for (int j = 0; j < n; j++)
+                // ---- MR 方向的边角：用标量处理 ----
+                for (; ir < mc; ++ir) {
+                    const float *Arow = Ap + ir * kc;
+                    float *Crow = C + (ic + ir) * N + jc;
+                    for (int p = 0; p < kc; ++p) {
+                        const float a = Arow[p];
+                        const float *Brow = Bp + p * n;
+                        for (int j = 0; j < n; ++j)
                             Crow[j] += a * Brow[j];
                     }
+                }
             }
         }
     }
-    free(Ap); free(Bp);
+
+    free(Ap);
+    free(Bp);
 }
+
+// ---------- V5 入口 ----------
+void gemm_naive_v5(int M, int N, int K, const float *A, const float *B, float *C) {
+    std::fill(C, C + M * N, 0.0f);
+
+    // 分块参数：按单核 L1d = 32 KiB、L2 = 512 KiB 估算
+    // A 块 MC×KC×4 + B 块 KC×NC×4 + C 块 MC×NC×4 ≤ L2 × 0.5
+    int MC = 64;
+    int NC = 64;
+    int KC = 32;
+
+    gemm_micro(M, N, K, A, B, C, MC, NC, KC);
+}
+
 ```
 
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/deepseek_svg_20261001_465a90.svg)
 
 &emsp;&emsp;微内核通过 48 个独立累加器填满了 FMA 流水线。若 FMA 延迟为 4 周期、吞吐为 2 条/周期，理论上只需要 8 条独立 FMA，而 48 个累加器提供的并行度远远超过这一要求。此时单核性能已经接近标量峰值，但每个 FMA 仍然只处理一个浮点数。
 
+&emsp;&emsp;在 2048³ 规模下，V5 的 CPU 时间降到 574.7ms，GFLOPS 达到 29.90，在三个规模上全面反超 V2（633.9ms、27.10 GFLOPS）和 V4（690.7ms、24.87 GFLOPS）。V5 比 V2 快约 9.3%，比 V4 快约 17%。这个提升不是靠减少计算量——2048³ 的 FMA 次数始终是 85.9 亿次——而是靠让 CPU 用更少的周期完成同样的工作。V5 的 cycles 是 108.4 亿，V2 约 112 亿，V5 用更少的周期完成了同样的计算。
+
+&emsp;&emsp;最显著的微观指标是 L1 miss 率。V5 的 L1-dcache-loads 是 49.6 亿，L1-dcache-load-misses 是 1.47 亿，miss 率约 **2.96%**。对比 V2 的 10.8%、V3 的 13.5%、V4 的 11.3%，这是一个数量级的改善。原因在于微内核用 `_mm256_loadu_ps` 一次加载 8 个 float，让 B 的缓存行利用率从标量版本的 37.5% 提到接近 100%。每次加载正好覆盖整个缓存行，miss 次数自然断崖式下降。而 V2 虽然通过循环交换解决了 B 的跨列访问问题，但内层仍是标量操作，每个缓存行只用到其中一部分，miss 率停在 10% 以上。这也解释了为什么 V5 能在 cycles 更少的情况下完成同样的计算——它把等待内存的时间转化成了有效的 FMA 发射。
+
+&emsp;&emsp;V5 的 instructions 是 123.6 亿，比 V2 的 103.5 亿多约 19%。多出来的指令主要来自打包（复制 A、B 子块）和微内核的循环控制。但 V5 的 cycles 反而比 V2 少，说明多出来的指令是**高效指令**——它们没有引发额外的停顿，反而让 FMA 单元被喂得更满。IPC 约 1.14，不算高，但比 V3 的 1.01 和 V4 的 0.85 都好，说明 CPU 没有在等内存，也没有在空转。这一点在性能优化里很关键：指令多不等于慢，如果多出来的指令能把流水线填满，反而比指令少但频繁停顿的版本更快。
+
+```cpp
+Performance counter stats for './build/bench_gemm --benchmark_filter=BM_sgemm/naive_v5/2048x2048x2048':
+
+10,844,283,019      cycles                                                                
+12,361,764,878      instructions                                                          
+    4,961,292,893      L1-dcache-loads                                                       
+    147,025,797      L1-dcache-load-misses  
+```
+
+&emsp;&emsp;从优化路径看，V2 到 V5 经历了四步：循环交换解决 L1 访存模式，分块改善 L2/L3 复用，打包把子块搬到连续缓冲区，微内核 + intrinsic 把内层访存向量化。每一步单独看收益有限，但叠加起来，V5 在 2048³ 下比 V2 快约 9%、比 V4 快约 17%。L1 miss 率从 10.8% 压到 2.96% 是这一轮优化的核心成果，也是 V5 最终反超的关键。这组数据说明，当访存模式经过循环交换和打包之后，**下一步的瓶颈不再是“读得少”，而是“读得宽”**——用一条向量指令替代八条标量加载，才是把 miss 率压到 3% 以下、把 GFLOPS 推过 29 的直接原因。
+
+![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261002_59acc3.svg)
+
 ### 2.7 SIMD 向量化
 
 &emsp;&emsp;现代 x86 CPU 支持 AVX2 或 AVX-512，单条 FMA 指令可以作用在 8 个或 16 个单精度浮点数上。把微内核中的 NR 设为 SIMD 宽度的整数倍，用 `_mm256_fmadd_ps` 等内在函数替代标量 FMA，可以让吞吐成倍提升。以下代码使用 AVX2，编译时需加 `-mavx2 -mfma`。
 
 ```c
-#include <immintrin.h>
-
 #define MR 8
 #define NR 8
 
-void micro_kernel_avx2(int kc, int n,
-                       const float *Ap, const float *Bp,
-                       float *C, int ldc) {
+static inline void micro_kernel_avx2(int kc, int n,
+                                     const float * __restrict Ap,
+                                     const float * __restrict Bp,
+                                     float * __restrict C, int ldc) {
+    // 6 个 YMM 累加器，每个存 8 个 float
     __m256 c[MR];
-    for (int i = 0; i < MR; i++)
-        c[i] = _mm256_loadu_ps(C + i*ldc);
+    for (int i = 0; i < MR; ++i)
+        c[i] = _mm256_loadu_ps(C + i * ldc);
 
-    for (int p = 0; p < kc; p++) {
-        const float *Brow = Bp + p*n;
-        __m256 b = _mm256_loadu_ps(Brow);
-        for (int i = 0; i < MR; i++) {
-            __m256 a = _mm256_set1_ps(Ap[i*kc + p]);
-            c[i] = _mm256_fmadd_ps(a, b, c[i]);
+    for (int p = 0; p < kc; ++p) {
+        __m256 b = _mm256_loadu_ps(Bp + p * n);   // 一次加载 8 个 B 元素
+        for (int i = 0; i < MR; ++i) {
+            __m256 a = _mm256_set1_ps(Ap[i * kc + p]);  // 广播 A 的标量
+            c[i] = _mm256_fmadd_ps(a, b, c[i]);          // 向量 FMA
         }
     }
 
-    for (int i = 0; i < MR; i++)
-        _mm256_storeu_ps(C + i*ldc, c[i]);
+    for (int i = 0; i < MR; ++i)
+        _mm256_storeu_ps(C + i * ldc, c[i]);
+}
+
+// ---------- 主循环：分块 + 打包 + AVX2 微内核 ----------
+static void gemm_micro_avx2(int M, int N, int K,
+                            const float *A, const float *B, float *C,
+                            int MC, int NC, int KC) {
+    float *Ap = (float *)aligned_alloc(32, (size_t)MC * KC * sizeof(float));
+    float *Bp = (float *)aligned_alloc(32, (size_t)KC * NC * sizeof(float));
+    if (!Ap || !Bp) {
+        free(Ap);
+        free(Bp);
+        return;
+    }
+
+    for (int jc = 0; jc < N; jc += NC) {
+        const int n = (jc + NC <= N) ? NC : N - jc;
+        for (int pc = 0; pc < K; pc += KC) {
+            const int kc = (pc + KC <= K) ? KC : K - pc;
+
+            // ---- 打包 B 的 KC×NC 子块 ----
+            for (int p = 0; p < kc; ++p) {
+                const float *Brow = B + (pc + p) * N + jc;
+                float *Bprow = Bp + p * n;
+                for (int j = 0; j < n; ++j)
+                    Bprow[j] = Brow[j];
+            }
+
+            for (int ic = 0; ic < M; ic += MC) {
+                const int mc = (ic + MC <= M) ? MC : M - ic;
+
+                // ---- 打包 A 的 MC×KC 子块 ----
+                for (int i = 0; i < mc; ++i) {
+                    const float *Arow = A + (ic + i) * K + pc;
+                    float *Aprow = Ap + i * kc;
+                    for (int p = 0; p < kc; ++p)
+                        Aprow[p] = Arow[p];
+                }
+
+                // ---- AVX2 微内核主块 ----
+                int ir = 0;
+                for (; ir + MR <= mc; ir += MR) {
+                    int jr = 0;
+                    for (; jr + NR <= n; jr += NR) {
+                        micro_kernel_avx2(kc, n,
+                                          Ap + ir * kc,
+                                          Bp + jr,
+                                          C + (ic + ir) * N + (jc + jr),
+                                          N);
+                    }
+                    // NR 方向边角：标量兜底
+                    for (; jr < n; ++jr) {
+                        float *Ccol = C + (ic + ir) * N + (jc + jr);
+                        for (int ii = 0; ii < MR; ++ii) {
+                            const float *Arow = Ap + (ir + ii) * kc;
+                            float acc = Ccol[ii * N];
+                            for (int p = 0; p < kc; ++p)
+                                acc += Arow[p] * Bp[p * n + jr];
+                            Ccol[ii * N] = acc;
+                        }
+                    }
+                }
+
+                // MR 方向边角：标量兜底
+                for (; ir < mc; ++ir) {
+                    const float *Arow = Ap + ir * kc;
+                    float *Crow = C + (ic + ir) * N + jc;
+                    for (int p = 0; p < kc; ++p) {
+                        const float a = Arow[p];
+                        const float *Brow = Bp + p * n;
+                        for (int j = 0; j < n; ++j)
+                            Crow[j] += a * Brow[j];
+                    }
+                }
+            }
+        }
+    }
+
+    free(Ap);
+    free(Bp);
+}
+
+// ---------- V6 入口 ----------
+void gemm_naive_v6(int M, int N, int K, const float *A, const float *B, float *C) {
+    std::fill(C, C + M * N, 0.0f);
+
+    // Zen 3 的 L1d = 32 KiB，L2 = 512 KiB
+    // MR=6, NR=8 下，KC 可以取大一点，减少打包次数
+    int MC = 64;
+    int NC = 64;
+    int KC = 128;
+
+    if (MC > M) MC = M;
+    if (NC > N) NC = N;
+    if (KC > K) KC = K;
+
+    gemm_micro_avx2(M, N, K, A, B, C, MC, NC, KC);
 }
 ```
 
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/deepseek_svg_20261001_b692d2.svg)
 
 &emsp;&emsp;调用 AVX2 微内核的主循环与 2.6 类似，只需把 `micro_kernel` 替换为 `micro_kernel_avx2`，并把 NR 改为 8。AVX2 版本通常能在标量微内核基础上再提升 3–6 倍。至此单核性能已接近峰值，剩下的问题是单个核心的算力有限，需要把工作分摊到多个核心上。
+
+![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261003_30c2ea.svg)
+
+&emsp;&emsp;在 2048³ 规模下，V6 的 CPU 时间降到 285.0ms，GFLOPS 达到 60.28，相比 V5 的 530.5ms、32.39 GFLOPS 快了近一倍，相比 V2 的 513.4ms、33.46 GFLOPS 快了约 80%。这个提升来自微内核的彻底重写：V6 不再依赖编译器自动向量化，而是用 AVX2 intrinsic 显式加载 8 个 float、广播 A 的标量、执行向量 FMA。perf 数据也印证了这一点——L1-dcache-loads 从 V5 的 49.6 亿涨到 83.7 亿，但 L1-dcache-load-misses 从 1.47 亿上升到 4.51 亿的绝对值。从miss率和指令等方面看是劣化了的。
+
+&emsp;&emsp;V6 的性能提升主要来自 **FMA 发射效率**，而不是 L1 miss 率。V6 的 instructions 从 V5 的 123.6 亿涨到 159.6 亿，多了 29%，但 cycles 从 108.4 亿只涨到 112.6 亿，IPC 从 1.14 升到 1.42。这说明 CPU 在执行更多指令的同时，周期数没有同比增加，流水线利用率提高了。
+
+```cpp
+ Performance counter stats for './build/bench_gemm --benchmark_filter=BM_sgemm/naive_v6/2048x2048x2048':
+
+    11,261,600,769      cycles                                                                
+    15,959,752,975      instructions                                                          
+     8,366,425,515      L1-dcache-loads                                                       
+       451,003,500      L1-dcache-load-misses 
+```
+
+&emsp;&emsp;**为什么 L1 miss 率反而升了？** 因为 V6 的 MR=8、NR=8 微内核一次加载 8 个 B 元素（32 字节），但缓存行是 64 字节，只用到一半。V5 的 NR=8 也是加载 8 个 float，但 V5 的微内核可能被编译器优化成了更紧凑的访存模式。V6 的 `_mm256_loadu_ps` 每次加载 32 字节，跨缓存行的概率比 V5 的标量加载更高，所以 miss 率略升。
+
+&emsp;&emsp;从优化路径看，V6 是第一个把 GFLOPS 推过 60 的版本。它的核心改动是：**用 AVX2 intrinsic 替代标量微内核，用 `_mm256_fmadd_ps` 替代逐元素 FMA，用 `_mm256_set1_ps` 替代标量广播**。这些改动让每条指令处理 8 个 float，FMA 吞吐从标量时代的每周期 1~2 条提升到向量时代的每周期 1 条（但每条算 8 个）。在 5600X 的 Zen 3 架构上，256-bit FMA 会被拆成两个 128-bit uop，所以实际吞吐是每周期 4 个 float 的 FMA——这比 V5 的标量版本每周期 1~2 个 float 快了一倍以上，与实测的 1.8 倍提升吻合。
+
+
 
 ### 2.8 多线程与 NUMA
 
@@ -569,7 +732,32 @@ void gemm_mt(int M, int N, int K,
 
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob/imgs/deepseek_svg_20261001_d317e3.svg)
 
+
+&emsp;&emsp;在 2048³ 规模下，V7 的单次端到端耗时是 **66.98ms**，但 CPU 时间只有 **51.77ms**，GFLOPS 达到 **331.84**。这里的 `Time` 和 `CPU` 差异（66.98 vs 51.77）说明多线程带来了额外的调度开销——`real_time` 包含线程启动、同步和等待的墙钟时间，而 `cpu_time` 是各线程实际占用 CPU 的时间总和。在 12 线程下，cpu_time / real_time ≈ 0.77，说明有约 23% 的墙钟时间花在了等待和调度上，这是多线程版本典型的开销。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/cpu_gemm_v7_xxxxxxxxxxxxxxx_bench_result.png)
+
+
+```cpp
+Benchmark                                 Time             CPU   Iterations UserCounters...
+-------------------------------------------------------------------------------------------
+BM_sgemm/naive_v7/2048x2048x2048   66984193 ns     51771392 ns           12 GFLOPS=331.841G/s
+
+ Performance counter stats for './build/bench_gemm --benchmark_filter=BM_sgemm/naive_v7/2048x2048x2048':
+
+    39,405,153,162      cycles                                                                
+    44,106,297,329      instructions                                                          
+    18,020,714,506      L1-dcache-loads                                                       
+     2,574,376,694      L1-dcache-load-misses 
+```
+
+&emsp;&emsp;从吞吐看，V7 的 331.84 GFLOPS 是 V6 单核 63.01 GFLOPS 的 **5.27 倍**。12 核理论上能到 12 倍，但实际只拿到 5.27 倍，原因在 perf 数据里：cycles 是 394.05 亿，instructions 是 441.06 亿，IPC 约 **1.12**，比 V6 单核的 1.42 低。多线程下 IPC 下降是正常的——多个线程共享 L3（32MB）和内存带宽，缓存争用和带宽饱和让每个线程的指令退休效率降低。
+
+&emsp;&emsp;L1-dcache-loads 是 180.2 亿，L1-dcache-misses 是 25.74 亿，miss 率约 **14.3%**。这个数字比 V6 单核的 5.4% 高出不少。原因是 12 个线程同时运行时，每个线程的 `Ap`、`Bp` 缓冲区加起来约 786KB，加上 A、B、C 各 16MB 的共享数据，L1 和 L2 的容量被大量挤占。线程切换时缓存局部性被反复打断，miss 率自然上升。这也解释了为什么 V7 的加速比只有 5.27 倍而不是接近 12 倍——**内存带宽和缓存争用是多线程阶段的主要瓶颈**。
+
 &emsp;&emsp;至此，从朴素实现到多线程 SIMD 微内核的完整路径已经走完。每一步都在解决前一步遗留的瓶颈：循环交换解决 B 的跨步访问，分块解决全局复用，打包解决微内核加载效率，寄存器分块解决 FMA 延迟，SIMD 提升单指令吞吐，多线程突破单核算力限制。硬件峰值和带宽决定了性能上界，而这些优化方法的作用，就是让实际性能不断逼近这一上界。
+
+
 
 ## 3 GEMM GPU优化
 
