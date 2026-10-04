@@ -1171,5 +1171,603 @@ BM_sgemm/naive_v8/2048x2048x2048   29604181 ns     29601578 ns           23 GFLO
 
 &emsp;&emsp;至此，从朴素实现到多线程 SIMD 微内核的完整优化路径已全部走完。每一步都在解决前一步遗留的瓶颈：循环交换解决 B 的跨步访问，分块解决全局复用，打包提升微内核的加载效率，寄存器分块隐藏 FMA 延迟，SIMD 提升单指令吞吐，多线程突破单核算力上限。硬件峰值与带宽决定了性能上界，而这些优化方法的作用，就是让实际性能不断逼近这一上界。
 
+
 ## 3 GEMM 的 GPU 优化
 
+### 3.1 GPU GEMM 的性能模型与优化方法
+
+&emsp;&emsp;上文已经给出了 GEMM 的数学形式，并指出单精度浮点运算量为 $2MNK$,完成了CPU优化GEMM。要进一步优化性能，则需要在 GPU 上执行 GEMM，为了进一步优化GPU性能，仅了解运算量还不够，还需深入理解 GPU 架构与计算模型。与 CPU 不同，GPU 的设计哲学并非“降低单条指令的延迟”，而是“以海量并行隐藏延迟”。因此，CPU 上关于缓存层次、指令级并行的直觉，不能直接照搬到 GPU；需要从存储层次、执行单元及二者配合方式三个维度重新建立性能模型。
+
+&emsp;&emsp;根据**Roofline 模型**，GPU 的全局内存带宽通常远低于其峰值算力，转折点对应的算术强度很高，因此**GPU 上 GEMM 的首要瓶颈往往是全局内存带宽**——若每个线程都直接从全局内存读取矩阵元素，再强的算力也会受制于访存。
+
+&emsp;&emsp;与 CPU 的层次化缓存类似，GPU 同样具有多级存储，但容量与带宽的比例与 CPU 差异显著：
+
+- **全局内存（Global Memory / HBM）**：容量大（数十 GB），但延迟高（数百周期）、带宽相对有限。GPU 上 GEMM 优化的第一要务，是让数据尽可能在片上复用，减少全局访存。
+- **L2 缓存**：由所有 SM 共享，容量小于 CPU 的 L3，但带宽更高，用于缓解全局内存压力。
+- **共享内存（Shared Memory / SMEM）**：每个 SM（流式多处理器）私有的片上存储，容量小（通常几十 KB 到上百 KB），但延迟极低、带宽极高。GEMM 优化的核心手段之一，是将全局内存中的数据分块（tiling）搬入共享内存，使线程在片上反复复用，减少全局访存次数。
+- **寄存器（Register File）**：每个线程私有，速度最快。高性能 GEMM 内核会让每个线程在寄存器中维护一小块累加器（如 8×8），从而在循环体内只执行 FMA，无需访问其他存储层级。
+
+&emsp;&emsp;与 CPU 的行主序/列主序问题类似，GPU 上矩阵的存储布局同样关键，但应对方式不同：GPU 通过**合并访问（coalesced access）**保证效率——当一个 warp（32 个线程）访问全局内存时，若访问地址连续，硬件会将这次访问合并为一次宽事务；若地址分散，则拆分为多次事务，带宽利用率骤降。因此，GPU 上的 GEMM 内核通常要求矩阵按特定布局排列，或在加载时通过共享内存进行转置，以配合合并访问。
+
+&emsp;&emsp;执行单元方面，GPU 的算力来自大量 SM，每个 SM 内部包含：
+
+- **CUDA Core**：执行 FP32/INT32 等常规运算。FMA 指令在 CUDA Core 上执行，延迟同样约为 4 周期，但每个 SM 每周期可发射多条 FMA（具体数量取决于架构，如 Ampere 上每个 SM 每周期可发射 64 条 FP32 FMA）。
+- **Tensor Core**：专为矩阵乘法设计的单元，单条指令即可完成一个小矩阵块（如 16×16×16）的乘加。Tensor Core 的吞吐量远高于 CUDA Core，是现代 GPU 上 GEMM 性能的主要来源。但其使用存在约束：需要特定的数据类型（FP16、BF16、TF32、INT8 等）、特定的数据布局（如 wmma/mma 所要求的 fragment 排布），并且需要软件显式调用。
+- **特殊函数单元（SFU）**：处理超越函数等运算，与 GEMM 关系不大。
+
+&emsp;&emsp;这里同样存在延迟与吞吐的权衡，只是尺度不同：GPU 上一条 Tensor Core MMA 指令的延迟可能达十几至几十周期，但吞吐量很高。要填满流水线，就需要**足够多的独立 warp** 同时驻留在 SM 上，由此引出 GPU 特有的概念：
+
+- **Occupancy（占用率）**：每个 SM 上活跃 warp 数与最大支持 warp 数之比。Occupancy 过低时延迟无法被隐藏，执行单元会空闲；过高时又可能因寄存器或共享内存不足而限制每个线程可用的资源，反而降低单线程效率。
+- **Warp 调度**：当某个 warp 因等待内存或依赖前一条指令而停顿时，调度器立即切换到另一个就绪 warp。GPU 正是依靠这种“以并行度换延迟隐藏”的方式，让海量线程将高延迟的访存与计算重叠起来。
+
+&emsp;&emsp;预取方面，GPU 上的“预取”更多体现为**分块加载**：在计算当前 tile 的同时，将下一个 tile 从全局内存搬入共享内存或寄存器，使访存与计算重叠。过度分块会增加共享内存占用、降低 Occupancy，因此分块大小需要在“复用率”和“Occupancy”之间取平衡。
+
+&emsp;&emsp;矩阵存储顺序在 GPU 上同样直接影响访存模式。以行主序为例，$C[i,j]=\sum_k A[i,k]B[k,j]$。若一个 warp 内的线程按 j 方向连续排列，则对 B 的访问沿 j 连续，可合并；对 A 的访问是广播（所有线程读同一个 $A[i,k]$），也能高效处理。若线程按 k 方向连续排列，则对 B 的访问步长为 N，无法合并，带宽利用率骤降。因此，GPU 上的 GEMM 内核通常让线程沿 N 方向排列，或通过共享内存转置来配合合并访问。
+
+&emsp;&emsp;从实现角度看，GPU GEMM 的高性能实现通常采用分层分块与微内核结构（具体思路和CPU优化类似）：
+1. 将 C 划分为若干 tile，每个线程块（block）负责一个 tile；
+2. 将 A、B 的子块从全局内存搬入共享内存，线程在共享内存上反复复用；
+3. 每个线程在寄存器中维护 $MR\times NR$ 的小累加器，沿 K 维循环执行 FMA；
+4. 使用 `__syncthreads()` 同步共享内存的加载与计算，避免数据竞争；
+5. 通过双缓冲（double buffering）将下一块数据的加载与当前块的计算重叠；
+6. 在支持 Tensor Core 的架构上，用 `wmma` 或 `mma` 指令替代 CUDA Core 的 FMA，将吞吐提升一个数量级；
+7. 调整 block 大小、tile 大小、寄存器用量，使 Occupancy 与复用率达到最佳平衡。
+
+&emsp;&emsp;这些方法最终服务于同一个目标：用分块和共享内存提高片上数据复用率，用多 warp 和 Occupancy 隐藏访存延迟，用 Tensor Core 提升单指令吞吐，并根据矩阵布局选择最合适的访问模式。GPU 的峰值算力和全局内存带宽决定了性能上界，而优化方法的作用，是不断逼近这一上界。
+
+---
+
+### 3.2 朴素实现
+
+&emsp;&emsp;GPU 上 GEMM 的数学形式与 CPU 完全一致：$C[i,j]=\sum_{k=0}^{K-1}A[i,k]B[k,j]$。最直接的 CUDA 实现，是让每个线程负责 C 的一个元素，在全局内存上完成一次内积：
+
+```cpp
+__global__ void sgemm_naive_kernel(int M, int N, int K,
+                                   const float* __restrict__ A,
+                                   const float* __restrict__ B,
+                                   float* __restrict__ C) {
+  // row-major：C[M×N] = A[M×K] · B[K×N]，alpha=1, beta=0
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= M || col >= N) return;
+
+  float acc = 0.f;
+  for (int k = 0; k < K; ++k) acc += A[row * K + k] * B[k * N + col];
+  C[row * N + col] = acc;
+}
+
+void sgemm_cuda_naive_v1(int M, int N, int K, const float* A, const float* B, float* C) {
+  const size_t a_bytes = sizeof(float) * static_cast<size_t>(M) * K;
+  const size_t b_bytes = sizeof(float) * static_cast<size_t>(K) * N;
+  const size_t c_bytes = sizeof(float) * static_cast<size_t>(M) * N;
+
+  float* d_a = nullptr;
+  float* d_b = nullptr;
+  float* d_c = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_a, a_bytes));
+  CUDA_CHECK(cudaMalloc(&d_b, b_bytes));
+  CUDA_CHECK(cudaMalloc(&d_c, c_bytes));
+  CUDA_CHECK(cudaMemcpy(d_a, A, a_bytes, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_b, B, b_bytes, cudaMemcpyHostToDevice));
+
+  dim3 block(32, 32);
+  dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+  sgemm_naive_kernel<<<grid, block>>>(M, N, K, d_a, d_b, d_c);
+  CUDA_CHECK(cudaGetLastError());
+
+  CUDA_CHECK(cudaMemcpy(C, d_c, c_bytes, cudaMemcpyDeviceToHost));
+
+  CUDA_CHECK(cudaFree(d_a));
+  CUDA_CHECK(cudaFree(d_b));
+  CUDA_CHECK(cudaFree(d_c));
+}
+```
+
+&emsp;&emsp;主机端负责分配设备内存、把 A、B 拷贝到显存、启动内核、把 C 拷回主机。block 取 `(32, 32)`，grid 按输出矩阵的维度除以 block 维度向上取整。2048³ 下 `grid = (64, 64)`、`block = (32, 32)`，共 4096 个 block、419 万个线程，每个线程计算 C 的一个元素。
+
+&emsp;&emsp;从合并访问的角度看，这个实现没有明显缺陷。内层 k 循环访问 `B[k * N + col]` 时，同一 warp 内 32 个线程的 `col` 连续，对 B 的访问沿 N 方向连续，硬件会合并为一次宽事务；访问 `A[row * K + k]` 时，同一 warp 内所有线程的 `row` 和 `k` 相同，读的是同一个地址，硬件按广播处理，效率同样很高。所以 naive 实现的访存模式在“合并访问”这一层是合格的。
+
+&emsp;&emsp;真正的问题在于**数据复用为零**。每个线程独立完成一次长度为 K 的内积：A 的第 row 行被同一行的 N 个线程各读一遍，B 的第 col 列被同一列的 M 个线程各读一遍。整个计算过程中，A 被读取 N 次、B 被读取 M 次，总访存量约为 $4MNK + 4MNK + 4MN$ 字节，而浮点运算量只有 $2MNK$。算术强度约为 $2MNK/(8MNK+4MN) \approx 0.25$ FLOP/Byte，远低于 Roofline 转折点。
+
+&emsp;&emsp;以 2048³ 为例，$2MNK \approx 1.72 \times 10^{10}$ FLOP，而访存量约 $8MNK \approx 6.87 \times 10^{10}$ 字节。若按 DRAM 带宽 224 GB/s 估算，理论耗时约 0.31 秒；但实测耗时只有 37.58 毫秒，比这个估算快了一个数量级。这说明**实际访存并未全部落到 DRAM**——L1 和 L2 缓存吸收了大量重复读取。要判断真正的瓶颈，需要看 Nsight Compute 的硬件计数器。
+
+&emsp;&emsp;用 `ncu` 采集 2048³ 内核的 SpeedOfLight 数据，结果如下：
+
+```cpp
+❯ sudo ncu --set roofline -k sgemm_naive_kernel --launch-skip 6 --launch-count 1 \
+        -f -o roofline_naive \
+        ./build/bench_gemm --benchmark_filter=BM_sgemm/cuda_naive_v1/2048x2048x2048 && sudo ncu --import roofline_naive.ncu-rep --section SpeedOfLight
+==PROF== Report: /media/nvme0n1/workspace/gemm_test/roofline_naive.ncu-rep
+[9841] bench_gemm@127.0.0.1
+  gemm::sgemm_naive_kernel(int, int, int, const float *, const float *, float *) (64, 64, 1)x(32, 32, 1), Context 1, Stream 7, Device 0, CC 8.6
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ------------- -------------
+    Metric Name               Metric Unit  Metric Value
+    ----------------------- ------------- -------------
+    DRAM Frequency          cycle/nsecond          6.79
+    SM Frequency            cycle/nsecond          1.55
+    Elapsed Cycles                  cycle    58,341,477
+    Memory Throughput                   %         92.09
+    DRAM Throughput                     %         15.37
+    Duration                      msecond         37.58
+    L1/TEX Cache Throughput             %         92.35
+    L2 Cache Throughput             %         10.60
+    Compute (SM) Throughput             %         92.09
+    SM Active Cycles                cycle 58,179,103.35
+    ----------------------- ------------- -------------
+```
+
+&emsp;&emsp;这组数据揭示了一个与直觉不同的瓶颈分布。`DRAM Throughput` 只有 **15.37%**，说明显存带宽远未饱和；`L2 Cache Throughput` 只有 **10.60%**，L2 也没有成为瓶颈。真正的热点在 **L1/TEX 缓存**：`L1/TEX Cache Throughput` 达 **92.35%**，几乎被打满。`Memory Throughput` 和 `Compute (SM) Throughput` 都是 **92.09%**，看似计算和访存同时受限，但结合 naive 内核没有做任何计算优化的背景，这个“Compute”并非来自 FMA 单元——FMA 单元此时几乎空闲，92% 的忙碌来自 **LSU（加载/存储单元）**，它被大量 `A[row*K+k]` 和 `B[k*N+col]` 的加载指令塞满。
+
+&emsp;&emsp;换句话说，naive 内核的瓶颈是 **L1/TEX 带宽和 LSU 吞吐**，而不是显存带宽。这与 CPU 上的 naive_v1 情况如出一辙：不是数据取不回来，而是数据以低效的方式被反复取用。区别在于 GPU 的 L1 带宽和并行度远高于 CPU，因此绝对性能高出三个数量级，但相对峰值仍然很低。
+
+![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/gpu_gemm_v1_xxxxxxxxxxxxxxxxxxx.png)
+
+&emsp;&emsp;优化方向很明确：**把数据从 L1 搬到更靠近计算单元的地方，在 block 内反复复用**。具体来说，让一个 block 负责 C 的一个 tile，把对应的 A、B 子块搬进**共享内存**，block 内所有线程从共享内存读数据，而不是每次都从 L1 读。共享内存的带宽比 L1 更高，且 bank 可并行访问；同时，每个线程在寄存器中维护多个累加器（如 4×4），减少对 C 的读写次数。这样 A、B 的每个元素只从 L1/全局内存读一次，却在 block 内被复用多次，L1 压力和 LSU 压力都能大幅下降。这正是 3.3 节要讨论的共享内存分块。
+
+### 3.3 共享内存分块
+
+&emsp;&emsp;3.2 节的数据给出了一个与直觉不同的结论：naive 实现的瓶颈不在显存带宽，而在 **L1/TEX 缓存**。`L1/TEX Cache Throughput` 达 92.35%，而 `DRAM Throughput` 只有 15.37%。这说明 A、B 的每个元素虽然被反复读取，但大部分请求被 L1 吸收，真正打到显存的数据量并不大。问题在于 **L1 的访问次数太多**：每个线程独立完成一次长度为 K 的内积，A 的第 row 行被同一行的 N 个线程各读一遍，B 的第 col 列被同一列的 M 个线程各读一遍，数据复用为零。
+
+&emsp;&emsp;要减少 L1 访问，就需要让数据在更靠近计算单元的地方被复用。GPU 上最直接的复用载体是**共享内存（Shared Memory / SMEM）**：每个 SM 私有的片上存储，延迟低、带宽高，且同一 block 内的所有线程都能访问。共享内存分块的思路是：把输出矩阵 C 划分为若干 `TILE × TILE` 的小块，每个线程块负责一个 C 的 tile；沿 K 方向按 `TILE` 步长切分，每次把一个 `TILE × TILE` 的 A 子块和一个 `TILE × TILE` 的 B 子块从全局内存搬进共享内存，block 内所有线程在共享内存上完成这一段的乘加，再推进到下一个 K 切片。这样，A、B 的每个元素在 block 内被复用 `TILE` 次，L1 的访问次数大幅下降。
+
+&emsp;&emsp;实现的关键有三点：共享内存的声明、加载时的边界处理、同步与计算。完整代码如下：
+
+```cpp
+// ---------- 共享内存分块 GEMM：v2 ----------
+#define TILE 32
+
+__global__ void sgemm_shared_kernel_v2(int M, int N, int K,
+                                       const float* __restrict__ A,
+                                       const float* __restrict__ B,
+                                       float* __restrict__ C) {
+    __shared__ float A_s[TILE][TILE];
+    __shared__ float B_s[TILE][TILE];
+
+    const int row_base = blockIdx.y * TILE;
+    const int col_base = blockIdx.x * TILE;
+    const int ty = threadIdx.y;
+    const int tx = threadIdx.x;
+    const int row = row_base + ty;
+    const int col = col_base + tx;
+
+    float acc = 0.0f;
+
+    for (int k_base = 0; k_base < K; k_base += TILE) {
+        // ---- 加载 A 子块到共享内存 ----
+        const int a_row = row_base + ty;
+        const int a_col = k_base + tx;
+        if (a_row < M && a_col < K)
+            A_s[ty][tx] = A[a_row * K + a_col];
+        else
+            A_s[ty][tx] = 0.0f;
+
+        // ---- 加载 B 子块到共享内存 ----
+        const int b_row = k_base + ty;
+        const int b_col = col_base + tx;
+        if (b_row < K && b_col < N)
+            B_s[ty][tx] = B[b_row * N + b_col];
+        else
+            B_s[ty][tx] = 0.0f;
+
+        __syncthreads();
+
+        // ---- 在共享内存上完成 TILE 长度的内积 ----
+        for (int k = 0; k < TILE; ++k)
+            acc += A_s[ty][k] * B_s[k][tx];
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N)
+        C[row * N + col] = acc;
+}
+
+void sgemm_cuda_shared_v2(int M, int N, int K,
+                          const float* A, const float* B, float* C) {
+    const size_t a_bytes = sizeof(float) * static_cast<size_t>(M) * K;
+    const size_t b_bytes = sizeof(float) * static_cast<size_t>(K) * N;
+    const size_t c_bytes = sizeof(float) * static_cast<size_t>(M) * N;
+
+    float* d_a = nullptr;
+    float* d_b = nullptr;
+    float* d_c = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_a, a_bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, b_bytes));
+    CUDA_CHECK(cudaMalloc(&d_c, c_bytes));
+    CUDA_CHECK(cudaMemcpy(d_a, A, a_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, B, b_bytes, cudaMemcpyHostToDevice));
+
+    dim3 block(TILE, TILE);
+    dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+    sgemm_shared_kernel_v2<<<grid, block>>>(M, N, K, d_a, d_b, d_c);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaMemcpy(C, d_c, c_bytes, cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_c));
+}
+```
+
+&emsp;&emsp;相比 naive 版本，这段代码有三处关键改动。
+- **第一，共享内存声明**：`A_s` 和 `B_s` 各是一个 `TILE × TILE` 的 `float` 数组，共 `2 × 32 × 32 × 4 = 8 KB`，RTX 3050 每个 SM 有 100 KB 共享内存，8 KB 的占用不会限制 Occupancy。**
+- **第二，加载时的边界处理**：当 `M`、`N`、`K` 不是 `TILE` 的整数倍时，越界的元素填 0。填 0 而不是跳过，是为了让后面的乘加仍然执行，不引入额外的分支；由于 `0 * x = 0`，填 0 不会影响最终结果。
+- **第三，两次 `__syncthreads()`**：第一次在加载完成后，确保共享内存里的数据对 block 内所有线程可见；第二次在计算完成后，确保没有线程在下一轮加载时覆盖别人还在读的数据。缺少任何一次同步，都会导致读写竞争或读到旧数据。
+
+&emsp;&emsp;共享内存分块的性能提升来自**数据复用**。naive 版本中，A 的每个元素被同一行的 N 个线程各读一遍；分块后，A 的每个元素被 block 内 `TILE` 个线程复用，L1 访问次数降到原来的 `1/TILE`。2048³ 下 `TILE = 32`，L1 的 A 访问量理论上降到 1/32。
+
+&emsp;&emsp;实测结果如下：
+
+```cpp
+BM_sgemm/cuda_naive_v2/2048x2048x2048  100602078 ns    GFLOPS=182.12
+
+Performance counter stats (ncu --set roofline):
+    Elapsed Cycles                  cycle    46,313,231
+    Duration                      msecond         29.84
+    Memory Throughput                   %         79.80
+    DRAM Throughput                     %         19.08
+    L1/TEX Cache Throughput             %         79.94
+    L2 Cache Throughput                 %         13.32
+    Compute (SM) Throughput             %         79.80
+    SM Active Cycles                cycle    46,218,668
+```
+
+&emsp;&emsp;这组数据与 3.2 节的 naive 实现对比，可以清楚看到共享内存分块的作用：
+
+| 指标 | `_v1`（naive） | `_v2`（共享内存分块） | 变化 |
+|------|---------------|---------------------|------|
+| GFLOPS | 160.22 | **182.12** | 升 13.7% |
+| Duration | 37.58 ms | **29.84 ms** | 降 20.6% |
+| Elapsed Cycles | 58,341,477 | **46,313,231** | 降 20.6% |
+| L1/TEX Cache Throughput | 92.35% | **79.94%** | 降 12.4 个百分点 |
+| DRAM Throughput | 15.37% | 19.08% | 略升 |
+| L2 Cache Throughput | 10.60% | 13.32% | 略升 |
+| Compute (SM) Throughput | 92.09% | **79.80%** | 降 12.3 个百分点 |
+
+&emsp;&emsp;三个关键指标的下降说明共享内存分块确实缓解了 L1 的压力：`L1/TEX Cache Throughput` 从 92.35% 降到 79.94%，`Compute (SM) Throughput` 从 92.09% 降到 79.80%，`Elapsed Cycles` 降了 20.6%。`DRAM Throughput` 从 15.37% 升到 19.08%，说明共享内存分块后，从全局内存加载 A、B 子块的行为更集中，但显存带宽仍然远未饱和。
+
+&emsp;&emsp;不过，性能提升只有 13.7%，远低于理论预期的 `1/TILE` 级别。原因在于两个尚未解决的瓶颈。
+
+&emsp;&emsp;**第一，共享内存的 bank conflict。** 当前写法里 `A_s[ty][k]` 的访问模式中，同一个 warp 内 32 个线程的 `ty` 从 0 到 31、`k` 相同，访问的是 `A_s[0..31][k]` 这一列，步长为 `TILE = 32` 个 float。32 是 32 的倍数，所有线程访问的地址都落在同一个 bank 上，产生 **32 路 bank conflict**。这使共享内存的实际带宽降到理论值的 1/32。修法是把共享内存的列数从 `TILE` 增加到 `TILE + 1`，即 `A_s[TILE][TILE + 1]`。这样列的步长变成 33，和 32 互质，不同 `ty` 的线程访问的 bank 分散开。这是 CUDA 编程中常见的 **padding 技巧**，改动只有一行，但能显著减少 bank conflict。
+
+&emsp;&emsp;**第二，每个线程仍然只计算一个 C 元素。** 共享内存分块减少了 A、B 的 L1 访问，但每个线程对 C 的写回仍然是 1 次，对 A_s、B_s 的读取仍然是一次完整的 `TILE` 长度内积。要进一步提高 FMA 效率，需要让每个线程在寄存器中维护多个累加器，一次计算 `MR × NR` 个 C 元素。这不仅能减少对共享内存的读取次数，还能提高 FMA 的发射效率，同时让 A_s、B_s 的元素被更多次复用。这正是 3.4 节要讨论的**寄存器分块**。
+
+&emsp;&emsp;从性能模型看，共享内存分块把算术强度从 naive 版本的 0.25 FLOP/Byte 提升到约 `TILE/2` 的水平。`TILE = 32` 时算术强度约 16 FLOP/Byte，已经越过 Roofline 转折点，性能从“带宽受限”转向“计算受限”。这正是共享内存分块的意义：**不是让数据取回来，而是让数据取回来之后被用得更充分**。接下来的寄存器分块会把“用得更充分”推到极致——让每个从共享内存读出的数据，在寄存器中被复用 `MR` 或 `NR` 次，把 L1 和共享内存的访问都降到最低。
+
+### 3.4 寄存器分块与线程级并行
+
+&emsp;&emsp;3.3 节的共享内存分块把 A、B 的 L1 访问降到原来的 `1/TILE`，但每个线程仍然只计算 C 的一个元素。`A_s[ty][k]` 和 `B_s[k][tx]` 的每次读取只服务一次 FMA，共享内存的读取次数与 FMA 次数之比仍然是 2:1。要进一步提高计算访存比，需要让每个线程一次计算 `MR × NR` 个 C 元素，在寄存器中维护多个累加器，使每个从共享内存读出的数据在寄存器中被复用多次。
+
+&emsp;&emsp;具体做法是：把 block 的 `TILE × TILE` 输出块进一步划分为 `(TILE/MR) × (TILE/NR)` 个线程，每个线程负责一个 `MR × NR` 的小块。沿 K 方向循环时，每个线程从 `A_s` 读取 `MR` 个元素、从 `B_s` 读取 `NR` 个元素，执行 `MR × NR` 次 FMA。这样，`A_s` 的每个元素被复用 `NR` 次，`B_s` 的每个元素被复用 `MR` 次，共享内存的读取次数降到 `1/MR + 1/NR`。同时，`MR × NR` 个累加器彼此独立，FMA 之间没有依赖链，可以填满流水线。
+
+&emsp;&emsp;下面给出 `MR = 4`、`NR = 4` 的版本。block 取 `TILE × TILE = 32 × 32`，每个 block 有 `(32/4) × (32/4) = 8 × 8 = 64` 个线程，每个线程计算 `4 × 4` 个 C 元素。宏名统一加 `SG_` 前缀，避免和前面版本的 `TILE`、`MR`、`NR` 冲突。
+
+```cpp
+#define SG_TILE 32
+#define SG_MR 4
+#define SG_NR 4
+
+__global__ void sgemm_register_kernel_v3(int M, int N, int K,
+                                         const float* __restrict__ A,
+                                         const float* __restrict__ B,
+                                         float* __restrict__ C) {
+    __shared__ float A_s[SG_TILE][SG_TILE];
+    __shared__ float B_s[SG_TILE][SG_TILE];
+
+    const int row_base = blockIdx.y * SG_TILE;
+    const int col_base = blockIdx.x * SG_TILE;
+
+    const int ty = threadIdx.y;
+    const int tx = threadIdx.x;
+
+    // 当前线程负责的 MR x NR 小块左上角
+    const int row = row_base + ty * SG_MR;
+    const int col = col_base + tx * SG_NR;
+
+    // 每个线程维护 MR x NR 个累加器
+    float acc[SG_MR][SG_NR];
+    for (int i = 0; i < SG_MR; ++i)
+        for (int j = 0; j < SG_NR; ++j)
+            acc[i][j] = 0.0f;
+
+    // 加载时，32x32 的 tile 共 1024 个元素，8x8=64 个线程各负责
+    // 4x4=16 个（行按 blockDim.y 步进、列按 blockDim.x 步进），恰好铺满。
+    for (int k_base = 0; k_base < K; k_base += SG_TILE) {
+        // ---- 加载 A 子块：A_s[i][j]，i 覆盖 32 行、j 覆盖 32 列 ----
+        for (int i = ty; i < SG_TILE; i += blockDim.y) {
+            const int a_row = row_base + i;
+            for (int j = tx; j < SG_TILE; j += blockDim.x) {
+                const int a_col = k_base + j;
+                if (a_row < M && a_col < K)
+                    A_s[i][j] = A[a_row * K + a_col];
+                else
+                    A_s[i][j] = 0.0f;
+            }
+        }
+
+        // ---- 加载 B 子块：B_s[i][j]，i 覆盖 32 行（k 维）、j 覆盖 32 列 ----
+        for (int j = tx; j < SG_TILE; j += blockDim.x) {
+            const int b_col = col_base + j;
+            for (int i = ty; i < SG_TILE; i += blockDim.y) {
+                const int b_row = k_base + i;
+                if (b_row < K && b_col < N)
+                    B_s[i][j] = B[b_row * N + b_col];
+                else
+                    B_s[i][j] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        // ---- 在共享内存上完成 TILE 长度的乘加 ----
+        for (int k = 0; k < SG_TILE; ++k) {
+            float a_frag[SG_MR];
+            float b_frag[SG_NR];
+            for (int i = 0; i < SG_MR; ++i)
+                a_frag[i] = A_s[ty * SG_MR + i][k];
+            for (int j = 0; j < SG_NR; ++j)
+                b_frag[j] = B_s[k][tx * SG_NR + j];
+
+            for (int i = 0; i < SG_MR; ++i)
+                for (int j = 0; j < SG_NR; ++j)
+                    acc[i][j] += a_frag[i] * b_frag[j];
+        }
+
+        __syncthreads();
+    }
+
+    // ---- 写回 C ----
+    for (int i = 0; i < SG_MR; ++i) {
+        for (int j = 0; j < SG_NR; ++j) {
+            const int r = row + i;
+            const int c = col + j;
+            if (r < M && c < N)
+                C[r * N + c] = acc[i][j];
+        }
+    }
+}
+
+void sgemm_cuda_register_v3(int M, int N, int K,
+                            const float* A, const float* B, float* C) {
+    const size_t a_bytes = sizeof(float) * static_cast<size_t>(M) * K;
+    const size_t b_bytes = sizeof(float) * static_cast<size_t>(K) * N;
+    const size_t c_bytes = sizeof(float) * static_cast<size_t>(M) * N;
+
+    float* d_a = nullptr;
+    float* d_b = nullptr;
+    float* d_c = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_a, a_bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, b_bytes));
+    CUDA_CHECK(cudaMalloc(&d_c, c_bytes));
+    CUDA_CHECK(cudaMemcpy(d_a, A, a_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, B, b_bytes, cudaMemcpyHostToDevice));
+
+    // block 取 (TILE/MR) x (TILE/NR)，每个线程负责 MR x NR 个 C 元素
+    dim3 block(SG_TILE / SG_NR, SG_TILE / SG_MR);
+    dim3 grid((N + SG_TILE - 1) / SG_TILE, (M + SG_TILE - 1) / SG_TILE);
+    sgemm_register_kernel_v3<<<grid, block>>>(M, N, K, d_a, d_b, d_c);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaMemcpy(C, d_c, c_bytes, cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_c));
+}
+
+static Registrar reg_cuda_register_v3("cuda_naive_v3", &sgemm_cuda_register_v3);
+
+```
+
+&emsp;&emsp;相比 3.3 节的共享内存版本，这段代码有四处关键改动。
+- **第一，block 从 `(32, 32)` 变成 `(8, 8)`**：`TILE = 32`、`MR = NR = 4` 时，每个线程负责 `4 × 4` 的 C 小块，block 内需要的线程数是 `(32/4) × (32/4) = 8 × 8 = 64`。线程数从 1024 降到 64，但每个线程的计算量从 1 个 FMA 链变成 16 条 FMA 链，指令级并行度大幅提升。
+- **第二，加载循环用双重跨步**：因为 block 只有 64 个线程，而 `A_s`、`B_s` 各有 1024 个元素，每个线程需要加载 16 个元素。用 `for (i = ty; i < 32; i += 8)` 外层跨行、`for (j = tx; j < 32; j += 8)` 内层跨列，正好覆盖 32×32 全部位置。
+- **第三，内层循环引入 `a_frag` 和 `b_frag`**：每个 k 步，先从 `A_s` 读 `MR` 个元素到 `a_frag`，从 `B_s` 读 `NR` 个元素到 `b_frag`，再做 `MR × NR` 次 FMA。这两个局部数组会被编译器放入寄存器，使每个从共享内存读出的数据在寄存器中被复用 `MR` 或 `NR` 次。
+- **第四，累加器用二维数组 `acc[MR][NR]`**：16 个累加器彼此独立，FMA 之间没有依赖链，可以填满流水线。
+
+&emsp;&emsp;实测结果如下：
+
+```cpp
+BM_sgemm/cuda_naive_v3/2048x2048x2048   75339098 ns    GFLOPS=248.51
+
+Performance counter stats (ncu --set roofline):
+    Elapsed Cycles                  cycle    26,120,020
+    Duration                      msecond         16.89
+    Memory Throughput                   %         52.24
+    DRAM Throughput                     %         10.84
+    L1/TEX Cache Throughput             %         52.27
+    L2 Cache Throughput                 %         15.65
+    Compute (SM) Throughput             %         28.49
+    SM Active Cycles                cycle    26,106,796
+```
+
+&emsp;&emsp;这组数据与 3.3 节的共享内存版本对比，可以看到寄存器分块的作用：
+
+| 指标 | `_v2`（共享内存分块） | `_v3`（寄存器分块） | 变化 |
+|------|---------------------|-------------------|------|
+| GFLOPS | 182.12 | **248.51** | 升 36.4% |
+| Duration | 29.84 ms | **16.89 ms** | 降 43.4% |
+| Elapsed Cycles | 46,313,231 | **26,120,020** | 降 43.6% |
+| L1/TEX Cache Throughput | 79.94% | **52.27%** | 降 27.7 个百分点 |
+| DRAM Throughput | 19.08% | 10.84% | 降 8.2 个百分点 |
+| L2 Cache Throughput | 13.32% | 15.65% | 略升 |
+| Compute (SM) Throughput | 79.80% | **28.49%** | 降 51.3 个百分点 |
+
+&emsp;&emsp;三个关键指标的下降说明寄存器分块确实把访存压力大幅降下来了。`L1/TEX Cache Throughput` 从 79.94% 降到 **52.27%**，因为 `A_s`、`B_s` 的每个元素被复用 `MR` 或 `NR` 次，共享内存的读取次数降到 `1/MR + 1/NR = 1/4 + 1/4 = 1/2`。`Compute (SM) Throughput` 从 79.80% 降到 **28.49%**，说明 LSU 不再是瓶颈——之前 92% 的“Compute”主要来自 LSU 忙碌，现在 LSU 压力小了，SM 有更多资源给 FMA。`Elapsed Cycles` 从 4631 万降到 **2612 万**，降幅 43.6%。
+
+![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/gpu_gemm_v3_xxxxxxxxxxxxxxxxxxx.png)
+
+&emsp;&emsp;但有一个数字值得注意：**`Compute (SM) Throughput` 只有 28.49%，说明 FMA 单元远未饱和**。按 Roofline 模型，此时计算单元利用率只有 28%，理论上还有 3.5 倍提升空间。瓶颈从 L1/LSU 转移到了别处。可能的原因有三个：**第一，共享内存的 bank conflict**：`A_s[ty*MR+i][k]` 的访问中，同一 warp 内 32 个线程的 `ty` 从 0 到 7、`tx` 从 0 到 3，访问的是 `A_s[0..31][k]` 这一列，步长 32 个 float，产生 bank conflict。修法是把 `A_s`、`B_s` 的列数从 `SG_TILE` 增加到 `SG_TILE + 1`。**第二，Occupancy 不足**：block 只有 64 个线程，RTX 3050 每个 SM 最多支持 1536 个线程，理论上可以同时驻留 24 个 block。但如果寄存器用量或共享内存用量过高，实际驻留的 block 数会减少，延迟隐藏不充分。**第三，FMA 发射效率**：`acc[i][j] += a_frag[i] * b_frag[j]` 这个双重循环，编译器是否真的把它编译成了 `MR × NR` 条独立的 FMA，还是插入了额外的 load/store？需要看 SASS 才能确认。
+
+&emsp;&emsp;目前的版本还没有达到最优，需要继续调参优化。
+- **第一，加 padding 消除 bank conflict**
+- **第二，增大 `MR`、`NR`**
+
+---
+
+```cpp
+// ---------- 寄存器分块 + 共享内存调参：v4 ----------
+// 相对 v3 的两处改动（其余结构不变）：
+// 1) 共享内存加 padding：[TILE][TILE+1]，同列相邻行的元素错开 1 个 bank，
+//    消除 A_s[ty*MR+i][k] / B_s[k][tx*NR+j] 的列广播式 bank conflict
+// 2) TILE 32 -> 64、block 8x8 -> 16x16（MR/NR 保持 4）：每 block 算 64x64，
+//    数据复用翻倍，全局访存量减半
+#define SG_TILE 64
+#define SG_MR 4
+#define SG_NR 4
+#define SG_PAD 1
+
+__global__ void sgemm_tiled_kernel_v4(int M, int N, int K,
+                                      const float* __restrict__ A,
+                                      const float* __restrict__ B,
+                                      float* __restrict__ C) {
+    // +SG_PAD 消 bank conflict
+    __shared__ float A_s[SG_TILE][SG_TILE + SG_PAD];
+    __shared__ float B_s[SG_TILE][SG_TILE + SG_PAD];
+
+    const int row_base = blockIdx.y * SG_TILE;
+    const int col_base = blockIdx.x * SG_TILE;
+
+    const int ty = threadIdx.y;
+    const int tx = threadIdx.x;
+
+    // 当前线程负责的 MR x NR 小块左上角
+    const int row = row_base + ty * SG_MR;
+    const int col = col_base + tx * SG_NR;
+
+    // 每个线程维护 MR x NR 个累加器
+    float acc[SG_MR][SG_NR];
+    for (int i = 0; i < SG_MR; ++i)
+        for (int j = 0; j < SG_NR; ++j)
+            acc[i][j] = 0.0f;
+
+    // 32x32 -> 64x64 tile：TILE*TILE/(blockDim.x*blockDim.y) = 16 个元素/线程
+    // 加载循环按 blockDim 双向步进，自动适配 block 尺寸
+    for (int k_base = 0; k_base < K; k_base += SG_TILE) {
+        // ---- 加载 A 子块：A_s[i][j]，i 覆盖 TILE 行、j 覆盖 TILE 列 ----
+        for (int i = ty; i < SG_TILE; i += blockDim.y) {
+            const int a_row = row_base + i;
+            for (int j = tx; j < SG_TILE; j += blockDim.x) {
+                const int a_col = k_base + j;
+                if (a_row < M && a_col < K)
+                    A_s[i][j] = A[a_row * K + a_col];
+                else
+                    A_s[i][j] = 0.0f;
+            }
+        }
+
+        // ---- 加载 B 子块：B_s[i][j]，i 覆盖 TILE 行（k 维）、j 覆盖 TILE 列 ----
+        for (int j = tx; j < SG_TILE; j += blockDim.x) {
+            const int b_col = col_base + j;
+            for (int i = ty; i < SG_TILE; i += blockDim.y) {
+                const int b_row = k_base + i;
+                if (b_row < K && b_col < N)
+                    B_s[i][j] = B[b_row * N + b_col];
+                else
+                    B_s[i][j] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        // ---- 在共享内存上完成 TILE 长度的乘加 ----
+        for (int k = 0; k < SG_TILE; ++k) {
+            float a_frag[SG_MR];
+            float b_frag[SG_NR];
+            for (int i = 0; i < SG_MR; ++i)
+                a_frag[i] = A_s[ty * SG_MR + i][k];
+            for (int j = 0; j < SG_NR; ++j)
+                b_frag[j] = B_s[k][tx * SG_NR + j];
+
+            for (int i = 0; i < SG_MR; ++i)
+                for (int j = 0; j < SG_NR; ++j)
+                    acc[i][j] += a_frag[i] * b_frag[j];
+        }
+
+        __syncthreads();
+    }
+
+    // ---- 写回 C ----
+    for (int i = 0; i < SG_MR; ++i) {
+        for (int j = 0; j < SG_NR; ++j) {
+            const int r = row + i;
+            const int c = col + j;
+            if (r < M && c < N)
+                C[r * N + c] = acc[i][j];
+        }
+    }
+}
+
+void sgemm_cuda_tiled_v4(int M, int N, int K,
+                         const float* A, const float* B, float* C) {
+    const size_t a_bytes = sizeof(float) * static_cast<size_t>(M) * K;
+    const size_t b_bytes = sizeof(float) * static_cast<size_t>(K) * N;
+    const size_t c_bytes = sizeof(float) * static_cast<size_t>(M) * N;
+
+    float* d_a = nullptr;
+    float* d_b = nullptr;
+    float* d_c = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_a, a_bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, b_bytes));
+    CUDA_CHECK(cudaMalloc(&d_c, c_bytes));
+    CUDA_CHECK(cudaMemcpy(d_a, A, a_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, B, b_bytes, cudaMemcpyHostToDevice));
+
+    // block 取 (TILE/MR) x (TILE/NR) = 16x16，每个线程负责 MR x NR 个 C 元素
+    dim3 block(SG_TILE / SG_NR, SG_TILE / SG_MR);
+    dim3 grid((N + SG_TILE - 1) / SG_TILE, (M + SG_TILE - 1) / SG_TILE);
+    sgemm_tiled_kernel_v4<<<grid, block>>>(M, N, K, d_a, d_b, d_c);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaMemcpy(C, d_c, c_bytes, cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_c));
+}
+
+```
+
+&emsp;&emsp;当前 v4 在 2048³ 下达到 **995.7 GFLOPS**，相比 v3 的 843.0 GFLOPS 提升 18.1%，相比 v2 的 567.0 GFLOPS 提升 75.6%，相比 v1 的 468.8 GFLOPS 提升 112.4%。v4 的核心改动有两处：一是**共享内存加 padding**，把 `A_s`、`B_s` 的列数从 `SG_TILE` 改成 `SG_TILE + 1`，使同一列相邻行的元素错开一个 bank，消除了 v3 中 `A_s[ty*MR+i][k]` 和 `B_s[k][tx*NR+j]` 的列广播式 bank conflict；二是**把 TILE 从 32 提到 64、block 从 8×8 提到 16×16**，每个 block 计算 64×64 的输出块，数据复用翻倍，全局访存量减半。ncu 数据印证了这两项改动的效果：`L1/TEX Cache Throughput` 从 v3 的 52.27% 降到 **41.85%**，`DRAM Throughput` 从 10.84% 升到 **17.54%**，`Elapsed Cycles` 从 2612 万降到 **2074 万**，`Duration` 从 16.89ms 降到 **13.43ms**。不过 `Compute (SM) Throughput` 只有 **33.45%**，FMA 单元仍远未饱和，说明瓶颈已经不在访存，而在共享内存到寄存器这一段还有优化空间。
+
+![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/gpu_gemm_v4_xxxxxxxxxxxxxxxxxxx.png)
+
+```cpp
+    ----------------------- ------------- -------------
+    Metric Name               Metric Unit  Metric Value
+    ----------------------- ------------- -------------
+    DRAM Frequency          cycle/nsecond          6.79
+    SM Frequency            cycle/nsecond          1.54
+    Elapsed Cycles                  cycle    20,744,917
+    Memory Throughput                   %         41.77
+    DRAM Throughput                     %         17.54
+    Duration                      msecond         13.43
+    L1/TEX Cache Throughput             %         41.85
+    L2 Cache Throughput                 %         13.63
+    SM Active Cycles                cycle 20,699,892.60
+    Compute (SM) Throughput             %         33.45
+    ----------------------- ------------- -------------
+```
+
+---
+
+
+### 3.5 双缓冲与访存计算重叠
+
+&emsp;&emsp;（内容方向：用双缓冲将下一块数据的加载与当前块的计算重叠，隐藏全局内存延迟。给出基准测试结果。）
+
+### 3.6 Tensor Core 与 WMMA
+
+&emsp;&emsp;（内容方向：用 `wmma` 或 `mma` 指令替代 CUDA Core 的 FMA。展示 FP16/BF16/TF32 的吞吐差异、fragment 布局要求、精度问题。给出基准测试结果，对比 CUDA Core 版本的提升。）
+
+### 3.7 多流与异步拷贝
+
+&emsp;&emsp;（内容方向：用 CUDA Stream 将多个 GEMM 任务重叠，或用 `cp.async` 实现全局内存到共享内存的异步拷贝。给出基准测试结果。）
+
+### 3.8 性能对比与总结
+
+&emsp;&emsp;（内容方向：汇总 GPU 各版本的 GFLOPS、耗时、带宽利用率、Occupancy，对比 cuBLAS。给出 Roofline 图，说明各版本在 Roofline 上的位置和瓶颈。总结从朴素实现到 Tensor Core 的完整优化路径。）
+
+---
