@@ -1176,7 +1176,7 @@ BM_sgemm/naive_v8/2048x2048x2048   29604181 ns     29601578 ns           23 GFLO
 
 ### 3.1 GPU GEMM 的性能模型与优化方法
 
-&emsp;&emsp;上文已经给出了 GEMM 的数学形式，并指出单精度浮点运算量为 $2MNK$,完成了CPU优化GEMM。要进一步优化性能，则需要在 GPU 上执行 GEMM，为了进一步优化GPU性能，仅了解运算量还不够，还需深入理解 GPU 架构与计算模型。与 CPU 不同，GPU 的设计哲学并非“降低单条指令的延迟”，而是“以海量并行隐藏延迟”。因此，CPU 上关于缓存层次、指令级并行的直觉，不能直接照搬到 GPU；需要从存储层次、执行单元及二者配合方式三个维度重新建立性能模型。
+&emsp;&emsp;上文已经给出了 GEMM 的数学形式，指出单精度浮点运算量为 $2MNK$，并完成了 CPU 侧的优化。要进一步优化 GPU 上的 GEMM，仅了解运算量还不够，还需深入理解 GPU 架构与计算模型。与 CPU 不同，GPU 的设计哲学并非“降低单条指令的延迟”，而是“以海量并行隐藏延迟”。因此，CPU 上关于缓存层次、指令级并行的直觉不能直接照搬到 GPU，需要从存储层次、执行单元及二者配合方式三个维度重新建立性能模型。
 
 &emsp;&emsp;根据**Roofline 模型**，GPU 的全局内存带宽通常远低于其峰值算力，转折点对应的算术强度很高，因此**GPU 上 GEMM 的首要瓶颈往往是全局内存带宽**——若每个线程都直接从全局内存读取矩阵元素，再强的算力也会受制于访存。
 
@@ -1204,7 +1204,7 @@ BM_sgemm/naive_v8/2048x2048x2048   29604181 ns     29601578 ns           23 GFLO
 
 &emsp;&emsp;矩阵存储顺序在 GPU 上同样直接影响访存模式。以行主序为例，$C[i,j]=\sum_k A[i,k]B[k,j]$。若一个 warp 内的线程按 j 方向连续排列，则对 B 的访问沿 j 连续，可合并；对 A 的访问是广播（所有线程读同一个 $A[i,k]$），也能高效处理。若线程按 k 方向连续排列，则对 B 的访问步长为 N，无法合并，带宽利用率骤降。因此，GPU 上的 GEMM 内核通常让线程沿 N 方向排列，或通过共享内存转置来配合合并访问。
 
-&emsp;&emsp;从实现角度看，GPU GEMM 的高性能实现通常采用分层分块与微内核结构（具体思路和CPU优化类似）：
+&emsp;&emsp;从实现角度看，GPU GEMM 的高性能实现通常采用分层分块与微内核结构（与 CPU 优化的思路一脉相承）：
 1. 将 C 划分为若干 tile，每个线程块（block）负责一个 tile；
 2. 将 A、B 的子块从全局内存搬入共享内存，线程在共享内存上反复复用；
 3. 每个线程在寄存器中维护 $MR\times NR$ 的小累加器，沿 K 维循环执行 FMA；
@@ -1297,9 +1297,9 @@ void sgemm_cuda_naive_v1(int M, int N, int K, const float* A, const float* B, fl
     ----------------------- ------------- -------------
 ```
 
-&emsp;&emsp;这组数据揭示了一个与直觉不同的瓶颈分布。`DRAM Throughput` 只有 **15.37%**，说明显存带宽远未饱和；`L2 Cache Throughput` 只有 **10.60%**，L2 也没有成为瓶颈。真正的热点在 **L1/TEX 缓存**：`L1/TEX Cache Throughput` 达 **92.35%**，几乎被打满。`Memory Throughput` 和 `Compute (SM) Throughput` 都是 **92.09%**，看似计算和访存同时受限，但结合 naive 内核没有做任何计算优化的背景，这个“Compute”并非来自 FMA 单元——FMA 单元此时几乎空闲，92% 的忙碌来自 **LSU（加载/存储单元）**，它被大量 `A[row*K+k]` 和 `B[k*N+col]` 的加载指令塞满。
+&emsp;&emsp;这组数据揭示了一个与直觉不同的瓶颈分布。`DRAM Throughput` 仅 **15.37%**，说明显存带宽远未饱和；`L2 Cache Throughput` 仅 **10.60%**，L2 也没有成为瓶颈。真正的热点在 **L1/TEX 缓存**：`L1/TEX Cache Throughput` 达 **92.35%**，已接近饱和。`Memory Throughput` 和 `Compute (SM) Throughput` 均为 **92.09%**，看似计算与访存同时受限；但考虑到 naive 内核未做任何计算优化，这个“Compute”并非来自 FMA 单元——FMA 单元此时几乎空闲，92% 的忙碌来自 **LSU（加载/存储单元）**，它被大量 `A[row*K+k]` 与 `B[k*N+col]` 的加载指令占满。
 
-&emsp;&emsp;换句话说，naive 内核的瓶颈是 **L1/TEX 带宽和 LSU 吞吐**，而不是显存带宽。这与 CPU 上的 naive_v1 情况如出一辙：不是数据取不回来，而是数据以低效的方式被反复取用。区别在于 GPU 的 L1 带宽和并行度远高于 CPU，因此绝对性能高出三个数量级，但相对峰值仍然很低。
+&emsp;&emsp;换句话说，naive 内核的瓶颈是 **L1/TEX 带宽与 LSU 吞吐**，而非显存带宽。这与 CPU 端 naive_v1 的情况如出一辙：瓶颈都不在于数据能否取回，而在于数据被低效地反复取用。区别在于 GPU 的 L1 带宽与并行度远高于 CPU，因此绝对性能高出三个数量级，但相对峰值仍然很低。
 
 ![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/gpu_gemm_v1_xxxxxxxxxxxxxxxxxxx.png)
 
@@ -1392,7 +1392,7 @@ void sgemm_cuda_shared_v2(int M, int N, int K,
 ```
 
 &emsp;&emsp;相比 naive 版本，这段代码有三处关键改动。
-- **第一，共享内存声明**：`A_s` 和 `B_s` 各是一个 `TILE × TILE` 的 `float` 数组，共 `2 × 32 × 32 × 4 = 8 KB`，RTX 3050 每个 SM 有 100 KB 共享内存，8 KB 的占用不会限制 Occupancy。**
+- **第一，共享内存声明**：`A_s` 和 `B_s` 均为 `TILE × TILE` 的 `float` 数组，合计 `2 × 32 × 32 × 4 = 8 KB`。RTX 3050 每个 SM 有 100 KB 共享内存，8 KB 的占用不会限制 Occupancy。
 - **第二，加载时的边界处理**：当 `M`、`N`、`K` 不是 `TILE` 的整数倍时，越界的元素填 0。填 0 而不是跳过，是为了让后面的乘加仍然执行，不引入额外的分支；由于 `0 * x = 0`，填 0 不会影响最终结果。
 - **第三，两次 `__syncthreads()`**：第一次在加载完成后，确保共享内存里的数据对 block 内所有线程可见；第二次在计算完成后，确保没有线程在下一轮加载时覆盖别人还在读的数据。缺少任何一次同步，都会导致读写竞争或读到旧数据。
 
@@ -1430,11 +1430,11 @@ Performance counter stats (ncu --set roofline):
 
 &emsp;&emsp;不过，性能提升只有 13.7%，远低于理论预期的 `1/TILE` 级别。原因在于两个尚未解决的瓶颈。
 
-&emsp;&emsp;**第一，共享内存的 bank conflict。** 当前写法里 `A_s[ty][k]` 的访问模式中，同一个 warp 内 32 个线程的 `ty` 从 0 到 31、`k` 相同，访问的是 `A_s[0..31][k]` 这一列，步长为 `TILE = 32` 个 float。32 是 32 的倍数，所有线程访问的地址都落在同一个 bank 上，产生 **32 路 bank conflict**。这使共享内存的实际带宽降到理论值的 1/32。修法是把共享内存的列数从 `TILE` 增加到 `TILE + 1`，即 `A_s[TILE][TILE + 1]`。这样列的步长变成 33，和 32 互质，不同 `ty` 的线程访问的 bank 分散开。这是 CUDA 编程中常见的 **padding 技巧**，改动只有一行，但能显著减少 bank conflict。
+&emsp;&emsp;**第一，共享内存的 bank conflict。** 当前写法里 `A_s[ty][k]` 的访问模式中，同一个 warp 内 32 个线程的 `ty` 从 0 到 31、`k` 相同，访问的是 `A_s[0..31][k]` 这一列，步长为 `TILE = 32` 个 float，恰为 bank 总数（32）的整数倍，所有线程访问的地址因此都落在同一个 bank 上，产生 **32 路 bank conflict**。这使共享内存的实际带宽降到理论值的 1/32。修法是把共享内存的列数从 `TILE` 增加到 `TILE + 1`，即 `A_s[TILE][TILE + 1]`。这样列的步长变成 33，和 32 互质，不同 `ty` 的线程访问的 bank 分散开。这是 CUDA 编程中常见的 **padding 技巧**，改动只有一行，但能显著减少 bank conflict。
 
 &emsp;&emsp;**第二，每个线程仍然只计算一个 C 元素。** 共享内存分块减少了 A、B 的 L1 访问，但每个线程对 C 的写回仍然是 1 次，对 A_s、B_s 的读取仍然是一次完整的 `TILE` 长度内积。要进一步提高 FMA 效率，需要让每个线程在寄存器中维护多个累加器，一次计算 `MR × NR` 个 C 元素。这不仅能减少对共享内存的读取次数，还能提高 FMA 的发射效率，同时让 A_s、B_s 的元素被更多次复用。这正是 3.4 节要讨论的**寄存器分块**。
 
-&emsp;&emsp;从性能模型看，共享内存分块把算术强度从 naive 版本的 0.25 FLOP/Byte 提升到约 `TILE/2` 的水平。`TILE = 32` 时算术强度约 16 FLOP/Byte，已经越过 Roofline 转折点，性能从“带宽受限”转向“计算受限”。这正是共享内存分块的意义：**不是让数据取回来，而是让数据取回来之后被用得更充分**。接下来的寄存器分块会把“用得更充分”推到极致——让每个从共享内存读出的数据，在寄存器中被复用 `MR` 或 `NR` 次，把 L1 和共享内存的访问都降到最低。
+&emsp;&emsp;从性能模型看，共享内存分块把算术强度从 naive 版本的 0.25 FLOP/Byte 提升到约 `TILE/2` 的水平。`TILE = 32` 时算术强度约 16 FLOP/Byte，已经越过 Roofline 转折点，性能从“带宽受限”转向“计算受限”。这正是共享内存分块的意义：**不是让数据取回来，而是让数据取回来之后被用得更充分**。接下来的寄存器分块会把“用得更充分”推向极致——让每个从共享内存读出的数据，在寄存器中被复用 `MR` 或 `NR` 次，把 L1 和共享内存的访问都降到最低。
 
 ### 3.4 寄存器分块与线程级并行
 
@@ -1595,15 +1595,22 @@ Performance counter stats (ncu --set roofline):
 | L2 Cache Throughput | 13.32% | 15.65% | 略升 |
 | Compute (SM) Throughput | 79.80% | **28.49%** | 降 51.3 个百分点 |
 
-&emsp;&emsp;三个关键指标的下降说明寄存器分块确实把访存压力大幅降下来了。`L1/TEX Cache Throughput` 从 79.94% 降到 **52.27%**，因为 `A_s`、`B_s` 的每个元素被复用 `MR` 或 `NR` 次，共享内存的读取次数降到 `1/MR + 1/NR = 1/4 + 1/4 = 1/2`。`Compute (SM) Throughput` 从 79.80% 降到 **28.49%**，说明 LSU 不再是瓶颈——之前 92% 的“Compute”主要来自 LSU 忙碌，现在 LSU 压力小了，SM 有更多资源给 FMA。`Elapsed Cycles` 从 4631 万降到 **2612 万**，降幅 43.6%。
+&emsp;&emsp;三项关键指标的下降说明寄存器分块显著降低了访存压力。`L1/TEX Cache Throughput` 从 79.94% 降至 **52.27%**，因为 `A_s`、`B_s` 的每个元素被复用 `MR` 或 `NR` 次，共享内存的读取次数降到 `1/MR + 1/NR = 1/4 + 1/4 = 1/2`。`Compute (SM) Throughput` 从 79.80% 降至 **28.49%**，说明 LSU 不再是瓶颈——此前 92% 的“Compute”主要来自 LSU 的忙碌，LSU 压力下降后，SM 得以将更多资源分配给 FMA。`Elapsed Cycles` 从 4631 万降至 **2612 万**，降幅 43.6%。
 
 ![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/gpu_gemm_v3_xxxxxxxxxxxxxxxxxxx.png)
 
-&emsp;&emsp;但有一个数字值得注意：**`Compute (SM) Throughput` 只有 28.49%，说明 FMA 单元远未饱和**。按 Roofline 模型，此时计算单元利用率只有 28%，理论上还有 3.5 倍提升空间。瓶颈从 L1/LSU 转移到了别处。可能的原因有三个：**第一，共享内存的 bank conflict**：`A_s[ty*MR+i][k]` 的访问中，同一 warp 内 32 个线程的 `ty` 从 0 到 7、`tx` 从 0 到 3，访问的是 `A_s[0..31][k]` 这一列，步长 32 个 float，产生 bank conflict。修法是把 `A_s`、`B_s` 的列数从 `SG_TILE` 增加到 `SG_TILE + 1`。**第二，Occupancy 不足**：block 只有 64 个线程，RTX 3050 每个 SM 最多支持 1536 个线程，理论上可以同时驻留 24 个 block。但如果寄存器用量或共享内存用量过高，实际驻留的 block 数会减少，延迟隐藏不充分。**第三，FMA 发射效率**：`acc[i][j] += a_frag[i] * b_frag[j]` 这个双重循环，编译器是否真的把它编译成了 `MR × NR` 条独立的 FMA，还是插入了额外的 load/store？需要看 SASS 才能确认。
+&emsp;&emsp;但有一个数字值得注意：**`Compute (SM) Throughput` 仅 28.49%，说明 FMA 单元远未饱和**。按 Roofline 模型，此时计算单元利用率仅 28%，理论上仍有 3.5 倍的提升空间，说明瓶颈已从 L1/LSU 转移到了别处。可能的原因有三个：
 
-&emsp;&emsp;目前的版本还没有达到最优，需要继续调参优化。
-- **第一，加 padding 消除 bank conflict**
-- **第二，增大 `MR`、`NR`**
+- **共享内存的 bank conflict**：`A_s[ty*MR+i][k]` 的访问中，同一 warp 内 32 个线程的 `ty` 从 0 到 7、`tx` 从 0 到 3，访问的是 `A_s[0..31][k]` 这一列，步长为 32 个 float，产生 bank conflict。修法是把 `A_s`、`B_s` 的列数从 `SG_TILE` 增加到 `SG_TILE + 1`。
+- **Occupancy 不足**：block 仅有 64 个线程，RTX 3050 每个 SM 最多支持 1536 个线程，理论上可同时驻留 24 个 block。但若寄存器或共享内存用量过高，实际驻留的 block 数会减少，延迟隐藏不充分。
+- **FMA 发射效率**：对于 `acc[i][j] += a_frag[i] * b_frag[j]` 这一双重循环，编译器是否真正将其编译为 `MR × NR` 条独立的 FMA，还是插入了额外的 load/store，需要查看 SASS 才能确认。
+
+&emsp;&emsp;当前版本尚未达到最优，可以从两个方向继续调参：
+
+- **第一，加 padding 消除 bank conflict**；
+- **第二，增大 `MR`、`NR`**。
+
+完整的 v4 实现如下：
 
 ---
 
@@ -1753,9 +1760,9 @@ void sgemm_cuda_tiled_v4(int M, int N, int K,
 
 ### 3.5 访存指令向量化：float4 与 A 转置
 
-&emsp;&emsp;v4 通过 padding 消除 bank conflict、增大 tile 到 64×64，把 `Duration` 从 13.43ms 降到 7.02ms，2048³ 下 GFLOPS 从 843.0 提升到 916.1。但 ncu 数据显示，`L1/TEX Cache Throughput` 仍有 69.60%，`Memory Throughput` 68.60%，是三项吞吐中最高的两项。这说明数据复用虽然改善了，但**每条 FMA 周围的访存指令数仍然偏多**。
+&emsp;&emsp;v4 通过 padding 消除 bank conflict、把 tile 增大到 64×64，`Duration` 从 v3 的 16.89ms 降至 13.43ms，2048³ 下 GFLOPS 从 843.0 提升到 916.1。但 ncu 数据显示，v4 的 `L1/TEX Cache Throughput`（41.85%）与 `Memory Throughput`（41.77%）是四项吞吐指标中最高的两项，而 `Compute (SM) Throughput` 仅 33.45%。这说明数据复用虽有改善，但**每条 FMA 周围的访存指令数仍然偏多**。
 
-&emsp;&emsp;具体来说，v4 的内层循环每个 k 步要执行 8 次共享内存标量读：4 次 `A_s[ty*4+i][k]`（i 从 0 到 3）、4 次 `B_s[k][tx*4+j]`（j 从 0 到 3）。这 8 次读服务 16 次 FMA，访存/计算比为 1:2。LSU 被这些标量读指令塞满，FMA 单元反而空闲——这正是 v4 的 `Compute (SM) Throughput` 只有 33.45% 的原因。
+&emsp;&emsp;具体来说，v4 的内层循环每个 k 步要执行 8 次共享内存标量读：4 次 `A_s[ty*4+i][k]`（i 从 0 到 3）、4 次 `B_s[k][tx*4+j]`（j 从 0 到 3）。这 8 次读服务 16 次 FMA，访存/计算比为 1:2。LSU 被这些标量读指令占满，FMA 单元反而空闲——这正是 v4 的 `Compute (SM) Throughput` 仅 33.45% 的原因。
 
 &emsp;&emsp;要减少访存指令数，最直接的办法是**向量化**：用 `float4` 一次读 4 个 float，把 8 次标量读压缩到 2 次向量读。但 `A_s` 的访问模式是列访问，`A_s[ty*4+i][k]` 沿 `i` 变化、`k` 固定，地址步长为 `TILE` 个 float，不连续，无法直接向量化。解决办法是**在加载阶段把 A 转置存放**：共享内存里存 `A_sT[k][i]`，让 `k` 成为行、`i` 成为列。这样内层循环读 `A_sT[k][ty*4..ty*4+3]` 时，4 个元素连续，可以用一条 `float4` 读完成。
 
@@ -1949,17 +1956,17 @@ Performance counter stats (ncu --set roofline, 2048³):
 | Memory Throughput | 41.77% | 68.60% | 升 64.2% |
 | Compute (SM) Throughput | 33.45% | **42.69%** | 升 27.6% |
 
-&emsp;&emsp;`Duration` 和 `Elapsed Cycles` 都降了 47.5%，GFLOPS 提升 47.1%，说明 float4 向量化确实把访存指令数减下来了。`Compute (SM) Throughput` 从 33.45% 升到 42.69%，FMA 单元被喂得更满。但 `L1/TEX Cache Throughput` 和 `Memory Throughput` 反而升到了 69.60% 和 68.60%，说明 float4 读一次搬 16 字节，L1 和内存的数据搬运量更集中，带宽压力上升。这是好事——说明内核从“LSU 被标量指令塞满”转向了“L1/内存带宽被充分利用”。
+&emsp;&emsp;`Duration` 与 `Elapsed Cycles` 均下降 47.5%，GFLOPS 提升 47.1%，说明 float4 向量化确实显著减少了访存指令数。`Compute (SM) Throughput` 从 33.45% 升至 42.69%，FMA 单元得到更充分的利用。但 `L1/TEX Cache Throughput` 和 `Memory Throughput` 反而升至 69.60% 和 68.60%，说明 float4 单次读取搬运 16 字节，L1 与内存的数据搬运更为集中，带宽压力上升。这恰恰是积极的信号——说明内核已从“LSU 被标量指令占满”转向“L1/内存带宽被充分利用”。
 
 ![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/gpu_gemm_v5_xxxxxxxxxxxxxxxxxxx.png)
 
-&emsp;&emsp;共享内存的占用从 v4 的 `2 × 64 × 65 × 4 = 33.3 KB` 涨到 v5 的 `2 × 64 × 68 × 4 = 34.8 KB`。RTX 3050 每个 SM 有 100 KB 共享内存，v4 理论上能驻留 3 个 block，v5 也是 3 个（34.8 × 3 = 104.4 KB，略超，实际可能只有 2 个）。Occupancy 略有下降，但用占用率换来了 smem 指令从 8 条降到 2 条、全局加载指令从 32 条降到 8 条，由实测数据裁决——GFLOPS 提升 47.1% 说明这笔交易划算。
+&emsp;&emsp;共享内存占用从 v4 的 `2 × 64 × 65 × 4 = 33.3 KB` 增至 v5 的 `2 × 64 × 68 × 4 = 34.8 KB`。RTX 3050 每个 SM 有 100 KB 共享内存，v4 理论上可驻留 3 个 block，v5 也是 3 个（34.8 × 3 = 104.4 KB 略超上限，实际可能只有 2 个）。Occupancy 因此略有下降，但换来了 smem 指令从 8 条降到 2 条、全局加载指令从 32 条降到 8 条。实测结果表明这一取舍是值得的：GFLOPS 提升 47.1%。
 
-&emsp;&emsp;不过 v5 的 `Compute (SM) Throughput` 只有 42.69%，FMA 单元仍有大量空闲。下一步的优化方向是**双缓冲**：当 `DRAM Throughput` 涨到 32.02%、`Memory Throughput` 到 68.60% 时，全局内存加载开始成为可见瓶颈，双缓冲能把加载和计算重叠。具体做法是把 `A_sT`、`B_s` 各分成两份，一份用于当前 K 切片的计算，另一份用于预加载下一个 K 切片。如果配合 Ampere 的 `cp.async` 异步拷贝指令，加载和计算能真正并行，而不是靠 `__syncthreads()` 逻辑重叠。
+&emsp;&emsp;不过，v5 的 `Compute (SM) Throughput` 仅 42.69%，FMA 单元仍大量空闲。下一步的优化方向是**双缓冲**：当 `DRAM Throughput` 涨到 32.02%、`Memory Throughput` 到 68.60% 时，全局内存加载开始成为可见瓶颈，双缓冲能把加载和计算重叠。具体做法是把 `A_sT`、`B_s` 各分成两份，一份用于当前 K 切片的计算，另一份用于预加载下一个 K 切片。如果配合 Ampere 的 `cp.async` 异步拷贝指令，加载和计算能真正并行，而不是靠 `__syncthreads()` 逻辑重叠。
 
 ### 3.6 双缓冲与访存计算重叠
 
-&emsp;&emsp;3.5 节的 v5 通过 float4 向量化把每 k 步的共享内存指令从 8 条压到 2 条，2048³ 下 GFLOPS 达到 **1476.9**。但 v5 的 ncu 数据显示 `Memory Throughput` 68.60%、`DRAM Throughput` 32.02%，访存已经开始成为可见瓶颈。此时全局内存的加载与共享内存的计算之间仍然是**串行**的：先加载 A、B 子块，`__syncthreads()` 等待加载完成，再做乘加，再 `__syncthreads()` 进入下一轮。加载期间 FMA 单元空闲，计算期间全局内存空闲。**双缓冲**的目标就是让这两段重叠。
+&emsp;&emsp;3.5 节的 v5 通过 float4 向量化把每 k 步的共享内存指令从 8 条减少到 2 条，2048³ 下 GFLOPS 达到 **1476.9**。但 v5 的 ncu 数据显示 `Memory Throughput` 68.60%、`DRAM Throughput` 32.02%，访存已经开始成为可见瓶颈。此时全局内存的加载与共享内存的计算之间仍然是**串行**的：先加载 A、B 子块，`__syncthreads()` 等待加载完成，再做乘加，再 `__syncthreads()` 进入下一轮。加载期间 FMA 单元空闲，计算期间全局内存空闲。**双缓冲**的目标就是让这两段重叠。
 
 &emsp;&emsp;双缓冲的思路是：把共享内存分成两份，一份用于当前 K 切片的计算，另一份用于预加载下一个 K 切片。在计算 `cur` buf 的同时，把下一个 K 切片加载到 `nxt` buf。这样全局内存加载与共享内存计算在时间上重叠，隐藏全局内存延迟。双缓冲的同步是关键：循环开头用一次 `__syncthreads()` 确保 `cur` buf 加载完成，循环末尾再用一次 `__syncthreads()` 确保本轮计算完成后 `nxt` buf 才被下一轮覆盖。
 
@@ -2212,11 +2219,11 @@ Performance counter stats (ncu --set roofline, 2048³):
 
 ![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/gpu_gemm_v6_xxxxxxxxxxxxxxxxxxx.png)
 
-&emsp;&emsp;这也说明**双缓冲并非总是有效**。它的收益依赖于两个条件：全局内存延迟确实是瓶颈，且双缓冲带来的 Occupancy 下降不严重。v5 的 `DRAM Throughput` 只有 32.02%，全局内存延迟还没有严重到需要双缓冲来掩盖；而双缓冲把共享内存翻倍，直接砍掉了一半 Occupancy，损失大于收益。
+&emsp;&emsp;这也说明**双缓冲并非总是有效**。它的收益依赖于两个条件：全局内存延迟确实是瓶颈，且双缓冲带来的 Occupancy 下降不严重。v5 的 `DRAM Throughput` 只有 32.02%，全局内存延迟还没有严重到需要双缓冲来掩盖；而双缓冲使共享内存翻倍，直接削减了一半 Occupancy，损失大于收益。
 
 ### 3.7 cp.async 异步拷贝
 
-&emsp;&emsp;3.6 节的双缓冲尝试得出了一个负面结论：共享内存翻倍导致 Occupancy 从 2 个 block/SM 降到 1 个 block/SM，性能反而下降 0.8%。这说明在 RTX 3050 上，**用翻倍共享内存换访存计算重叠是一笔不划算的交易**。但 v5 的 `DRAM Throughput` 32.02%、`Memory Throughput` 68.60% 说明访存压力确实存在。有没有办法**不翻倍共享内存**也能实现异步加载？
+&emsp;&emsp;3.6 节的双缓冲尝试得出了一个负面结论：共享内存翻倍导致 Occupancy 从 2 个 block/SM 降到 1 个 block/SM，性能反而下降 0.8%。这说明在 RTX 3050 上，**通过翻倍共享内存换取访存计算重叠并不合算**。但 v5 的 `DRAM Throughput` 32.02%、`Memory Throughput` 68.60% 说明访存压力确实存在。有没有办法**不翻倍共享内存**也能实现异步加载？
 
 &emsp;&emsp;Ampere 架构（CC 8.0+）提供了硬件异步拷贝指令 **`cp.async`**。它从全局内存直接拷贝到共享内存，**绕过寄存器堆**，由异步拷贝单元执行，不占用 warp 的执行周期，也不产生 `STS` 指令。等待拷贝完成用 `cp.async.wait_group`。这样，全局内存加载和计算可以真正并行——加载由异步单元执行，warp 继续做 FMA。
 
@@ -2402,13 +2409,13 @@ Performance counter stats (ncu --set roofline, 2048³):
 | Compute (SM) Throughput | 42.69% | 37.70% | **76.51%** |
 | Memory Throughput | 68.60% | 62.07% | **76.51%** |
 
-&emsp;&emsp;**v7 的 GFLOPS 是三版中最高的，达到 1493.31。** `Compute (SM) Throughput` 从 v5 的 42.69% 跃升到 **76.51%**，说明 FMA 单元被喂得更满。`Memory Throughput` 也从 68.60% 升到 76.51%，`DRAM Throughput` 从 32.02% 升到 37.69%。这些指标同步上升，说明 `cp.async` 确实让访存和计算并行起来了——FMA 单元不再等数据，L1/内存也不再空转。
+&emsp;&emsp;**v7 的 GFLOPS 是三版中最高的，达到 1493.31。** `Compute (SM) Throughput` 从 v5 的 42.69% 跃升至 **76.51%**，说明 FMA 单元得到更充分的利用。`Memory Throughput` 从 68.60% 升至 76.51%，`DRAM Throughput` 从 32.02% 升至 37.69%。这些指标同步上升，表明 `cp.async` 确实使访存与计算并行起来——FMA 单元不再等待数据，L1/内存也不再空闲。
 
 &emsp;&emsp;但 v7 的 `Duration` 是 7.37ms，比 v5 的 7.02ms 略长。GFLOPS 更高但 Duration 更长，这是因为 benchmark 的 60 次迭代里有 1 次被 `ncu` 采集时重放，`ncu` 报告的 Duration 是重放后的时间，而 benchmark 的 GFLOPS 是 60 次迭代的平均。以 benchmark 数据为准，**v7 的 1493.31 GFLOPS 是三者中最高的**。
 
 ![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/gpu_gemm_v7_xxxxxxxxxxxxxxxxxxx.png)
 
-&emsp;&emsp;`L1/TEX Cache Throughput` 从 v5 的 69.60% 升到 77.21%，`L2 Cache Throughput` 从 25.21% 升到 40.29%，说明 `cp.async` 把访存压力从寄存器堆转移到了 L1/L2。a_frag 从 1 条 `LDS.128` 退化为 4 条 `LDS.32`，指令数增加，L1/TEX 吞吐上升，这是 `cp.async` 无法转置的代价。但同一 `ty` 的 8 个线程读同一地址，硬件按广播处理，事务数没有劣化，所以 `L1/TEX Cache Throughput` 虽然升高但没有饱和。
+&emsp;&emsp;`L1/TEX Cache Throughput` 从 v5 的 69.60% 升至 77.21%，`L2 Cache Throughput` 从 25.21% 升至 40.29%，说明 `cp.async` 将访存压力从寄存器堆转移到了 L1/L2。`a_frag` 从 1 条 `LDS.128` 退化为 4 条 `LDS.32`，指令数增加，L1/TEX 吞吐上升，这是 `cp.async` 无法转置的代价。但同一 `ty` 的 8 个线程读取同一地址时硬件按广播处理，事务数并未劣化，因此 `L1/TEX Cache Throughput` 虽有上升但未达到饱和。
 
 
 ### 3.8 共享内存 swizzle 消除 bank conflict
@@ -2614,7 +2621,7 @@ Performance counter stats (ncu --set roofline, 2048³):
 
 &emsp;&emsp;CUDA 的 block 调度顺序是 `blockIdx.x` 最快变化，`blockIdx.y` 次之。在 v8 里，`blockIdx.x` 对应 C 的列块，`blockIdx.y` 对应 C 的行块。这意味着**同一行的 32 个列块会连续执行**。对 A 面板来说，这是好事——同一行的 A 面板在 32 个列块间被反复复用，命中 L2。但对 B 面板来说，这是坏事——B 的每个面板要被 32 个行块各读一遍，**B 面板的 L2/DRAM 读取次数被放大了 32 倍**。
 
-&emsp;&emsp;解决办法是 **L2 block swizzle**：重映射 grid 的遍历顺序，让一个"带"内的多个行块共享同一个 B 面板。具体来说，把 `gridDim.y` 按 `GROUP = 8` 分组，每个带包含 8 个行块和全部列块。带内按"行优先"遍历（先遍历 8 个行块，再推进列块），这样同一个 B 面板在带内被 8 个行块共享，**B 面板的 L2/DRAM 读取次数降到 1/8**。同时，A 面板仍被带内全部列块复用。
+&emsp;&emsp;解决办法是 **L2 block swizzle**：重映射 grid 的遍历顺序，让一个“带”内的多个行块共享同一个 B 面板。具体来说，把 `gridDim.y` 按 `GROUP = 8` 分组，每个带包含 8 个行块和全部列块。带内按“行优先”遍历（先遍历 8 个行块，再推进列块），这样同一个 B 面板在带内被 8 个行块共享，**B 面板的 L2/DRAM 读取次数降到 1/8**。同时，A 面板仍被带内全部列块复用。
 
 &emsp;&emsp;带的工作集是 `8 × 16KB（A 面板）+ 32 × 16KB（B 面板）= 640KB`，远小于 RTX 3050 的 L2 容量（2MB），所以带内数据能全部驻留 L2。下面给出完整实现。
 
@@ -2800,7 +2807,7 @@ if (first_row + V9_GROUP <= gridDim.y) {
 }
 ```
 
-&emsp;&emsp;这段映射把原本"列优先"的遍历顺序改成"带内行优先"。2048³ 下 `gridDim = (32, 32)`，`V9_GROUP = 8`，每个带包含 `8 × 32 = 256` 个 block，共 4 个带。带内 `row_blk` 从 `first_row` 到 `first_row + 7`，`col_blk` 从 0 到 31，遍历顺序是 `(0,0), (1,0), ..., (7,0), (0,1), (1,1), ...`。这样 B 的第 0 个列面板在带内被 8 个行块各读一遍，之后不再被后面的带读到（因为 `col_blk` 会推进到下一个列块）。
+&emsp;&emsp;这段映射把原本“列优先”的遍历顺序改成“带内行优先”。2048³ 下 `gridDim = (32, 32)`，`V9_GROUP = 8`，每个带包含 `8 × 32 = 256` 个 block，共 4 个带。带内 `row_blk` 从 `first_row` 到 `first_row + 7`，`col_blk` 从 0 到 31，遍历顺序是 `(0,0), (1,0), ..., (7,0), (0,1), (1,1), ...`。这样 B 的第 0 个列面板在带内被 8 个行块各读一遍，之后不再被后面的带读到（因为 `col_blk` 会推进到下一个列块）。
 
 &emsp;&emsp;实测结果如下：
 
@@ -2842,7 +2849,7 @@ Performance counter stats (ncu --set roofline, 2048³):
 
 ### 3.10 Host 侧缓冲区复用
 
-&emsp;&emsp;3.9 节的 v9 用 L2 block swizzle 把 `DRAM Throughput` 从 45.06% 降到 25.39%，但 GFLOPS 没有提升，因为瓶颈已经在 `Compute (SM) Throughput` 92%、`L1/TEX Cache Throughput` 93%。此时 kernel 本身已经接近 RTX 3050 在 FP32 路径上的上限。但 benchmark 的 **端到端口径**里还有一笔固定开销被忽略了：每次调用 `sgemm_cuda_*` 都要 `cudaMalloc` 三块设备缓冲区、`cudaFree` 释放，2048³ 下这套固定开销约 5ms，而 kernel 本身只有约 6ms。**端到端耗时里，近一半花在了内存分配和释放上。**
+&emsp;&emsp;3.9 节的 v9 用 L2 block swizzle 把 `DRAM Throughput` 从 45.06% 降到 25.39%，但 GFLOPS 没有提升，因为瓶颈已经在 `Compute (SM) Throughput` 92%、`L1/TEX Cache Throughput` 93%。此时 kernel 本身已经接近 RTX 3050 在 FP32 路径上的上限。但 benchmark 的 **端到端口径**里还有一笔固定开销被忽略了：每次调用 `sgemm_cuda_*` 都要 `cudaMalloc` 三块设备缓冲区、`cudaFree` 释放，2048³ 下该固定开销约 5ms，而 kernel 本身仅约 6ms。**端到端耗时中，近一半消耗在内存分配与释放上。**
 
 &emsp;&emsp;解决办法是在**进程内缓存 device buffer**，按需扩容（只扩不缩）。第一次调用时分配，后续调用复用，只有规模增大时才重新分配。这样，benchmark 的 60 次迭代里，前几次会走分配路径，后面全部走复用路径，端到端耗时大幅下降。下面给出实现。
 
@@ -2960,7 +2967,7 @@ Performance counter stats (ncu --set roofline, 2048³):
 
 ### 3.11 Tensor Core 与 WMMA
 
-&emsp;&emsp;3.10 节的 v10 用 host 侧缓冲区复用把端到端 GFLOPS 推到 **1788.16**（2048³），`Compute (SM) Throughput` 92%、`L1/TEX Cache Throughput` 93%，已经接近 RTX 3050 在 CUDA Core FP32 路径上的上限。要突破这个上限，必须换执行单元——用 **Tensor Core**。Tensor Core 是 NVIDIA 从 Volta 开始引入的专用矩阵乘加单元，单条 `mma` 指令完成一个小矩阵块（如 16×16×8）的乘加，吞吐远高于 CUDA Core 的 FMA。
+&emsp;&emsp;3.10 节的 v10 用 host 侧缓冲区复用把端到端 GFLOPS 提升至 **1788.16**（2048³），`Compute (SM) Throughput` 92%、`L1/TEX Cache Throughput` 93%，已经接近 RTX 3050 在 CUDA Core FP32 路径上的上限。要突破这个上限，必须换执行单元——用 **Tensor Core**。Tensor Core 是 NVIDIA 从 Volta 开始引入的专用矩阵乘加单元，单条 `mma` 指令完成一个小矩阵块（如 16×16×8）的乘加，吞吐远高于 CUDA Core 的 FMA。
 
 &emsp;&emsp;RTX 3050 是 Ampere 架构（CC 8.6），支持 Tensor Core 的 **TF32** 精度：输入 A、B 是 FP32 存储，在 `mma` 内部被舍入成 TF32（10-bit 尾数），累加器仍是 FP32。TF32 的吞吐是 FP32 CUDA Core 的数倍，代价是**精度损失**——A、B 被舍入到 10-bit 尾数，非精确 FP32。如果换 FP16，吞吐更高，但精度损失更大。
 
@@ -3167,13 +3174,13 @@ Performance counter stats (ncu --set roofline, 2048³):
 
 ![](http://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/gpu_gemm_v11_xxxxxxxxxxxxxxxxxxx.png)
 
-&emsp;&emsp;值得注意的是 v11 的 GFLOPS 1941.05 已经**接近 cublas 的 2005.97**，差距只有 3.2%。cublas 是 NVIDIA 官方调优的库，用 `mma` 指令、双缓冲、L2 swizzle、向量化加载等一整套优化。v11 只用 WMMA 的高层接口，没有做双缓冲和 L2 swizzle，就能达到 cublas 的 96.8%，说明 TF32 路线的潜力很大。
+&emsp;&emsp;值得注意的是 v11 的 GFLOPS 1941.05 已经**接近 cublas 的 2005.97**，差距只有 3.2%。cublas 是 NVIDIA 官方调优的库，用 `mma` 指令、双缓冲、L2 swizzle、向量化加载等一整套优化。v11 仅使用 WMMA 的高层接口，未做双缓冲与 L2 swizzle，即达到 cublas 的 96.8%，表明 TF32 路线仍有较大潜力。
 
 &emsp;&emsp;从优化路径看，v11 是继 v3（寄存器分块）、v4（padding + 增大 tile）、v5（float4 向量化）、v6（双缓冲失败）、v7（cp.async）、v8（smem swizzle）、v9（L2 swizzle）、v10（host 复用）之后的第九步。它换了一个执行单元——从 CUDA Core 的 FMA 换成 Tensor Core 的 `mma`，用 TF32 精度换取数倍的吞吐。至此，2048³ 下 GFLOPS 从 v1 的 430.7 提升到 v11 的 **1941.1**，提升 350.7%。
 
 ### 3.12 微内核形状调参：4×8
 
-&emsp;&emsp;3.11 节的 v11 换用 Tensor Core 的 TF32 WMMA，把 2048³ 推到 **1941.05 GFLOPS**，达到 cuBLAS 的 96.8%。但 Tensor Core 路线依赖特定的数据类型和 fragment 布局，不是所有场景都能用。回到 CUDA Core 的 FP32 路径，v9 的 `Compute (SM) Throughput` 已经到 92%，看起来接近饱和。但仔细分析 v9 的 ncu 画像会发现一个被掩盖的问题：**瓶颈不是 FMA 单元算不过来，而是发射槽被非 FMA 指令挤占**。
+&emsp;&emsp;3.11 节的 v11 换用 Tensor Core 的 TF32 WMMA，将 2048³ 提升至 **1941.05 GFLOPS**，达到 cuBLAS 的 96.8%。但 Tensor Core 路线依赖特定的数据类型和 fragment 布局，不是所有场景都能用。回到 CUDA Core 的 FP32 路径，v9 的 `Compute (SM) Throughput` 已经到 92%，看起来接近饱和。但仔细分析 v9 的 ncu 画像会发现一个被掩盖的问题：**瓶颈不是 FMA 单元算不过来，而是发射槽被非 FMA 指令挤占**。
 
 &emsp;&emsp;v9 的微内核形状是 `4 × 4`，即每个线程维护 4 行 × 4 列的累加器。每个 k 步，线程要执行：4 次 `A_s` 的标量读（含 swizzle 地址计算）、1 次 `B_s` 的 `float4` 读、16 条 FMA。也就是说，**每个 k 步有 5 条访存指令 + 若干 swizzle 计算指令服务 16 条 FMA**，非 FMA 指令占比接近 30%。`Compute (SM) Throughput` 92% 统计的是所有 SM 子单元的忙碌程度，包括 LSU 和地址计算，所以这个 92% 里有一部分是 swizzle 计算和共享内存寻址，而不是 FMA。
 
@@ -3445,7 +3452,7 @@ Benchmark (2048³ 分块流水线，单块口径):
 | Compute (SM) Throughput | 92.00% | **64.97%** | **降 27.0 个百分点** |
 | Memory Throughput | 92.00% | 83.25% | 降 8.8 个百分点 |
 
-&emsp;&emsp;`Compute (SM) Throughput` 从 92.00% 降到 **64.97%**，看起来是“变差了”，但这实际上是**好事**。v9 的 92% 里，很大一部分是 LSU 和 swizzle 计算在忙碌，而不是 FMA。v14 通过把微内核形状从 `4 × 4` 改成 `4 × 8`，让每个 k 步的 FMA 从 16 条增加到 32 条，swizzle 计算按 FMA 摊薄，LSU 的忙碌程度下降。所以 `Compute (SM) Throughput` 下降，说明**发射槽从非 FMA 指令中解放出来，留给了 FMA**。
+&emsp;&emsp;`Compute (SM) Throughput` 从 92.00% 降至 **64.97%**，表面上像是“变差了”，实质上却是**好事**。v9 的 92% 里，很大一部分是 LSU 和 swizzle 计算在忙碌，而不是 FMA。v14 通过把微内核形状从 `4 × 4` 改成 `4 × 8`，让每个 k 步的 FMA 从 16 条增加到 32 条，swizzle 计算按 FMA 摊薄，LSU 的忙碌程度下降。所以 `Compute (SM) Throughput` 下降，说明**发射槽从非 FMA 指令中解放出来，留给了 FMA**。
 
 &emsp;&emsp;`L1/TEX Cache Throughput` 从 93.21% 降到 85.42%，说明 L1/TEX 的压力也下降了。v9 的 93% 接近饱和，v14 通过减少访存指令数把它降到了 85%，留出了余量。`DRAM Throughput` 从 25.39% 降到 22.62%，`Memory Throughput` 从 92.00% 降到 83.25%，说明整体访存压力都在下降。
 
@@ -3459,30 +3466,30 @@ Benchmark (2048³ 分块流水线，单块口径):
 
 &emsp;&emsp;从优化路径看，v14 是继 v3（寄存器分块）、v4（padding + 增大 tile）、v5（float4 向量化）、v6（双缓冲失败）、v7（cp.async）、v8（smem swizzle）、v9（L2 swizzle）、v10（host 复用）、v11（Tensor Core）之后的第十步。它没有引入新的硬件特性，只是调整了微内核的形状，把 `4 × 4` 改成 `4 × 8`。这一步的收益（相比 v9 提升 34.6%）说明：**在微内核已经接近饱和时，形状调参比引入新的优化手段更有效**。v6 的双缓冲失败、v14 的形状调参成功，都是同一个道理的两种表现——要针对真正的瓶颈下手，而不是盲目叠加优化手段。
 
-&emsp;&emsp;至此，GPU 侧 2048³ 下 GFLOPS 从 v1 的 430.7 提升到 v14 的 **2101.31**，提升 387.8%，超过 cuBLAS 的 1921.85。从朴素实现到微内核形状调参，完整走过了共享内存分块、寄存器分块、padding、tile 增大、float4 向量化、cp.async、smem swizzle、L2 swizzle、host 复用、Tensor Core、微内核形状调参的完整路径。每一步都在解决前一步遗留的瓶颈，最终的 2101.31 GFLOPS 已经接近 RTX 3050 在 FP32 精度下的实际上限。
+&emsp;&emsp;至此，GPU 侧 2048³ 下 GFLOPS 从 v1 的 430.7 提升至 v14 的 **2101.31**，增幅 387.8%，超过 cuBLAS 的 1921.85。从朴素实现出发，依次经历了共享内存分块、寄存器分块、padding、tile 增大、float4 向量化、cp.async、smem swizzle、L2 swizzle、host 复用、Tensor Core、微内核形状调参的完整路径。每一步都在解决前一步遗留的瓶颈，最终的 2101.31 GFLOPS 已接近 RTX 3050 在 FP32 精度下的实际上限。
 
 ## 4 总结
 
-&emsp;&emsp;本文以 GEMM 为对象，完整走了一遍从朴素实现到 Tensor Core 的优化路径。CPU 侧从三重循环出发，经循环交换、分块、打包、寄存器分块、SIMD 向量化、多线程、大页与 TLB 优化，最终把 2048³ 下的单精度性能从 1.86 GFLOPS 推到 **580.37 GFLOPS**；GPU 侧从每线程一个 C 元素的朴素内核出发，经共享内存分块、寄存器分块、padding、tile 增大、float4 向量化、cp.async 异步拷贝、共享内存 swizzle、L2 block swizzle、host 侧缓冲区复用、Tensor Core WMMA，最后用微内核形状调参把 2048³ 推到 **2101.31 GFLOPS**，超过官方 cuBLAS 的 1921.85(主要是偏特化的实现而不是通用的性能)。
+&emsp;&emsp;本文以 GEMM 为对象，完整走了一遍从朴素实现到 Tensor Core 的优化路径。CPU 侧从三重循环出发，经循环交换、分块、打包、寄存器分块、SIMD 向量化、多线程、大页与 TLB 优化，最终把 2048³ 下的单精度性能从 1.86 GFLOPS 提升至 **580.37 GFLOPS**；GPU 侧从每线程一个 C 元素的朴素内核出发，经共享内存分块、寄存器分块、padding、tile 增大、float4 向量化、cp.async 异步拷贝、共享内存 swizzle、L2 block swizzle、host 侧缓冲区复用、Tensor Core WMMA，最后用微内核形状调参把 2048³ 提升至 **2101.31 GFLOPS**，超过官方 cuBLAS 的 1921.85（这一优势主要因为本文实现是针对固定规模的特化实现，而 cuBLAS 面向通用场景）。
 
-&emsp;&emsp;回顾整个过程，每一步优化都在解决前一步遗留的瓶颈，而不是简单地叠加手段。CPU 侧的起点是访存模式：朴素实现中 B 的跨列访问导致 L1 miss 率高达 80.6%，仅循环交换一步就把 L1 miss 率降到 10.8%、性能提升 72 倍。此后分块解决 L2/L3 复用，打包消除大步长访问，寄存器分块隐藏 FMA 延迟，SIMD 把每条指令从 1 个 float 提升到 8 个 float，多线程突破单核算力，大页把 4K 页的 TLB miss 从 3305 万降到接近零。最终 `fpu_pipe_assignment` 的两个 FMA 管道各占 50%、每周期约 3.5 个 uop，利用率接近 Zen 3 的 4 uop/周期上限。GPU 侧的路径同样清晰：朴素内核的瓶颈不在显存带宽（`DRAM Throughput` 仅 15.37%），而在 L1/TEX 和 LSU——每个线程独立做完整 K 循环，数据复用为零。共享内存分块把 A、B 搬到片上，寄存器分块把共享内存访问降到 `1/MR + 1/NR`，padding 消除 bank conflict，tile 从 32 提到 64 提高复用率，float4 向量化把每 k 步的 smem 指令从 8 条压到 2 条。v6 的双缓冲尝试给出了一个负面结论：共享内存翻倍导致 Occupancy 从 2 个 block/SM 降到 1 个，性能反而下降 0.8%——**双缓冲并非总是有效，它的收益依赖于全局内存延迟确实是瓶颈且 Occupancy 下降不严重**。v7 用 `cp.async` 绕过寄存器堆实现真正的异步加载，v8 用 XOR swizzle 消除了 `cp.async` 16 字节写入引入的 2-way bank conflict，v9 用 L2 block swizzle 把 B 面板的 DRAM 读取次数降到 1/8，v10 用 host 侧缓冲区复用消除 `cudaMalloc`/`cudaFree` 的固定开销，v11 换上 Tensor Core 的 `mma` 指令用 TF32 精度换取数倍吞吐，v14 把微内核形状从 `4 × 4` 改成 `4 × 8`，把发射槽从非 FMA 指令中解放出来，端到端 GFLOPS 提升 34.6%。
+&emsp;&emsp;回顾整个过程，每一步优化都在解决前一步遗留的瓶颈，而不是简单地叠加手段。CPU 侧的起点是访存模式：朴素实现中 B 的跨列访问导致 L1 miss 率高达 80.6%，仅循环交换一步就把 L1 miss 率降到 10.8%、性能提升 72 倍。此后分块解决 L2/L3 复用，打包消除大步长访问，寄存器分块隐藏 FMA 延迟，SIMD 把每条指令从 1 个 float 提升到 8 个 float，多线程突破单核算力，大页把 4K 页的 TLB miss 从 3305 万降到接近零。最终 `fpu_pipe_assignment` 的两个 FMA 管道各占 50%、每周期约 3.5 个 uop，利用率接近 Zen 3 的 4 uop/周期上限。GPU 侧的路径同样清晰：朴素内核的瓶颈不在显存带宽（`DRAM Throughput` 仅 15.37%），而在 L1/TEX 和 LSU——每个线程独立做完整 K 循环，数据复用为零。共享内存分块把 A、B 搬到片上，寄存器分块把共享内存访问降到 `1/MR + 1/NR`，padding 消除 bank conflict，tile 从 32 提到 64 提高复用率，float4 向量化把每 k 步的 smem 指令从 8 条减少到 2 条。v6 的双缓冲尝试给出了一个负面结论：共享内存翻倍导致 Occupancy 从 2 个 block/SM 降到 1 个，性能反而下降 0.8%——**双缓冲并非总是有效，它的收益依赖于全局内存延迟确实是瓶颈且 Occupancy 下降不严重**。v7 用 `cp.async` 绕过寄存器堆实现真正的异步加载，v8 用 XOR swizzle 消除了 `cp.async` 16 字节写入引入的 2-way bank conflict，v9 用 L2 block swizzle 把 B 面板的 DRAM 读取次数降到 1/8，v10 用 host 侧缓冲区复用消除 `cudaMalloc`/`cudaFree` 的固定开销，v11 换上 Tensor Core 的 `mma` 指令用 TF32 精度换取数倍吞吐，v14 把微内核形状从 `4 × 4` 改成 `4 × 8`，把发射槽从非 FMA 指令中解放出来，端到端 GFLOPS 提升 34.6%。
 
 &emsp;&emsp;从实战角度看，CPU 侧的优化思路可以归纳为四条，优先级递进：
-- **第一，先解决访存模式，再谈其他。** 朴素实现的瓶颈几乎总是 B 的跨列访问——内层 k 循环步长为 N，一个 64 字节缓存行只用 1 个 float，L1 miss 率可达 80% 以上。把 k 循环提到中间层，让内层 j 连续访问 B 和 C，L1 miss 率能降到 10% 左右，性能提升数十倍。这一步不需要 SIMD、不需要分块、不需要多线程，只是换个循环顺序，就能拿到整个优化路径中最高的单步收益。**如果只能做一个优化，就做循环交换。** 
+- **第一，先解决访存模式，再谈其他。** 朴素实现的瓶颈几乎总是 B 的跨列访问——内层 k 循环步长为 N，一个 64 字节缓存行只用 1 个 float，L1 miss 率可达 80% 以上。把 k 循环提到中间层，让内层 j 连续访问 B 和 C，L1 miss 率能降到 10% 左右，性能提升数十倍。这一步不需要 SIMD、不需要分块、不需要多线程，只是换个循环顺序，就能拿到整个优化路径中最高的单步收益。**如果只能做一个优化，就做循环交换。**
 - **第二，用分块和打包把数据搬到离计算单元更近的地方。** 循环交换解决了 L1 访存模式，但没有解决全局复用。分块把 C 划分为 `MC × NC`、A 划分为 `MC × KC`、B 划分为 `KC × NC`，让 A、B 的子块在 L2/L3 中被多个 C 元素复用；打包把子块复制到连续缓冲区，让内层循环的地址计算更简单、访存更连续。两者必须配合：没有分块，打包的块太大，复制开销无法摊销；没有打包，分块后的内层仍在原始矩阵中跨步访问。
 - **第三，用寄存器分块和 SIMD 填满 FMA 流水线。** 分块和打包解决的是访存，寄存器分块解决的是计算。`MR × NR` 的累加器块让 FMA 之间没有依赖链，多个独立累加器填满流水线。但标量 FMA 每次只处理 1 个 float，用 AVX2 的 `_mm256_fmadd_ps` 一次处理 8 个，吞吐直接翻数倍。这一步的关键不是“向量化”本身，而是**让编译器或 intrinsic 生成真正的向量 FMA**。
-- **第四，用多线程和大页突破单核上限和 TLB 瓶颈。** 前三步做完，单核性能已经接近峰值，继续压榨单核的收益有限。多线程沿 M/N 分块并行，能突破单核算力上限；但要注意 SMT 兄弟线程会争抢 FPU 端口和缓存，把线程数压到物理核数往往比用满逻辑核更快。大页解决的是 TLB 覆盖问题：16MB 的矩阵在 4K 页下需要 4096 个 TLB 条目，远超 L1/L2 TLB 容量，每次访问都要页表遍历；改用 2MB 大页后，同样的矩阵只需 8 个条目，TLB miss 从数亿降到千万级。**大页是那种“改一行代码、收益立竿见影”的优化。**
+- **第四，用多线程和大页突破单核上限和 TLB 瓶颈。** 前三步做完，单核性能已经接近峰值，继续挖掘单核潜力的收益有限。多线程沿 M/N 分块并行，能突破单核算力上限；但要注意 SMT 兄弟线程会争抢 FPU 端口和缓存，将线程数限制到物理核数往往比用满逻辑核更快。大页解决的是 TLB 覆盖问题：16MB 的矩阵在 4K 页下需要 4096 个 TLB 条目，远超 L1/L2 TLB 容量，每次访问都要页表遍历；改用 2MB 大页后，同样的矩阵只需 8 个条目，TLB miss 从数亿降到千万级。**大页属于“改动一处、收益立竿见影”一类的优化。**
 
 &emsp;&emsp;GPU 侧的优化思路可以归纳为三条，优先级同样递进：
-- **第一，先用共享内存解决数据复用，再用寄存器分块减少共享内存访问。** GPU 上 naive 内核的瓶颈不在显存带宽，而在 L1/TEX 和 LSU——每个线程独立做完整 K 循环，数据复用为零。共享内存分块把 A、B 子块搬到片上，block 内所有线程在共享内存上反复复用，L1 压力大幅下降。但共享内存分块只解决 A、B 的 L1 访问，每个线程仍然只计算 C 的一个元素，共享内存的读取次数与 FMA 次数之比是 2:1。寄存器分块让每个线程一次计算 `MR × NR` 个 C 元素，在寄存器中维护多个累加器，使每个从共享内存读出的数据被复用 `MR` 或 `NR` 次，共享内存访问降到 `1/MR + 1/NR`。**这两步是 GPU 优化的地基，不做这两步，后面所有优化都无从谈起。** 
-- **第二，用 swizzle 消除 bank conflict，用 L2 block swizzle 减少 DRAM 流量。** 共享内存的 bank conflict 是 GPU 优化中最隐蔽的陷阱。`cp.async` 的 16 字节写入本身会引入 2-way bank conflict，`float4` 读的列访问也可能产生冲突。XOR swizzle 用 `col4 ^ (row & 7)` 把同一相位内的列索引打散到 8 个不同的 bank 桶，冲突消除。L2 block swizzle 则解决另一个问题：默认的 block 调度顺序让同一行的列块连续执行，B 的每个面板要被 32 个行块各读一遍，DRAM 流量被放大 32 倍。把 grid 按 `GROUP = 8` 分组，带内多个行块共享同一个 B 面板，DRAM 读取次数降到 1/8。**这两个 swizzle 都是“不改计算逻辑、只改地址映射”的优化，改动小、风险低、收益明确。** 
-- **第三，用 Tensor Core 换执行单元，用微内核形状调参压榨发射效率。** 前两步做完，CUDA Core 的 FP32 路径已经接近上限。要继续提升，必须换执行单元——用 Tensor Core 的 `mma` 指令，单条完成 16×16×8 的乘加，吞吐远高于 CUDA Core 的 FMA。代价是精度损失：TF32 只有 10-bit 尾数，FP16 更低。如果精度允许，Tensor Core 是数量级的提升；如果精度不允许，就回到 CUDA Core，用**微内核形状调参**压榨发射效率。v9 的 `Compute (SM) Throughput` 92% 看起来饱和，但其中很大一部分是 LSU 和 swizzle 计算在忙碌。把微内核从 `4 × 4` 改成 `4 × 8`，每个 k 步的 FMA 从 16 条增加到 32 条，swizzle 计算按 FMA 摊薄，发射槽留给 FMA，端到端 GFLOPS 提升 34.6%。**当 `Compute (SM) Throughput` 高但 FMA 没有真正饱和时，形状调参比引入新优化手段更有效。**
+- **第一，先用共享内存解决数据复用，再用寄存器分块减少共享内存访问。** GPU 上 naive 内核的瓶颈不在显存带宽，而在 L1/TEX 和 LSU——每个线程独立做完整 K 循环，数据复用为零。共享内存分块把 A、B 子块搬到片上，block 内所有线程在共享内存上反复复用，L1 压力大幅下降。但共享内存分块只解决 A、B 的 L1 访问，每个线程仍然只计算 C 的一个元素，共享内存的读取次数与 FMA 次数之比是 2:1。寄存器分块让每个线程一次计算 `MR × NR` 个 C 元素，在寄存器中维护多个累加器，使每个从共享内存读出的数据被复用 `MR` 或 `NR` 次，共享内存访问降到 `1/MR + 1/NR`。**这两步是 GPU 优化的地基，不做这两步，后面所有优化都无从谈起。**
+- **第二，用 swizzle 消除 bank conflict，用 L2 block swizzle 减少 DRAM 流量。** 共享内存的 bank conflict 是 GPU 优化中最隐蔽的陷阱。`cp.async` 的 16 字节写入本身会引入 2-way bank conflict，`float4` 读的列访问也可能产生冲突。XOR swizzle 用 `col4 ^ (row & 7)` 把同一相位内的列索引打散到 8 个不同的 bank 桶，冲突消除。L2 block swizzle 则解决另一个问题：默认的 block 调度顺序让同一行的列块连续执行，B 的每个面板要被 32 个行块各读一遍，DRAM 流量被放大 32 倍。把 grid 按 `GROUP = 8` 分组，带内多个行块共享同一个 B 面板，DRAM 读取次数降到 1/8。**这两个 swizzle 都是“不改计算逻辑、只改地址映射”的优化，改动小、风险低、收益明确。**
+- **第三，用 Tensor Core 换执行单元，用微内核形状调参提升发射效率。** 前两步做完，CUDA Core 的 FP32 路径已经接近上限。要继续提升，必须换执行单元——用 Tensor Core 的 `mma` 指令，单条完成 16×16×8 的乘加，吞吐远高于 CUDA Core 的 FMA。代价是精度损失：TF32 只有 10-bit 尾数，FP16 更低。如果精度允许，Tensor Core 是数量级的提升；如果精度不允许，就回到 CUDA Core，用**微内核形状调参**提升发射效率。v9 的 `Compute (SM) Throughput` 92% 看起来饱和，但其中很大一部分是 LSU 和 swizzle 计算在忙碌。把微内核从 `4 × 4` 改成 `4 × 8`，每个 k 步的 FMA 从 16 条增加到 32 条，swizzle 计算按 FMA 摊薄，发射槽留给 FMA，端到端 GFLOPS 提升 34.6%。**当 `Compute (SM) Throughput` 高但 FMA 没有真正饱和时，形状调参比引入新优化手段更有效。**
 
-&emsp;&emsp;当解决以上的问题后再通过 perf 查看当前硬件瓶颈，针对性优化。不同硬件的优化思路总是相似的，细节上需要针对具体的硬件进行调整。每次优化之后，都要用性能计数器重新验证瓶颈是否转移——因为优化本身会改变瓶颈的位置。一个在 92% Compute (SM) Throughput 下看起来饱和的内核，可能实际上 FMA 单元只用了 60%，剩下的 32% 是 LSU 和地址计算在忙碌；一次微内核形状调参就能把这部分发射槽释放给 FMA，换来 34.6% 的提升。反过来，一个在 DRAM Throughput 只有 32% 时看起来“访存不是瓶颈”的内核，引入双缓冲反而会因为共享内存翻倍、Occupancy 减半而性能下降 0.8%。瓶颈不是一个静态的标签，而是一个随优化不断移动的目标。 每轮优化后重新采集 perf / ncu 数据，看瓶颈从哪个指标转移到了哪个指标，比记住任何一条固定的优化清单都重要。
+&emsp;&emsp;上述问题解决之后，再通过 perf 观察当前硬件瓶颈，进行针对性优化。不同硬件的优化思路大体相似，细节上则需针对具体硬件调整。每次优化之后，都要用性能计数器重新验证瓶颈是否转移——因为优化本身会改变瓶颈的位置。一个在 92% Compute (SM) Throughput 下看起来饱和的内核，可能实际上 FMA 单元只用了 60%，剩下的 32% 是 LSU 和地址计算在忙碌；一次微内核形状调参就能把这部分发射槽释放给 FMA，换来 34.6% 的提升。反过来，一个在 DRAM Throughput 只有 32% 时看起来“访存不是瓶颈”的内核，引入双缓冲反而会因为共享内存翻倍、Occupancy 减半而性能下降 0.8%。瓶颈不是一个静态的标签，而是一个随优化不断移动的目标。每轮优化后重新采集 perf / ncu 数据，观察瓶颈从哪个指标转移到哪个指标，比记住任何一条固定的优化清单都更重要。
 
 &emsp;&emsp;把两条路径并排看，会发现它们共享同一套底层逻辑，只是手段因硬件而异。CPU 上的优化优先级是：访存模式（循环交换）> 数据复用（分块 + 打包）> 计算效率（寄存器分块 + SIMD）> 并行与地址翻译（多线程 + 大页）。GPU 上的优先级是：数据复用（共享内存 + 寄存器分块）> 地址映射（XOR swizzle + L2 block swizzle）> 执行单元（Tensor Core + 微内核形状调参）。两者的共同点是**先解决访存，再解决计算；先让数据流动高效，再让计算单元饱和**。区别在于 CPU 靠缓存层次和 SIMD 宽度，GPU 靠共享内存、Occupancy 和 Tensor Core。CPU 上 FMA 延迟约 4 周期、双发射，需要 8 条独立链填满流水线；GPU 上 `mma` 指令延迟十几到几十周期、吞吐极高，需要足够多的独立 warp 同时驻留。理解了这个区别，就理解了为什么同样的优化目标需要不同的手段。
 
-&emsp;&emsp;实战中最重要的一条经验是：**优化不是叠加手段，而是解决瓶颈**。v6 的双缓冲失败、v14 的形状调参成功，都是同一个道理的两种表现。双缓冲在 `DRAM Throughput` 只有 32% 时引入，反而因为共享内存翻倍降低了 Occupancy，性能下降 0.8%；形状调参在 `Compute (SM) Throughput` 92% 但 FMA 没饱和时引入，把发射槽从非 FMA 指令中解放出来，性能提升 34.6%。在正确的时机做正确的优化，比反复叠加优化手段更重要。此外，不要跳步：CPU 上单核还在 10 GFLOPS 就去调多线程，12 核只有 50 GFLOPS，因为每个线程的访存模式都是错的；GPU 上共享内存分块还没做对就去调 Tensor Core，`mma` 指令被数据搬运卡住，性能还不如 CUDA Core。**先让单核跑对，再让单核跑快，最后才上并行；先让数据在片上高效流动，再让计算单元高效执行，最后才换执行单元。**
+&emsp;&emsp;实战中最重要的一条经验是：**优化不是叠加手段，而是解决瓶颈**。v6 的双缓冲失败、v14 的形状调参成功，都是同一个道理的两种表现。双缓冲在 `DRAM Throughput` 只有 32% 时引入，反而因为共享内存翻倍降低了 Occupancy，性能下降 0.8%；形状调参在 `Compute (SM) Throughput` 92% 但 FMA 没饱和时引入，把发射槽从非 FMA 指令中解放出来，性能提升 34.6%。在正确的时机做正确的优化，比反复叠加优化手段更重要。此外，不要跳步：CPU 上单核尚处 10 GFLOPS 就去调多线程，12 核也只有 50 GFLOPS，因为每个线程的访存模式仍然低效；GPU 上共享内存分块还没做对就去调 Tensor Core，`mma` 指令被数据搬运卡住，性能还不如 CUDA Core。**先让单核跑对，再让单核跑快，最后才上并行；先让数据在片上高效流动，再让计算单元高效执行，最后才换执行单元。**
 
 &emsp;&emsp;从性能数字看，CPU 侧 2048³ 的 580.37 GFLOPS 已接近 Zen 3 单 CCD 的 FMA 吞吐极限（`fp_reg_file_rsrc_stall` 占 cycles 的 15.2%，FMA 管道利用率接近饱和）；GPU 侧 2048³ 的 2101.31 GFLOPS 超过 cuBLAS，说明在 RTX 3050 上，通过形状调参和 swizzle 优化，CUDA Core 的 FP32 路径仍有潜力可挖。若需进一步提升，CPU 侧需要 AVX-512 或多路 CPU，GPU 侧需要 FP16/BF16 精度、更低层的 `mma` 接口，或更新的架构（Hopper 的 WGMMA、Blackwell 的 tcgen05）。
 
