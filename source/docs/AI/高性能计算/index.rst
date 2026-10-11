@@ -14,4 +14,6 @@
    从pocl理解OpenCL驱动
    GEMM优化：Step by Step
    Swizzle：Bankl Conflict Free
+   分支发散
+   深入理解GPU分支发散：从 SIMT 模型到硬件实现
    
