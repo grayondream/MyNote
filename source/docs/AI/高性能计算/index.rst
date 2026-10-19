@@ -16,4 +16,5 @@
    Swizzle：Bankl Conflict Free
    分支发散
    深入理解GPU分支发散：从 SIMT 模型到硬件实现
+   FlashAttention 完全解析：从 Roofline 诊断到 CUDA 实现
    
