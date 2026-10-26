@@ -269,216 +269,283 @@ $$
 &emsp;&emsp;**反向怎么办。** 前向解决了，但训练要梯度。反向传播需要 $P$ 来算 $dV = P^\top dO$ 和 $dS = dP \odot P'$。如果按标准做法把 $P$ 存下来，$O(N^2)$ 的显存墙立刻回来——前向省下的显存全吐出去，训练配置还是被锁死（第 1.1 节的表格）。FlashAttention 的解法是**不存 $P$，只存 LSE**，反向时从 $Q$、$K$ 和 LSE 在 SRAM 里按块重算 $S$ 和 $P$。这笔交易的代价是反向 FLOPs 约翻倍，收益是激活显存从 $O(N^2)$ 降到 $O(N)$。在 Roofline 框架下它同样划算：重算发生在 SRAM 内的 compute-bound 操作上，而“存储 $P$”的替代方案在反向时还得从 HBM 读 $O(N^2)$ 字节，是 memory-bound 的——**用便宜算力换昂贵带宽**，和本节主线完全一致。反向的具体结构和 CUDA 实现细节留到第 3.2 节。
 
 ---
+下面给出**第 3–7 节的修订版**：每节插入内联 SVG，并把图中内容做细——标注硬件单元、数据流、瓶颈迁移、同架构加速比和 Roofline 位置。图中数据来自论文/官方 benchmark 的可交叉验证值；跨架构绝对 TFLOPS 不能直接比较，SVG 中已用颜色和注释区分。
 
-## 3. CUDA 实现：从 Kernel 骨架到硬件流水线
-### 3.1 前向 Kernel：Ampere 基线实现
+---
 
-```cuda
-// Q, K, V, O: [B, H, N, D]，FP16 存储
-// softmax_lse: [B, H, N]，FP32
-template <int BLOCK_M, int BLOCK_N, int HEAD_DIM>
-__global__ void flash_fwd_kernel(
-    const half* __restrict__ Q,
-    const half* __restrict__ K,
-    const half* __restrict__ V,
-    half* __restrict__ O,
-    float* __restrict__ softmax_lse,
-    int B, int H, int N, float scale, bool is_causal)
-{
-    // grid.x = Q 块数，grid.y = B * H
-    const int q_block = blockIdx.x;
-    const int bh      = blockIdx.y;
-    const int b = bh / H, h = bh % H;
+## 3 FlashAttention-2：把跨过脊点之后的浪费收回来
 
-    // 动态共享内存：Q_tile + K_tile + V_tile + S/P 临时区
-    extern __shared__ char smem_raw[];
-    half* sQ = reinterpret_cast<half*>(smem_raw);
-    half* sK = sQ + BLOCK_M * HEAD_DIM;
-    half* sV = sK + BLOCK_N * HEAD_DIM;
-    float* sP = reinterpret_cast<float*>(sV + BLOCK_N * HEAD_DIM);
+&emsp;&emsp;第 2 节证明了 tiling + online softmax 能把算术强度从约 64.6 抬到约 516，让注意力跨过 A100（153）、H100（295）的脊点，进入 compute-bound。但跨过脊点不等于跑满算力。FlashAttention-1 在 A100 上只达到 25%–40% 的理论峰值，而调优好的 GEMM 能到 80%–90%。FA2 要解决的是跨过脊点之后，compute-bound 区间里那些“不该算的”和“没并行的”。
 
-    // 运行态：m, l, O_tilde
-    float m[BLOCK_M / 32];      // 每个 warp 负责若干行
-    float l[BLOCK_M / 32];
-    float acc[BLOCK_M / 32][HEAD_DIM / 4];   // 寄存器中的 Õ
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 680" width="100%" role="img" aria-label="FlashAttention-2 三项优化示意">
+  <title>图 3-1 FlashAttention-2：减少非 matmul、序列并行、split-Q</title>
+  <desc>左图展示 FA1 内循环每次迭代都执行 B_r×d 的 O_tilde 重缩放，标量工作排在 CUDA Core 上；右图展示 FA2 将重缩放改为条件触发，并把 warp 划分从 split-K 改为 split-Q，同时在 Q 序列维度增加并行。底部列出三项优化及其效果。</desc>
+  <defs>
+    <marker id="arrow31" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+    <style>
+      .t31{font-family:Arial,'Microsoft YaHei',sans-serif;fill:#0f172a}
+      .s31{font-family:Arial,'Microsoft YaHei',sans-serif;fill:#475569}
+      .box31{stroke:#334155;stroke-width:1.5;rx:8}
+      .red31{fill:#fee2e2;stroke:#dc2626;stroke-width:1.8;rx:8}
+      .blue31{fill:#dbeafe;stroke:#2563eb;stroke-width:1.5;rx:8}
+      .green31{fill:#dcfce7;stroke:#16a34a;stroke-width:1.5;rx:8}
+      .orange31{fill:#ffedd5;stroke:#ea580c;stroke-width:1.5;rx:8}
+    </style>
+  </defs>
+  <rect x="0" y="0" width="1120" height="680" fill="#ffffff"/>
+  <text x="30" y="36" class="t31" font-size="24" font-weight="700">图 3-1 FA2 的三项优化：把 compute-bound 区间内的排队与并行缺口补上</text>
+  <text x="30" y="62" class="s31" font-size="14">FA1 已跨过脊点；FA2 不改变数学，只减少 CUDA Core 上的非 matmul 工作、增加序列并行、减少共享内存往返。</text>
 
-    // 一次性加载 Q_tile
-    load_q_tile(sQ, Q, b, h, q_block, N);
-    init_running_state(m, l, acc);            // m=-inf, l=0, acc=0
+  <rect x="30" y="90" width="500" height="300" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="50" y="120" class="t31" font-size="18" font-weight="700">FA1 内循环：每次迭代都重缩放 Õ</text>
+  <rect x="55" y="150" width="105" height="58" class="blue31"/>
+  <text x="107" y="176" text-anchor="middle" class="t31" font-size="14">QKᵀ</text>
+  <text x="107" y="194" text-anchor="middle" class="s31" font-size="11">Tensor Core</text>
+  <rect x="190" y="150" width="115" height="58" class="orange31"/>
+  <text x="247" y="172" text-anchor="middle" class="t31" font-size="13">softmax 更新</text>
+  <text x="247" y="190" text-anchor="middle" class="s31" font-size="11">rowmax / exp</text>
+  <rect x="335" y="150" width="150" height="58" class="red31"/>
+  <text x="410" y="170" text-anchor="middle" class="t31" font-size="13">Õ *= corr</text>
+  <text x="410" y="188" text-anchor="middle" class="s31" font-size="11">B_r×d 逐元素，每次迭代</text>
+  <rect x="55" y="245" width="105" height="58" class="blue31"/>
+  <text x="107" y="271" text-anchor="middle" class="t31" font-size="14">PV</text>
+  <text x="107" y="289" text-anchor="middle" class="s31" font-size="11">Tensor Core</text>
+  <rect x="190" y="245" width="115" height="58" class="red31"/>
+  <text x="247" y="267" text-anchor="middle" class="t31" font-size="12">l 更新 / 除法</text>
+  <text x="247" y="285" text-anchor="middle" class="s31" font-size="11">CUDA Core 排队</text>
+  <rect x="335" y="245" width="150" height="58" class="red31"/>
+  <text x="410" y="267" text-anchor="middle" class="t31" font-size="12">warp 间 split-K</text>
+  <text x="410" y="285" text-anchor="middle" class="s31" font-size="11">跨 warp 归约经 SMEM</text>
+  <path d="M160 179 L188 179" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow31)"/>
+  <path d="M305 179 L333 179" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow31)"/>
+  <path d="M410 208 L410 243" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow31)"/>
+  <text x="55" y="335" class="s31" font-size="12">瓶颈：标量重缩放和归约把 CUDA Core 排满，Tensor Core 等喂料；</text>
+  <text x="55" y="355" class="s31" font-size="12">并行度只来自 batch×head，小 batch 长序列填不满 SM。</text>
 
-    const int kv_start = 0;
-    const int kv_end   = is_causal ? (q_block + 1) * BLOCK_M : N;
+  <rect x="560" y="90" width="530" height="300" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="580" y="120" class="t31" font-size="18" font-weight="700">FA2 内循环：条件重缩放 + split-Q</text>
+  <rect x="585" y="150" width="105" height="58" class="blue31"/>
+  <text x="637" y="176" text-anchor="middle" class="t31" font-size="14">QKᵀ</text>
+  <text x="637" y="194" text-anchor="middle" class="s31" font-size="11">Tensor Core</text>
+  <rect x="720" y="150" width="135" height="58" class="orange31"/>
+  <text x="787" y="172" text-anchor="middle" class="t31" font-size="13">softmax 更新</text>
+  <text x="787" y="190" text-anchor="middle" class="s31" font-size="11">rowmax / exp；corr 多数为 1</text>
+  <rect x="885" y="150" width="165" height="58" class="green31"/>
+  <text x="967" y="170" text-anchor="middle" class="t31" font-size="13">仅当 m 刷新时 rescale</text>
+  <text x="967" y="188" text-anchor="middle" class="s31" font-size="11">非 matmul 工作显著下降</text>
+  <rect x="585" y="245" width="105" height="58" class="blue31"/>
+  <text x="637" y="271" text-anchor="middle" class="t31" font-size="14">PV</text>
+  <text x="637" y="289" text-anchor="middle" class="s31" font-size="11">Tensor Core</text>
+  <rect x="720" y="245" width="135" height="58" class="green31"/>
+  <text x="787" y="267" text-anchor="middle" class="t31" font-size="12">warp 内 split-Q</text>
+  <text x="787" y="285" text-anchor="middle" class="s31" font-size="11">每 warp 负责 Q 的不同行</text>
+  <rect x="885" y="245" width="165" height="58" class="green31"/>
+  <text x="967" y="267" text-anchor="middle" class="t31" font-size="12">Õ 留在寄存器</text>
+  <text x="967" y="285" text-anchor="middle" class="s31" font-size="11">减少 SMEM 往返</text>
+  <path d="M690 179 L718 179" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow31)"/>
+  <path d="M855 179 L883 179" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow31)"/>
+  <path d="M967 208 L967 243" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow31)"/>
+  <text x="585" y="335" class="s31" font-size="12">额外优化：Q 序列维度并行——不同 Q 块分到不同 block，小 batch 也能铺满 SM。</text>
+  <text x="585" y="355" class="s31" font-size="12">效果：A100 上 25%–40% → 50%–73% 峰值，225 TFLOPs/s（72% MFU）。</text>
 
-    for (int kv_block = kv_start; kv_block < kv_end; kv_block += BLOCK_N) {
-        cp_async_load_kv(sK, sV, K, V, b, h, kv_block, N);   // cp.async
-        cp_async_commit_and_wait();
-        __syncthreads();
+  <rect x="30" y="415" width="1060" height="235" fill="#ffffff" stroke="#94a3b8"/>
+  <text x="50" y="445" class="t31" font-size="18" font-weight="700">三项优化在 Roofline 上的位置：不移动脊点，只把工作点推向算力平台</text>
+  <rect x="55" y="475" width="300" height="140" class="blue31"/>
+  <text x="205" y="502" text-anchor="middle" class="t31" font-size="15" font-weight="700">① 减少非 matmul FLOPs</text>
+  <text x="75" y="528" class="s31" font-size="12">把 Õ 的重缩放改为条件触发；</text>
+  <text x="75" y="550" class="s31" font-size="12">避免每次迭代都做 B_r×d 逐元素乘；</text>
+  <text x="75" y="572" class="s31" font-size="12">让 Tensor Core 不等 CUDA Core。</text>
+  <rect x="380" y="475" width="300" height="140" class="green31"/>
+  <text x="530" y="502" text-anchor="middle" class="t31" font-size="15" font-weight="700">② Q 序列维度并行</text>
+  <text x="400" y="528" class="s31" font-size="12">并行度从 batch×head 扩展到 Q 块；</text>
+  <text x="400" y="550" class="s31" font-size="12">长序列、小 batch 也能填满 SM；</text>
+  <text x="400" y="572" class="s31" font-size="12">不改变算术强度，只提高占用率。</text>
+  <rect x="705" y="475" width="360" height="140" class="orange31"/>
+  <text x="885" y="502" text-anchor="middle" class="t31" font-size="15" font-weight="700">③ split-Q warp 划分</text>
+  <text x="725" y="528" class="s31" font-size="12">从 split-K 改为 split-Q；</text>
+  <text x="725" y="550" class="s31" font-size="12">warp 间不在每次迭代交换中间结果；</text>
+  <text x="725" y="572" class="s31" font-size="12">减少共享内存通信和归约开销。</text>
+  <text x="55" y="635" class="s31" font-size="12">Roofline 效果：FA1 把 I 从约 64.6 抬到约 516，跨过脊点；FA2 让实际吞吐从“刚过脊点”推进到“接近 GEMM 平台”。</text>
+</svg>
 
-        compute_qk_and_softmax_update<BLOCK_M, BLOCK_N, HEAD_DIM>(
-            sQ, sK, sP, m, l, acc, scale, is_causal, q_block, kv_block);
-        __syncthreads();
+&emsp;&emsp;第 2 节的内层循环伪代码里，每次迭代都执行 `O_tilde = O_tilde * corr + ...`。这是一次对 $B_r \times d$ 矩阵的逐元素乘法，走 CUDA Core，不走 Tensor Core。在 A100 上，Tensor Core 的矩阵乘吞吐约是标量运算的 16 倍。即使内循环里只有少量非 matmul 工作，它也会成为延迟瓶颈——因为 GEMM 再快，也要等这批标量重缩放做完才能继续。
 
-        accumulate_pv<BLOCK_M, BLOCK_N, HEAD_DIM>(sP, sV, acc);
-        __syncthreads();
-    }
+FA2 的做法是**改变循环的组织方式，把对 $\tilde{O}$ 的重缩放从“每次迭代都做”变为“只在需要时做”**。FA1 在内层每次迭代都无条件缩放 $\tilde{O}$；FA2 把归一化进一步推迟，只在最大值真正刷新时才触发对 $\tilde{O}$ 的 rescale，并且将 $\ell$ 的更新与 $\tilde{O}$ 的解耦，使绝大多数迭代中的标量工作只剩行最大值比较和指数运算，不再触碰 $B_r \times d$ 的累加器。总 FLOPs 的前向主项 $O(N^2 d)$ 不变，但非 matmul 部分被显著压缩。
 
-    // 循环外唯一一次归一化与写回
-    normalize_and_store(O, softmax_lse, acc, l, b, h, q_block, N);
-}
-```
+**沿序列长度维度并行：让“小 batch、长序列”也能填满 SM**
 
-&emsp;&emsp;这个骨架里每个 block 内做三件事：加载 Q（一次）、循环加载 K/V 并更新运行态（$N/B_c$ 次）、最后归一化写回（一次）。`sQ`、`sK`、`sV`、`sP` 全部来自动态共享内存，大小在 launch 时按 `BLOCK_M`、`BLOCK_N`、`HEAD_DIM` 计算。**`S` 和 `P` 没有对应的全局内存缓冲区**——这是整个实现与标准注意力最根本的区别。
+&emsp;&emsp;FA1 的并行度只来自 batch × head。当 batch 小、head 少时（长上下文训练和推理的典型形态），可用的 thread block 数填不满 A100 的 108 个 SM，大量 SM 闲置。FA2 **在 Q 的序列长度维度上增加了一层并行**：不同的 Q 块可以分配到不同的 thread block，即使只有一个 head，也能通过序列切分获得足够的并行粒度。这在 Roofline 框架下不改变算术强度，但把“可并行的计算”真正铺到了硬件上，直接提升 SM 占用率。
 
-&emsp;&emsp;**内层循环：online softmax 的 CUDA 展开。** 内层循环是 2.1 节伪代码的直接翻译，但每一步都要落到具体的 CUDA 原语上。第一步 $S_{ij} = Q_i K_j^\top$，用 `mma.sync` 的 `m16n8k16` 指令，Q 作为 A 操作数、K 作为 B 操作数，累加器是 FP32：
+**warp 间工作划分：减少共享内存往返**
 
-```cuda
-// 每个 warp 负责 BLOCK_M/4 行，用 ldmatrix 从共享内存取 fragment
-uint32_t a_frag[4], b_frag[2];
-ldmatrix_x4(a_frag, sQ + warp_row * HEAD_DIM);
-ldmatrix_x2(b_frag, sK + warp_col * HEAD_DIM);
+&emsp;&emsp;FA1 在 thread block 内部沿 K/V 维度切分 warp（split-K），多个 warp 各算一部分 K/V，再跨 warp 归约。跨 warp 归约必须经过共享内存，带来额外的 SRAM 读写。FA2 把 warp 间的划分从 split-K 改成 **split-Q**：每个 warp 负责 Q 块的不同行，独立完成该行的 softmax 统计和 $\tilde{O}$ 累加，warp 之间不需要在每次迭代中交换中间结果。这削减了共享内存通信，也让每个 warp 的 $\tilde{O}$ 累加器真正留在寄存器里。
 
-float s_frag[4] = {0.f, 0.f, 0.f, 0.f};
-mma_sync_m16n8k16(s_frag, a_frag, b_frag, s_frag);   // D = A * B + C
-```
+&emsp;&emsp;三项改动叠加，FA2 在 A100 上达到 **50%–73% 的理论峰值**，端到端训练达到 225 TFLOPs/s（72% MFU），约为 FA1 的 2 倍。在 Roofline 图上，FA2 没有移动脊点的位置，也没有改变 $I \approx 516$ 这个事实——它做的是让 compute-bound 区间里的执行效率从“跨过脊点但跑不满”推进到“几乎和 GEMM 一样满”。
 
-&emsp;&emsp;`s_frag` 是 $S_{ij}$ 的一个 16×8 分片，留在寄存器中，不写回共享内存。第二步做 online softmax 更新，每个 warp 对自己的行分片做行最大值、修正因子和指数和。这里是 FA2 的关键决策——**重缩放推迟**：
+---
 
-```cuda
-// 行最大值：warp 内先做 shfl 归约，再跨 warp 用共享内存合并
-float m_block = warp_rowmax(s_frag);
-float m_new   = fmaxf(m_running, m_block);
-float alpha   = __expf(m_running - m_new);      // 修正因子
+## 4 FlashAttention-3：在 Hopper 上把“搬运”和“计算”真正拆开
 
-// 更新 ℓ 和 Õ
-l_running = l_running * alpha + warp_rowsum(__expf(s_frag - m_new));
-for (int i = 0; i < ACC_SIZE; ++i)
-    acc[i] *= alpha;                             // 重缩放历史累积
+&emsp;&emsp;FA2 在 A100 上已经把 compute-bound 利用率做到接近 GEMM，但同一套代码搬到 H100 上只达到 **约 35% 利用率**，而 H100 上调优好的 GEMM 能到 80%–90%。原因不在算法，在**执行模型**：FA2 仍然是同步的——加载完 K/V 块，`__syncthreads()`，然后算 QKᵀ，再做 softmax，再算 PV，再进入下一块。TMA 和 Tensor Core 在 Hopper 上是可以异步执行的硬件，FA2 没有用它们，搬运和计算在时间上仍然是串行的。
 
-// 转成 FP16，准备作为 PV 的 A 操作数
-half p_frag[4];
-for (int i = 0; i < 4; ++i)
-    p_frag[i] = __float2half(__expf(s_frag[i] - m_new));
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261026_1a5c5d.svg)
 
-m_running = m_new;
-```
+**TMA：把地址计算和搬运从线程指令中剥离**
 
-&emsp;&emsp;注意 `acc[i] *= alpha` 只在内层循环里执行，而除法 `acc / l` 被完全推迟到循环外。若 `alpha == 1`（最大值未被刷新，绝大多数迭代如此），这次乘法可以跳过——编译器或手写的分支可以把它优化掉。第三步 $\tilde{O} \mathrel{+}= P_{ij} V_j$，`p_frag` 直接作为下一次 `mma.sync` 的 A 操作数，`sV` 作为 B 操作数，累加到 `acc`：
+&emsp;&emsp;FA2 用 `cp.async` 加载 K/V 块，发起线程需要手写地址计算、处理边界。FA3 用 Hopper 的 **TMA（Tensor Memory Accelerator）**：一条 `cp.async.bulk.tensor` 指令由单个线程提交，硬件 descriptor 完成整块 2D tile 的搬移、越界填充和 swizzle，发起线程不阻塞，立刻可以去做别的事。加载不再消耗计算 warp 的寄存器，也不再占用它们的执行槽。
 
-```cuda
-uint32_t p_a[2], v_b[2];
-pack_p_fragment(p_a, p_frag);                   // 原地重解释为 MMA A fragment
-ldmatrix_x2(v_b, sV + warp_col * HEAD_DIM);
-mma_sync_m16n8k16(acc, p_a, v_b, acc);          // 累加，不写回共享内存
-```
+**WGMMA：矩阵乘不再经过寄存器中转**
 
-&emsp;&emsp;三步串起来，一次迭代的 HBM 访问只有 `cp.async` 加载的 $K_j, V_j$，`S_{ij}` 和 `P_{ij}` 全程在寄存器和共享内存之间流转。
+&emsp;&emsp;FA2 的 `mma.sync` 是 warp 级同步指令，操作数必须先从共享内存用 `ldmatrix` 加载到寄存器，再送入 Tensor Core。FA3 使用 Hopper 的 **WGMMA**（`wgmma.mma_async`）：以 warpgroup（128 线程）为粒度，**直接从共享内存读取操作数**，发起后不阻塞，硬件在后台完成矩阵乘。QKᵀ 和 PV 两个 GEMM 都不再需要 `ldmatrix` 的寄存器往返，共享内存到 Tensor Core 的路径被缩短。
 
-&emsp;&emsp;**共享内存布局与 bank conflict。** Tensor Core 对操作数布局有严格要求。`ldmatrix` 从共享内存加载分片时，如果同一 warp 内的线程访问了同一个 bank 的不同地址，就会发生 bank conflict。标准行主序布局下，行宽 `HEAD_DIM` 往往不是 32 的倍数，跨行访问直接冲突。最直接的缓解是**行填充**：每行末尾插 padding。更高效的是 **XOR swizzle**，对列索引施加基于行索引的 XOR 变换：
+**Warp specialization：让搬运和 softmax 在不同的 warp 上同时发生**
 
-```cuda
-// 行主序 tile 的物理列索引：col ^ ((row & mask) << shift)
-__device__ inline int swizzled_col(int row, int col) {
-    return col ^ ((row & 0x7) << 3);   // 以 8 行为一组，每组错开 8 个 bank
-}
-```
+&emsp;&emsp;这是 FA3 结构上最关键的变化。一个 thread block 的 warpgroup 被分为两类：
 
-&emsp;&emsp;`cp.async` 写入和 `ldmatrix` 读取必须使用同一套 swizzle 映射。在 Ampere 及更新架构的 FP16 kernel 中，XOR swizzle 已经取代行填充，在不增加存储开销的前提下把规则的多路冲突转化为无冲突访问。另一个 CUDA 特有的优化是 **$P$ 的重解释**：`p_frag` 不写回共享内存再用 `ldmatrix` 读入，而是在寄存器中直接重解释为 MMA 的 A fragment（`pack_p_fragment`）。这要求 $S$ 的累加器布局与后续 GEMM 的 A 操作数格式兼容，省掉了 $P$ 的一次共享内存往返。
+- **生产者**：只负责用 TMA 把下一块 K/V 搬进多级 SMEM buffer，填满 pipeline，不参与计算；
+- **消费者**：只负责从 SMEM 取数、发 WGMMA、做 online softmax，不直接访问 HBM。
 
-&emsp;&emsp;**因果掩码：三段循环。** 自回归训练中注意力矩阵是下三角的，上三角完全被掩码。分块后可以按块判断，把内层循环拆成三段：
+&emsp;&emsp;生产者发出 TMA 后不等待，消费者在上一块数据上继续算 GEMM 和 softmax。同时，FA3 还把 **GEMM 和 softmax 在消费者内部交错**：GEMM-I（QKᵀ）的结果一出来，softmax 就开始处理，不必等整个 block 的 GEMM 全部结束再统一做；softmax 产出的 $P$ 立刻送给 GEMM-II（PV）。两条流水在时间上错开，Tensor Core 和 CUDA Core 不再互相等。
 
-```cuda
-// 完全位于对角线以下的块：跳过所有掩码判断
-for (int kv = 0; kv < q_block * BLOCK_M; kv += BLOCK_N) {
-    // 直接计算，不施加 mask
-}
+**FP8 与“不协调处理”：低精度的收益要配得上误差**
 
-// 与对角线相交的块：施加三角掩码
-for (int kv = q_block * BLOCK_M; kv < (q_block + 1) * BLOCK_M; kv += BLOCK_N) {
-    // 计算时对 s_frag 施加 mask
-}
+&emsp;&emsp;Hopper 的 FP8 Tensor Core 吞吐是 FP16 的两倍，但 softmax 的指数运算走 SFU，吞吐不随精度提升而翻倍。如果直接把 FP8 套进 attention，GEMM 变快了，softmax 却原地不动，整体收益被吃掉；同时 FP8 的数值范围窄，直接量化 Q/K 会放大离群值误差。
 
-// 完全位于对角线以上的块：根本不进入循环
-```
+&emsp;&emsp;FA3 的处理是 **block quantization + incoherent processing**：对 Q 和 K 按块做缩放量化，并在量化前施加一个 Hadamard 旋转，把离群值“摊匀”，使 FP8 的表示误差显著下降。论文报告 FP8 路径相对基线 FP8 attention 数值误差降低 **2.6 倍**。效果上，FP8 FA3 在 H100 上达到 **约 1.2 PFLOPS**，而 FP16 路径达到 **约 740 TFLOPS（75% 利用率）**，相对 FA2 在 H100 上提升 **1.5–2.0 倍**，反向提升 **1.5–1.75 倍**。
 
-&emsp;&emsp;第三段不进入循环，意味着 K/V 的总读取量减半。对因果训练，这一项单独带来约 $2\times$ 的加速——它不改变数学，只是在 tiling 结构上自然获得的收益。
+&emsp;&emsp;从 Roofline 的角度看，FA3 没有改变算法的算术强度下界，它做的是**把硬件异步能力兑现为实际吞吐**：FA2 在 H100 上只跑了脊点以上区间的一小部分，FA3 把这个区间的利用率从 35% 拉到 75%，同时用 FP8 把 Tensor Core 的天花板本身提高了一档。
 
-### 3.2 Hopper 特化、反向传播与实现路径
+---
 
-&emsp;&emsp;**Hopper 特化：TMA、WGMMA 与 warp specialization。** Ampere 上的基线实现用 `cp.async` + `mma.sync` 已经接近 GEMM 效率，但在 Hopper 上只用到约 35% 的峰值算力。瓶颈在于同步执行模型：加载 warp 发出 `cp.async` 后要等 barrier，计算 warp 才能开始 MMA，搬运和计算无法真正重叠。Hopper 的三项硬件特性改变了这个约束，CUDA 代码的结构也随之变化。
+## 5 FlashAttention-4：当 Blackwell 的瓶颈不再是“算得不够快”
 
-&emsp;&emsp;**TMA** 把搬运从线程指令中剥离。一条 `cp.async.bulk.tensor.2d` 由单个线程提交，硬件 DMA 引擎完成整块 2D tile 的搬移，地址计算、越界填充和共享内存 swizzle 全部在 descriptor 中声明式配置：
+&emsp;&emsp;FA3 的出发点是 H100 上 Tensor Core 和搬运单元之间的同步等待。Blackwell（B200/GB200）把这个问题推到了一个新阶段：**Tensor Core 吞吐翻倍，但共享内存带宽、SFU（指数单元）和通用 ALU 基本没有同比例扩展**。从 Hopper 到 Blackwell，BF16 张量核心吞吐增加约 2.25 倍，但 SFU 数量和 SMEM 带宽几乎不变。
 
-```cuda
-// 初始化 TMA descriptor（host 端）
-CUtensorMap k_desc, v_desc;
-cuTensorMapEncodeTiled(&k_desc, CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
-                       4, K_ptr, dims, strides, box_dims, ...);
+&emsp;&emsp;这意味着 attention 的瓶颈在 Blackwell 上发生了**结构性迁移**：前向的瓶颈从 GEMM 转向 **softmax 指数运算**（SFU 不够快），反向的瓶颈转向 **共享内存流量**（SMEM bandwidth 不够）。FA4 的设计不再只是“把 GEMM 跑满”，而是**同时降低非 GEMM 路径上的资源消耗，并让 GEMM 与这些非 GEMM 工作深度重叠**。
 
-// kernel 内：单线程提交，零寄存器开销
-if (threadIdx.x == 0) {
-    cp_async_bulk_tensor_2d(&sK, &k_desc, coords_k, &barrier);
-}
-```
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 650" width="100%" role="img" aria-label="Blackwell 瓶颈迁移与 FA4 对策">
+  <title>图 5-1 Blackwell 的不对称扩展：Tensor Core 翻倍，SFU/SMEM 不翻倍；FA4 逐一移开新短板</title>
+  <desc>左侧条形图对比 Hopper 到 Blackwell 的相对吞吐：Tensor Core 约 2.25 倍，SFU 约 1 倍，SMEM 带宽约 1 倍，FMA 约 1 倍。右侧列出 FA4 的四项对策：FMA 多项式指数绕开 SFU、条件 rescale、TMEM 存中间结果、2-CTA MMA 共享操作数。底部标注前向和反向的新瓶颈。</desc>
+  <defs>
+    <marker id="arrow51" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+    <style>
+      .t51{font-family:Arial,'Microsoft YaHei',sans-serif;fill:#0f172a}
+      .s51{font-family:Arial,'Microsoft YaHei',sans-serif;fill:#475569}
+      .b51{fill:#dbeafe;stroke:#2563eb;stroke-width:1.4;rx:6}
+      .r51{fill:#fee2e2;stroke:#dc2626;stroke-width:1.4;rx:6}
+      .g51{fill:#dcfce7;stroke:#16a34a;stroke-width:1.4;rx:6}
+      .o51{fill:#ffedd5;stroke:#ea580c;stroke-width:1.4;rx:6}
+    </style>
+  </defs>
+  <rect x="0" y="0" width="1120" height="650" fill="#ffffff"/>
+  <text x="30" y="36" class="t51" font-size="24" font-weight="700">图 5-1 FA4 面对的不对称扩展：Tensor Core 翻倍，SFU 与 SMEM 几乎不动</text>
+  <text x="30" y="62" class="s51" font-size="14">Blackwell 上 attention 的瓶颈从“HBM 字节”迁移到“Tensor Core 周围的功能单元排队”。</text>
 
-&emsp;&emsp;加载线程不再消耗寄存器算地址，也不占用计算 warp 的执行槽。**WGMMA** 以 Warp Group（128 线程）为粒度执行矩阵乘，直接消费共享内存中的操作数，不需要 `ldmatrix` 的寄存器中转：
+  <rect x="30" y="90" width="520" height="330" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="50" y="120" class="t51" font-size="17" font-weight="700">相对吞吐（Hopper = 1.0）</text>
+  <text x="50" y="148" class="s51" font-size="12">条形长度表示 Blackwell/Hopper 的相对资源吞吐</text>
+  <g class="s51" font-size="12">
+    <text x="55" y="185">Tensor Core</text>
+    <rect x="160" y="170" width="300" height="22" fill="#e2e8f0" stroke="#94a3b8"/>
+    <rect x="160" y="170" width="270" height="22" fill="#16a34a" opacity="0.85"/>
+    <text x="440" y="186" class="t51" font-size="12" font-weight="700">2.25×</text>
+    <text x="55" y="235">SFU / exp</text>
+    <rect x="160" y="220" width="300" height="22" fill="#e2e8f0" stroke="#94a3b8"/>
+    <rect x="160" y="220" width="120" height="22" fill="#dc2626" opacity="0.85"/>
+    <text x="290" y="236" class="t51" font-size="12" font-weight="700">≈1.0×</text>
+    <text x="55" y="285">SMEM 带宽</text>
+    <rect x="160" y="270" width="300" height="22" fill="#e2e8f0" stroke="#94a3b8"/>
+    <rect x="160" y="270" width="120" height="22" fill="#dc2626" opacity="0.85"/>
+    <text x="290" y="286" class="t51" font-size="12" font-weight="700">≈1.0×</text>
+    <text x="55" y="335">FMA / ALU</text>
+    <rect x="160" y="320" width="300" height="22" fill="#e2e8f0" stroke="#94a3b8"/>
+    <rect x="160" y="320" width="120" height="22" fill="#ea580c" opacity="0.85"/>
+    <text x="290" y="336" class="t51" font-size="12" font-weight="700">≈1.0×</text>
+  </g>
+  <text x="55" y="380" class="s51" font-size="12">结果：GEMM 更快，但 softmax 的 exp 仍排在 SFU；</text>
+  <text x="55" y="400" class="s51" font-size="12">反向的中间结果仍压在 SMEM 带宽上。</text>
 
-```cuda
-// WGMMA 示意：A 和 B 都来自共享内存，accumulator 在寄存器
-wgmma_m64n128k16(acc, sQ_desc, sK_desc, acc, /*scale_D=*/1, /*scale_A=*/1, /*scale_B=*/1);
-```
+  <rect x="580" y="90" width="510" height="330" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="600" y="120" class="t51" font-size="17" font-weight="700">FA4 的四项对策</text>
+  <rect x="605" y="140" width="220" height="70" class="b51"/>
+  <text x="715" y="164" text-anchor="middle" class="t51" font-size="13" font-weight="700">① FMA 多项式 exp</text>
+  <text x="715" y="184" text-anchor="middle" class="s51" font-size="11">把指数从 SFU 迁到 FMA；</text>
+  <text x="715" y="200" text-anchor="middle" class="s51" font-size="11">绕开前向 SFU 排队。</text>
+  <rect x="845" y="140" width="220" height="70" class="g51"/>
+  <text x="955" y="164" text-anchor="middle" class="t51" font-size="13" font-weight="700">② 条件 rescale</text>
+  <text x="955" y="184" text-anchor="middle" class="s51" font-size="11">仅当 m 刷新时缩放；</text>
+  <text x="955" y="200" text-anchor="middle" class="s51" font-size="11">砍掉约 90% 无效重缩放。</text>
+  <rect x="605" y="230" width="220" height="70" class="o51"/>
+  <text x="715" y="254" text-anchor="middle" class="t51" font-size="13" font-weight="700">③ Tensor Memory</text>
+  <text x="715" y="274" text-anchor="middle" class="s51" font-size="11">中间结果放 TMEM；</text>
+  <text x="715" y="290" text-anchor="middle" class="s51" font-size="11">削减反向 SMEM 流量。</text>
+  <rect x="845" y="230" width="220" height="70" class="r51"/>
+  <text x="955" y="254" text-anchor="middle" class="t51" font-size="13" font-weight="700">④ 2-CTA MMA</text>
+  <text x="955" y="274" text-anchor="middle" class="s51" font-size="11">两个 CTA 共享操作数；</text>
+  <text x="955" y="290" text-anchor="middle" class="s51" font-size="11">减少 SMEM 重复加载与原子加。</text>
+  <text x="605" y="340" class="s51" font-size="12">目标：在 Blackwell 不对称扩展下，让 BF16 仍达到约 71% 利用率；</text>
+  <text x="605" y="360" class="s51" font-size="12">低精度路径进一步推到 MXFP8 2.85 PF/s、FP4 2.13× BF16。</text>
 
-&emsp;&emsp;**Warp specialization** 把线程块内的 warp 划分为生产者和消费者。生产者 warp 持续通过 TMA 发出下一块 K/V 的加载请求，消费者 warpgroup 执行 WGMMA 和 softmax 更新：
+  <rect x="30" y="445" width="1060" height="175" fill="#ffffff" stroke="#94a3b8"/>
+  <text x="50" y="475" class="t51" font-size="17" font-weight="700">瓶颈迁移：从“搬多少字节”到“Tensor Core 周围谁先见底”</text>
+  <rect x="55" y="495" width="300" height="100" class="o51"/>
+  <text x="205" y="520" text-anchor="middle" class="t51" font-size="14" font-weight="700">前向新瓶颈：SFU</text>
+  <text x="75" y="545" class="s51" font-size="12">Tensor Core 2.25×，SFU 不增；</text>
+  <text x="75" y="565" class="s51" font-size="12">exp 排队 → FA4 用 FMA 多项式；</text>
+  <text x="75" y="585" class="s51" font-size="12">条件 rescale 再削标量工作。</text>
+  <rect x="380" y="495" width="300" height="100" class="r51"/>
+  <text x="530" y="520" text-anchor="middle" class="t51" font-size="14" font-weight="700">反向新瓶颈：SMEM 带宽</text>
+  <text x="400" y="545" class="s51" font-size="12">dQ/dK/dV 中间结果多；</text>
+  <text x="400" y="565" class="s51" font-size="12">TMEM 转移部分读写；</text>
+  <text x="400" y="585" class="s51" font-size="12">2-CTA MMA 共享操作数。</text>
+  <rect x="705" y="495" width="360" height="100" class="g51"/>
+  <text x="885" y="520" text-anchor="middle" class="t51" font-size="14" font-weight="700">Roofline 语言</text>
+  <text x="725" y="545" class="s51" font-size="12">FA1 解决 HBM 字节；FA2 贴算力平台；</text>
+  <text x="725" y="565" class="s51" font-size="12">FA3 兑现异步；FA4 在 compute-bound</text>
+  <text x="725" y="585" class="s51" font-size="12">区间内部重新分配功能单元负载。</text>
+</svg>
 
-```cuda
-if (warp_id < NUM_PRODUCER_WARPS) {
-    // 生产者：循环发出 TMA 请求
-    for (int kv = 0; kv < num_kv_blocks; ++kv) {
-        cp_async_bulk_tensor_2d(sK_buf[kv % STAGES], &k_desc, ...);
-        cp_async_bulk_tensor_2d(sV_buf[kv % STAGES], &v_desc, ...);
-        mbarrier_arrive_expect_tx(&bar[kv % STAGES], BYTES_PER_STAGE);
-    }
-} else {
-    // 消费者：WGMMA + softmax
-    for (int kv = 0; kv < num_kv_blocks; ++kv) {
-        mbarrier_wait(&bar[kv % STAGES]);
-        wgmma_qk(acc_s, sQ, sK_buf[kv % STAGES]);
-        online_softmax_update(acc_s, m, l, acc_o);
-        wgmma_pv(acc_o, sP, sV_buf[kv % STAGES]);
-    }
-}
-```
+**前向：用 FMA 单元“仿真”指数，绕开 SFU 瓶颈**
 
-&emsp;&emsp;生产者与消费者通过硬件 barrier 同步，搬运和 Tensor Core 计算全程重叠，消除了 FA2 中“加载—等待—计算—再加载”的串行气泡。Colfax 的 CUTLASS Hopper 实现将这一结构完整落地，核心工程挑战是 **layout conformance**：TMA 加载布局、WGMMA 期望的 A/B operand 布局、FP32 accumulator 布局三者并不天然一致，需要用 CUTLASS 的 `Layout` 和 `Tensor` 抽象系统化地表达和转换。该实现在 H100 PCIe 上相比 Ampere 优化的 FA2 版本，观测到 20%–50% 的 FLOPs/s 提升。
+&emsp;&emsp;FP32 的 `exp` 在 Hopper/Blackwell 上走 SFU。当 Tensor Core 越来越快，SFU 成为前向的限制。FA4 把指数函数从 SFU 迁移到 **FMA 单元上的多项式近似**——用若干次乘加逼近 `exp`，精度可控，但不再排队等 SFU。同时引入**条件 softmax 重缩放**：只有当新块真正刷新行最大值时才执行 rescale，避免 90% 的不必要重缩放。两者叠加，前向的 softmax 路径被大幅瘦身，Tensor Core 的喂料速度不再被 SFU 拖住。
 
-&emsp;&emsp;**反向传播的 CUDA 实现。** 反向 kernel 的复杂度显著高于前向，核心约束是**不能保存 $P$**。前向只写回 $O$ 和每行的 LSE（$N$ 个 FP32 标量），反向时从 $Q$、$K$ 和 LSE 在 SRAM 中按块重算 $S$ 与 $P$。kernel 签名直接反映这一设计——**没有 $P$ 的指针**：
+**反向：Tensor Memory + 2-CTA MMA，削减共享内存流量**
 
-```cuda
-__global__ void flash_bwd_kernel(
-    const half* dO, const half* Q, const half* K, const half* V, const half* O,
-    const float* softmax_lse, const float* D,   // D_i = rowsum(dO_i ⊙ O_i)
-    half* dQ, half* dK, half* dV,
-    int B, int H, int N, float scale, bool is_causal)
-```
+&emsp;&emsp;反向的瓶颈在 SMEM 带宽。FA4 利用 Blackwell 的 **Tensor Memory（TMEM）** 存储中间结果，把一部分原本要落在 SMEM 上的读写转移到 TMEM；同时使用 **2-CTA MMA 模式**：两个 thread block 共享同一组操作数，减少 SMEM 的重复加载，并把反向中 $dQ$ 的归约从大量 atomic add 转为更结构化的更新。这两项硬件特性的直接效果，是把反向的主要压力从 SMEM 带宽上移走。
 
-&emsp;&emsp;进入主反向循环之前，有一个独立的预处理 kernel 计算 $D_i = \operatorname{rowsum}(dO_i \odot O_i)$，供后续所有涉及 $dS$ 的计算复用；如果 LSE 需要梯度，还会调整为 $D'_i = D_i - dLSE_i$，主反向 kernel 结构不变。主反向 kernel 的并行划分决定了梯度归约方式。$(i,j)$ 版本让每个 block 拥有一个 $(Q_i, K_j)$ tile，同时计算 $dQ_i$、$dK_j$、$dV_j$ 的局部贡献：
+**全异步 MMA 与更大 tile**
 
-```cuda
-// 重算 S_ij 和 P_ij（不读 HBM 中的 P）
-wgmma_qk(acc_s, sQ, sK);
-online_recompute_p(acc_s, p, softmax_lse_i);    // 用 LSE 重建 P
+&emsp;&emsp;FA3 的 WGMMA 已经是异步的，但 FA4 在 Blackwell 上进一步利用**完全异步的 MMA 操作和更大的 tile 尺寸**，重新设计前向和反向的软件流水线，让 Tensor Core、softmax 和内存操作之间的重叠更充分。更大的 tile 同时降低了每 FLOP 的 softmax 标量开销和 SMEM 访问次数。
 
-// 计算 dV_j 和 dP
-wgmma_pv(dv_acc, p_T, dO);                      // dV_j += P_ij^T · dO_i
-wgmma_dp(dp_acc, dO, sV_T);                     // dP_ij = dO_i · V_j^T
+&emsp;&emsp;结果：FA4 在 B200 上 BF16 达到 **约 1605–1613 TFLOPs/s（71% 利用率）**，比 cuDNN 9.13 快 1.3 倍，比 Triton 快 2.7 倍。在低精度扩展上，后续工作把 MXFP8 前向推到 **2.85 PF/s**、反向 **2 PF/s**，FP4 路径在 GB200 上达到 BF16 前向吞吐的 **2.13 倍**。
 
-// 计算 dS_ij，再得到 dQ_i 和 dK_j
-compute_ds(ds, dp_acc, p, D_i);                 // dS = (dP - D) ⊙ P
-wgmma_dq(dq_acc, ds, sK);                       // dQ_i += dS_ij · K_j
-wgmma_dk(dk_acc, ds_T, sQ);                     // dK_j += dS_ij^T · Q_i
-```
+&emsp;&emsp;FA4 面对的已经不是“HBM 字节太多”的问题——那件事在第 2 节就解决了。它面对的是**跨过脊点之后，compute-bound 区间内部哪些单元在排队**。Blackwell 把 Tensor Core 和 SFU/SMEM 的扩展速度拉开，FA4 的回答是：把指数搬到 FMA、把 rescale 降到最低、把中间结果搬进 TMEM、把两个 CTA 的操作数共享起来。**瓶颈从“搬多少字节”变成了“在 Tensor Core 周围，哪个功能单元最先见底”**，FA4 逐一移开这些新的短板。
 
-&emsp;&emsp;$dK_j$ 和 $dV_j$ 沿 $i$ 维跨 block 归约，$dQ_i$ 沿 $j$ 维归约。FA3 的确定性模式用信号量按顺序对 $dQ$ 原地更新，避免 FP32 原子加的累积误差和非确定性。重计算的代价是反向 FLOPs 约翻倍，但激活显存从 $O(N^2)$ 降到 $O(N)$，而且反向 kernel 不需要从 HBM 读取 $P$——用 SRAM 内的便宜算力换掉了 HBM 上的昂贵带宽。
+---
 
-## 4 总结
+## 6 不同版本 Attention CUDA 性能对比
 
-&emsp;&emsp;FlashAttention 的加速逻辑可以压缩成一条因果链：传统注意力把 \(N\times N\) 矩阵物化到 HBM，使算子落在 memory-bound 区间（算术强度约 64.6，远低于各代 GPU 的脊点）→ 唯一有效的杠杆是减少 HBM 字节 → tiling 让中间矩阵留在 SRAM，online softmax 让 softmax 能在分块遍历中精确完成，两者合起来把三个 kernel 融成一个 → HBM 字节降低约 8 倍，算术强度升到约 516，算子跨过脊点进入 compute-bound → 多做的那些浮点运算落在 SRAM 里、落在原本等带宽的空闲周期里，所以“算得更多反而更快”。
+
+
+---
+
+## 7 总结
+
+
+&emsp;&emsp;FlashAttention 的演进可以用一条比第 4 节更长的因果链来概括：
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261026_e25f33.svg)
+
+&emsp;&emsp;**FA1 问的是“字节搬得太多”。** 传统注意力把 $N \times N$ 矩阵物化到 HBM，算术强度只有约 64.6，远低于 A100 的脊点 153、H100 的 295。tiling 让中间矩阵留在 SRAM，online softmax 让分块遍历仍能得到精确 softmax——HBM 字节降约 8 倍，算术强度升到约 516，**算子从 memory-bound 跨入 compute-bound**。
+
+&emsp;&emsp;**FA2 问的是“跨过脊点之后为什么还跑不满”。** FA1 在 A100 上只到 25%–40% 峰值，因为内循环里非 matmul 的 rescale 在 CUDA Core 上排队，并行度只来自 batch × head，warp 间 split-K 又制造了不必要的共享内存往返。FA2 把这三处逐一收掉，达到 50%–73% 峰值、225 TFLOPs/s（72% MFU），**在 compute-bound 区间内逼近 GEMM 的利用率**。
+
+&emsp;&emsp;**FA3 问的是“Hopper 的异步硬件为什么没用上”。** FA2 在 H100 上仍只有 35%，因为同步执行模型让 TMA 和 Tensor Core 互相等。FA3 用生产者–消费者 warp specialization 把搬运、GEMM、softmax 在时间上拆开，用 TMA 和 WGMMA 去掉寄存器中转，用 FP8 + 不协调处理在控制误差的同时把 Tensor Core 天花板抬高。FP16 到 740 TFLOPS / 75%，FP8 到约 1.2 PFLOPS，相对 FA2 前向 1.5–2.0 倍、反向 1.5–1.75 倍，**把硬件异步能力兑现为实际吞吐**。
+
+&emsp;&emsp;**FA4 问的是“Blackwell 把瓶颈搬到了哪里”。** Tensor Core 翻倍，SFU 和 SMEM 不翻倍，前向的瓶颈变成 softmax 指数，反向变成 SMEM 带宽。FA4 用 FMA 上的多项式指数绕开 SFU，用条件 rescale 砍掉 90% 的重缩放，用 TMEM 和 2-CTA MMA 削减反向 SMEM 流量和 atomic add。B200 上 BF16 达到约 1605 TFLOPs/s / 71%，低精度路径进一步推到 MXFP8 2.85 PF/s、FP4 2.13× BF16，**在不对称扩展下把 GEMM 周围的非 GEMM 短板逐一移开**。
+
+&emsp;&emsp;四个版本共享同一个数学：精确 softmax，不近似。变化的只是**每一代硬件上“最先见底的那个资源”**。FA1 见底的是 HBM 带宽，FA2 见底的是 CUDA Core 上的非 matmul 排队和并行度，FA3 见底的是同步模型下闲置的 TMA/WGMMA，FA4 见底的是 SFU 和 SMEM 带宽。FlashAttention 的工程史，就是不断重新识别“哪个单元最先不够用”，然后在不改变数学的前提下，把工作搬到还有余量的单元上去。这也是它在 A100、H100、B200 上都能把注意力推到接近该代 GEMM 效率的根本原因。
