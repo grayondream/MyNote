@@ -221,7 +221,6 @@ for i in range(N // B_r):                    # 外层：遍历 Q 块
 
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/flash_attention_2026-10-17.svg)
 
-
 &emsp;&emsp;**状态压缩：为什么存 LSE 而不是 $(m,\ell)$。** 前向结束后，反向传播需要知道每个 Q 行的 softmax 基准，才能重算 $P$。直接存 $(m, \ell)$ 每行要 2 个 FP32 标量；FlashAttention 改存**对数域归一化常数**：
 
 $$
@@ -267,9 +266,6 @@ $$
 &emsp;&emsp;**因果掩码是白送的额外收益。** 自回归训练里注意力矩阵是下三角的，上三角完全被掩码。分块后可以按块判断：完全位于对角线以下的块，跳过掩码判断直接算；完全位于对角线以上的块，**根本不进入内层循环**。后者让 K/V 的总读取量减半，IO 复杂度里的 $N^2$ 项直接砍掉一半，前向实际耗时也相应下降——这是在 tiling 结构上自然得到的，不需要额外的算法设计。
 
 &emsp;&emsp;**反向怎么办。** 前向解决了，但训练要梯度。反向传播需要 $P$ 来算 $dV = P^\top dO$ 和 $dS = dP \odot P'$。如果按标准做法把 $P$ 存下来，$O(N^2)$ 的显存墙立刻回来——前向省下的显存全吐出去，训练配置还是被锁死（第 1.1 节的表格）。FlashAttention 的解法是**不存 $P$，只存 LSE**，反向时从 $Q$、$K$ 和 LSE 在 SRAM 里按块重算 $S$ 和 $P$。这笔交易的代价是反向 FLOPs 约翻倍，收益是激活显存从 $O(N^2)$ 降到 $O(N)$。在 Roofline 框架下它同样划算：重算发生在 SRAM 内的 compute-bound 操作上，而“存储 $P$”的替代方案在反向时还得从 HBM 读 $O(N^2)$ 字节，是 memory-bound 的——**用便宜算力换昂贵带宽**，和本节主线完全一致。反向的具体结构和 CUDA 实现细节留到第 3.2 节。
-
----
-下面给出**第 3–7 节的修订版**：每节插入内联 SVG，并把图中内容做细——标注硬件单元、数据流、瓶颈迁移、同架构加速比和 Roofline 位置。图中数据来自论文/官方 benchmark 的可交叉验证值；跨架构绝对 TFLOPS 不能直接比较，SVG 中已用颜色和注释区分。
 
 ---
 
@@ -527,9 +523,56 @@ FA2 的做法是**改变循环的组织方式，把对 $\tilde{O}$ 的重缩放�
 
 ---
 
-## 6 不同版本 Attention CUDA 性能对比
+## 6 fa1 → fa5 在 RTX 3050 上的实测
+
+### 6.1 实验设置：一张 sm_86 小卡 vs 五个不同靶场的版本
+
+&emsp;&emsp;RTX 3050（sm_86，20 SM）：FP16 Tensor Core 峰值约 18 TFLOPS，显存带宽 224 GB/s，脊点 $I_{\text{ridge}} \approx 80$ FLOPs/byte。8 个配置（B4H8/B1H1/B2H4，N=1024–4096，D=32/64/128，含 causal），FP16 输入输出、FP32 累积。
+
+&emsp;&emsp;**关键在于每个版本的设计靶场不同：**
+
+| 版本 | 设计靶场 | 依赖的关键特性 | 3050（sm_86） |
+|---|---|---|---|
+| **fa1** | Ampere | `__syncthreads` + 手写 FMA | ✅ 原样可跑 |
+| **fa2** | Ampere | `cp.async` 双缓冲 | ✅ 可跑 |
+| **fa3** | **Hopper** | **TMA + WGMMA + warp specialization** | ❌ 退回 wmma |
+| **fa4** | Ampere 化 FA3 | 多级流水线 + 条件 rescale | ⚠️ 仅 rescale 兑现 |
+| **fa5** | Ampere 化 FA4 | Split-KV | ✅ 可跑（纯软件调度） |
+
+&emsp;&emsp;fa3 的两大杠杆 TMA（`cp.async.bulk.tensor`）和 WGMMA（`wgmma.mma_async`）都是 sm_90+ 指令，在 sm_86 上**不存在**，只能退回 `wmma::mma_sync` + 同步加载。**3050 上跑出来的 fa3，只是它 Hopper 版本的退化版。**
+
+### 6.2 实测
 
 
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/flash_attention_latency_by_shape.svg)
+
+&emsp;&emsp;**整条 fa1→fa5 只有 1.6–2.7×，且几乎全部来自 fa2→fa3 这一跳。** 逐跳拆：
+
+&emsp;&emsp;**① fa1 vs fa2：双缓冲没赢。** fa1 在 5/8 配置上更快（6.91 vs 7.35）。原因：fa1 的 $B_c=64$、fa2 的 $B_c=32$，内层循环次数翻倍，per-tile 固定开销翻倍；更关键的是**算/存比太低**——D=64 的 tile 读入约 70 ns，FMA 点积约 300–400 ns，算/存比 ~5，`cp.async` 只是把"等"从 `__syncthreads` 挪到了 `cp_async_wait`，重叠窗口太窄。唯一兑现的是 D=128（12.82 vs 14.73，快 13%），算/存比 ~10 才刚好覆盖延迟。
+
+&emsp;&emsp;**② fa2→fa3：2–3×，唯一能拿到的"代差"。** 一次 `mma.m16n16k16` 顶约 256 次标量 FMA，`QKᵀ` 和 `PV` 都走 Tensor Core，CUDA Core 从点积里解放。但 3050 上 MFU 只有 **7.3%**——这 7.3% 是 wmma 在这张卡的天花板，与 fa3 算法设计无关。**TMA 和 WGMMA 在 sm_86 上根本不存在，fa3 真正杀伤力部分完全作废**。
+
+&emsp;&emsp;**③ fa3→fa4→fa5：边际收益不到 15%。** fa3→fa4 的收益几乎全来自**条件 rescale**（跳过 90% 无效 `wmma::store/load`），多级流水线本身几乎不贡献——没有 TMA，Stage 增加只是把等待堆在队列里。fa4→fa5 的 split-KV 是纯软件调度、不依赖硬件，**是唯一能拿到"设计意图 100%"的版本**，但只在并行度不足时兑现：
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/flash_attention_tflops_by_shape.svg)
+
+&emsp;&emsp;**另外两件与硬件无关的收益完整兑现**：因果掩码在分块结构上自然拿到 2 倍（fa1–fa5 满/因果比全部 0.46–0.52）；split-KV 在 B1H1 这类低并行场景拿 15–20%。
+
+### 6.3 结论
+
+| 版本 | 3050 上实际兑现 | 丢掉的 |
+|---|---|---|
+| **fa1** | ✅ 100% | 无 |
+| **fa2** | ⚠️ 双缓冲仅 D=128 兑现 | 算/存比太低 |
+| **fa3** | ⚠️ 只拿到 wmma（~7% MFU） | **TMA + WGMMA 完全作废** |
+| **fa4** | ⚠️ 条件 rescale 兑现，流水线无效 | 没有 TMA，Stage 无意义 |
+| **fa5** | ✅ split-KV 完整兑现（低并行时） | 无 |
+
+&emsp;&emsp;**3050 上 fa1→fa5 只拿到 1.6–2.7×**，几乎全部来自 fa2→fa3（FMA → Tensor Core），其余版本边际收益 < 15%。这不是实现问题，是**硬件规格与设计靶场错配**。
+
+&emsp;&emsp;**fa3 是"最亏"的版本。** 核心创新 TMA 和 WGMMA 是 Hopper 专属（sm_90+），sm_86 上无法编译成目标指令，只能退回 wmma。**3050 上看到的"fa3 加速"不是 FA3 的加速，是 wmma 的加速**——FA3 论文在 H100 上报告的 1.5–2.0× 是 TMA/WGMMA 兑现后的结果，和这里完全是两笔账。
+
+&emsp;&emsp;**能完整兑现的只有三件与架构解耦的事**：Tensor Core 化（wmma 这一档）、因果掩码、split-KV（低并行时）。这恰好印证前五节的核心论点——FA 系列的收益从来不是"算法更聪明"，而是"把每代 GPU 上最先见底的那个资源挪开"。3050 上最先见底的是 FMA 吞吐，所以 fa3 那跳最猛；3050 上没有 Hopper 的异步单元，fa4 的多级流水线就打水漂。**要突破 wmma 的 7% MFU 天花板，路径不是更多版本，而是换硬件**——这正是 FA3/FA4 的 1.5–2× 和 71% MFU 都只在 H100/B200 上报告的原因。
 
 ---
 
@@ -548,4 +591,4 @@ FA2 的做法是**改变循环的组织方式，把对 $\tilde{O}$ 的重缩放�
 
 &emsp;&emsp;**FA4 问的是“Blackwell 把瓶颈搬到了哪里”。** Tensor Core 翻倍，SFU 和 SMEM 不翻倍，前向的瓶颈变成 softmax 指数，反向变成 SMEM 带宽。FA4 用 FMA 上的多项式指数绕开 SFU，用条件 rescale 砍掉 90% 的重缩放，用 TMEM 和 2-CTA MMA 削减反向 SMEM 流量和 atomic add。B200 上 BF16 达到约 1605 TFLOPs/s / 71%，低精度路径进一步推到 MXFP8 2.85 PF/s、FP4 2.13× BF16，**在不对称扩展下把 GEMM 周围的非 GEMM 短板逐一移开**。
 
-&emsp;&emsp;四个版本共享同一个数学：精确 softmax，不近似。变化的只是**每一代硬件上“最先见底的那个资源”**。FA1 见底的是 HBM 带宽，FA2 见底的是 CUDA Core 上的非 matmul 排队和并行度，FA3 见底的是同步模型下闲置的 TMA/WGMMA，FA4 见底的是 SFU 和 SMEM 带宽。FlashAttention 的工程史，就是不断重新识别“哪个单元最先不够用”，然后在不改变数学的前提下，把工作搬到还有余量的单元上去。这也是它在 A100、H100、B200 上都能把注意力推到接近该代 GEMM 效率的根本原因。
+&emsp;&emsp;四个版本共享同一个数学：精确 softmax，不近似。变化的只是**每一代硬件上“最先见底的那个资源”**。FA1 见底的是 HBM 带宽，FA2 见底的是 CUDA Core 上的非 matmul 排队和并行度，FA3 见底的是同步模型下闲置的 TMA/WGMMA，FA4 见底的是 SFU 和 SMEM 带宽。FlashAttention 的工程史，就是不断重新识别“哪个单元最先不够用”，然后在不改变数学的前提下，把工作搬到还有余量的单元上去。总的来说优化思路还是GEMM优化那一套。
