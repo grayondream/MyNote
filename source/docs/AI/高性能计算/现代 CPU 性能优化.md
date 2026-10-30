@@ -7,55 +7,148 @@
 
 &emsp;&emsp;先做两个实验。
 
-&emsp;&emsp;**实验 A**：写一个求和循环，累加到一个 `long` 局部变量中并打印。保持逻辑不变，仅将数组起始地址对齐到 64 字节边界，重新编译。
+### 1.1 分配对齐
+
+&emsp;&emsp;**实验 A**：写一个求和循环，累加到一个 `long` 局部变量中并打印。保持代码完全相同，只改变数组起始地址的对齐方式——一个用 `malloc` 默认分配（通常 16 字节对齐），另一个用 `posix_memalign` 强制 64 字节对齐。
 
 ```c
-long sum_v1(const int *a, size_t n) {
+// 两个版本调用完全相同的求和函数
+__attribute__((noinline))
+long sum_loop(const int *a, size_t n) {
     long s = 0;
     for (size_t i = 0; i < n; i++) s += a[i];
     return s;
 }
-// 版本 2 完全相同，仅调用侧 posix_memalign((void**)&buf, 64, n*sizeof(int));
+// v1: malloc(n * sizeof(int))              → base % 64 = 16
+// v2: posix_memalign(&p, 64, n * sizeof(int)) → base % 64 = 0
 ```
 
-&emsp;&emsp;在 5600X 上，两个版本的差异可能远小于你的预期——对齐本身不是“优化”，只是一个需要被测量验证的假设。
+&emsp;&emsp;直觉上，64 字节对齐应该更快——向量化后的 32B load 不会跨缓存行。在 5600X 上用 `clang++-22 -O2 -march=znver3` 编译，三种工作集大小各跑一轮，得到的数据却比直觉复杂得多：
 
-&emsp;&emsp;**实验 B**：两个线程各递增一个 `long` 计数器，不加填充，运行 1 亿次。
+**表 1 · 单次测量（首次运行）**
+
+| 场景 | 工作集 | v1 median | v2 median | 表面差异 |
+|---|---|---|---|---|
+| L2 驻留 | 512 KB × 10000 扫描 | 55.14 ms | 64.66 ms | **v2 慢 17%** |
+| L3 驻留 | 2 MB × 2000 扫描 | 48.00 ms | 48.17 ms | 几乎相同 |
+| DRAM | 256 MB × 1 扫描 | 10.75 ms | 10.33 ms | v2 快 4% |
+
+&emsp;&emsp;L2 场景的 17% 差异看起来足以支撑“对齐有害”或“对齐有益”的任何叙事。但把同样的 v1/v2 交替跑三轮，结果变了：
+
+**表 2 · 交替测量（每轮 v1 后 v2，共三轮）**
+
+| 轮次 | v1 median | v2 median | 差异 |
+|---|---|---|---|
+| Round 1 | 55.62 ms | 56.54 ms | v1 快 1.6% |
+| Round 2 | 55.74 ms | 56.55 ms | v1 快 1.5% |
+| Round 3 | 55.07 ms | 49.72 ms | v2 快 9.7% |
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261030_b944d9.svg)
+
+&emsp;&emsp;**交替测量后，前两轮 v1/v2 的差异缩到 1.5%，第三轮 v2 反而快 9.7%。没有出现任何方向一致的系统性差异。** 单次测量看到的 17% 在交替测量里消失了——它不是对齐的效果，而是 **v2 首次运行时 CPU 尚未进入热稳态、Precision Boost 频率还在爬升**，以及 `posix_memalign` 分配到的那一组物理页恰好对 L2 set 冲突更不友好。第三轮的 9.7% 方向反转，是物理页抽奖的另一次结果。
+
+&emsp;&emsp;这个实验的真正价值不在“对齐到底有没有用”，而在于它展示了**优化经验失效的两种典型方式**：
+- **把混杂变量误读为优化效果**。单次测量的 17% 差异不是对齐造成的，而是“v2 先跑 + 频率未稳 + 物理页随机”三者叠加的结果。如果把这次单次测量当成结论，就会得出“对齐有害”或“对齐有益”的相反叙事——两者都是错的。
+- **忽略微架构的并行化能力**。Zen 3 的 L1D 把跨 64B 行的 32B load 拆成两个 32B 操作后**并行发出**，16B 偏移完全在硬件并行化能吸收的范围内。只有跨 4K 页边界时 split load 才会产生真正昂贵的串行惩罚。**对齐不是“通用优化”，而是一个需要被测量验证的假设**——它在某些微架构上、某些访问模式下有效，在另一些条件下完全被 L2/L3/DRAM 的供给延迟掩盖。
+
+### 1.2 缓存行填充
+
+&emsp;&emsp;**实验 B**：两个线程各递增一个 `long` 计数器，不加填充，运行 1 亿次。v1 的 `a` 和 `b` 位于同一条 64B 缓存行内，v2 用 `alignas(64)` 把两者分隔到各自独占的缓存行。
 
 ```c
-struct counters_bad  { long a; long b; };          // 同一 64B 行
+struct counters_bad  { long a; long b; };                 // 同一 64B 行
 struct counters_good { alignas(64) long a; alignas(64) long b; };
+
+// 两个线程各自对 a、b 做 n 次递增，每次递增后插入 asm volatile 屏障，
+// 阻止编译器把连续的 ++ 合并成 += n——保持真实的"读-改-写"节奏。
+static void worker(long *p, long n, std::atomic<int> &ready, std::atomic<int> &go) {
+    ready.fetch_add(1, std::memory_order_release);
+    while (go.load(std::memory_order_acquire) == 0) {}
+    for (long i = 0; i < n; i++) {
+        (*p)++;
+        __asm__ __volatile__("" : "+m"(*p) : : "memory");
+    }
+}
 ```
 
-&emsp;&emsp;`perf stat -e cache-misses,cache-references` 显示缓存未命中率超过 15%。加一行 `alignas(64)`，吞吐量翻倍。改动不触及任何算法或数据结构语义。
+&emsp;&emsp;用 `taskset -c 0,1` 绑定到两个不同物理核，`clang++-22 -O2 -march=znver3` 编译。这次的数据与实验 A 完全相反：**方向一致、幅度巨大、机制可解释**。
 
+**表 3 · 裸跑 1 亿次/线程（每线程 1 亿，总计 2 亿次递增）**
+
+| 指标 | v1（伪共享） | v2（填充） | 比值 |
+|---|---|---|---|
+| median | 653.108 ms | 23.894 ms | **27.3×** |
+| min | 580.816 ms | 21.964 ms | 26.4× |
+| 每次递增耗时 | 3.27 ns | 0.12 ns | — |
+| 每秒递增数 | 306 M/s | 8.37 G/s | — |
+
+&emsp;&emsp;`0.12 ns/inc` 对应 5600X 在 boost 频率下每周期约 1.8 次递增——两个核心并行推进各自的私有缓存行，每个核心每周期约 0.9 次 `inc [mem]`。**v2 的时间已经触及 Zen 3 的 L1D 吞吐上限**，再优化布局也压不下去。
+
+<svg width="760" height="270" viewBox="0 0 760 270" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
+  <rect x="8" y="8" width="744" height="254" fill="#fafafa" stroke="#ccc" rx="6"/>
+  <text x="30" y="34" font-size="13" font-weight="bold" fill="#333">实验 B：伪共享把每次递增拖到 27 倍</text>
+  <line x1="70" y1="225" x2="720" y2="225" stroke="#333"/>
+  <line x1="70" y1="225" x2="70" y2="70" stroke="#333"/>
+  <rect x="160" y="80" width="120" height="145" fill="#c62828"/>
+  <rect x="420" y="219" width="120" height="6" fill="#2e7d32"/>
+  <text x="180" y="72" font-size="13" font-weight="bold" fill="#c62828">653 ms</text>
+  <text x="185" y="212" font-size="11" fill="#fff" font-weight="bold">3.27 ns/inc</text>
+  <text x="440" y="212" font-size="11" fill="#2e7d32" font-weight="bold">23.9 ms</text>
+  <text x="440" y="72" font-size="13" font-weight="bold" fill="#2e7d32">0.12 ns/inc</text>
+  <text x="190" y="245" font-size="11" fill="#333" font-weight="bold">v1 伪共享</text>
+  <text x="450" y="245" font-size="11" fill="#333" font-weight="bold">v2 填充</text>
+  <line x1="290" y1="150" x2="410" y2="150" stroke="#888" stroke-width="2"/>
+  <polygon points="410,150 400,144 400,156" fill="#888"/>
+  <text x="310" y="140" font-size="12" font-weight="bold" fill="#888">27.3×</text>
+  <text x="20" y="150" font-size="10" fill="#555" transform="rotate(-90 20,150)">时间</text>
+</svg>
+
+&emsp;&emsp;v1 的 5 次运行时间序列还揭示了一个细节：696.782 → 683.002 → 653.108 → 580.816 → 596.956，下降 16.7% 后又反弹。这不是噪声，是 **MESI 状态在收敛**。首次运行时缓存行在 Invalid 与 Modified 之间反复迁移；后续运行中两个核心的访问节奏逐渐稳定，一致性协议的开销落入更规则的模式。**这种"越跑越快"的模式本身就是伪共享的一个指纹**——真实的计算瓶颈不会因为重复运行而改变，只有协议状态机才会。
+
+&emsp;&emsp;时间差已经足够说服人，但要看**机制**，用 `perf stat` 把 1 亿次缩到 1 千万次（保证 perf 的采样开销不扭曲结果）：
+
+**表 4 · perf stat，每线程 1 千万次**
+
+| 指标 | v1（伪共享） | v2（填充） | 比值 |
+|---|---|---|---|
+| cache-references | **2,940,541** | **373,345** | **7.9×** |
+| cache-misses | 2,542,736 | 115,114 | 22.1× |
+| miss rate | **86.5%** | 30.8% | — |
+| cycles | 476,428,214 | 71,192,368 | 6.7× |
+| instructions | 196,487,676 | 198,807,570 | 1.01× |
+| **CPI** | **2.42** | **0.358** | **6.8×** |
+
+&emsp;&emsp;两版本的 `instructions` 几乎相同（差 1.2%）——编译器生成的代码没有本质差异。`cycles` 相差 6.7 倍，**所有性能差异都来自"等待"**。
+
+<svg width="760" height="290" viewBox="0 0 760 290" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
+  <rect x="8" y="8" width="744" height="274" fill="#fafafa" stroke="#ccc" rx="6"/>
+  <text x="30" y="34" font-size="13" font-weight="bold" fill="#333">PMU 指纹：v1 的缓存引用次数膨胀 7.9 倍，CPI 升到 2.42</text>
+  <text x="30" y="62" font-size="11" font-weight="bold" fill="#333">cache-references（相对 v2 归一化）</text>
+  <rect x="220" y="70" width="440" height="30" fill="#c62828"/>
+  <text x="228" y="90" font-size="11" fill="#fff" font-weight="bold">v1: 2.94M  （每次 inc 触发 0.147 次 RFO）</text>
+  <rect x="220" y="110" width="56" height="30" fill="#2e7d32"/>
+  <text x="286" y="130" font-size="11" fill="#2e7d32" font-weight="bold">v2: 373K</text>
+  <text x="30" y="168" font-size="11" font-weight="bold" fill="#333">CPI（cycles / instructions）</text>
+  <rect x="220" y="176" width="440" height="30" fill="#c62828"/>
+  <text x="228" y="196" font-size="11" fill="#fff" font-weight="bold">v1: 2.42</text>
+  <rect x="220" y="216" width="65" height="30" fill="#2e7d32"/>
+  <text x="295" y="236" font-size="11" fill="#2e7d32" font-weight="bold">v2: 0.358</text>
+  <text x="30" y="270" font-size="10" fill="#666">instructions 几乎相同（196M vs 199M），差异全在等待缓存行所有权迁移</text>
+</svg>
+
+&emsp;&emsp;**真正解释性能差异的是 `cache-references` 的绝对数，而不是 miss rate**。v1 每次递增平均产生 **0.147 次 L2/LLC 引用**——这正是 MESI 协议的行为：核心 0 写 `a` 时，向 L2/LLC 发出 RFO 请求把包含 `a`、`b` 的整条缓存行从核心 1 抢过来；核心 1 随后写 `b` 时再反向抢一次。**每一次写操作触发一次跨核一致性事务。** v2 每次递增平均只产生 **0.019 次引用**——`inc` 在本核 L1D 命中已拥有的缓存行，不产生跨核流量。
+
+&emsp;&emsp;**v2 的 miss rate 仍有 30.8%，看起来"也不健康"——但它的引用基数只有 373K，每次 miss 又落在 L2/L3 命中，实际代价几乎为零。** 这是本章最需要记住的反直觉点：**miss rate 本身不能用于诊断，要看 miss 的绝对数、代价以及它发生在哪个缓存层级。** 只看 miss rate 会得出"v2 也不健康"的错误结论，而真正的瓶颈是 v1 的引用次数膨胀。CPI 从 0.358 升到 2.42 的全部增量，来自流水线槽位在等待缓存行所有权迁移——**退休指令数没变，槽位被一致性协议的等待消耗了**。这与 Top-Down 的预测完全吻合：v1 的瓶颈会落在 Backend Bound → Memory Bound，而不是 Frontend Bound 或 Bad Speculation。
+
+### 1.3 结论
+&emsp;&emsp;实验 A 和实验 B 合起来，构成了"优化经验为何失效"的两个典型。
+- **实验 A**：看起来该有效的对齐优化（求和数组起始地址），在 Zen 3 上被 L1D 并行化能力 + L2/DRAM 供给延迟完全掩盖，交替测量后无系统性差异。
+- **实验 B**：看起来只是"数据结构布局"的改动（`alignas(64)`），把每次递增从 3.27 ns 降到 0.12 ns，27 倍加速，方向可复现、机制可解释。两者的差别不在改动大小，而在于**改动是否触及了当前瓶颈所在的微架构机制**——实验 A 的 16B 偏移落在 L1D 能并行吸收的范围内；实验 B 的布局改动直接改变了 MESI 协议的行为，缓存行所有权迁移是真实的、可测量的、7.9 倍的引用膨胀。
+
+&emsp;&emsp;**"优化经验"之所以经常错，就是因为它默认"对齐有用""数据布局有用"这些结论可跨场景迁移，而测量一次次在告诉你它们不可迁移。** 判断一个改动是否有效，必须看它是否触及了当前瓶颈所在的微架构机制；而判断"触及了哪个机制"的唯一可靠方式，是带对照、交替、重复的测量加 PMU 事件计数，而不是一次运行的时间差。
 &emsp;&emsp;这两个实验指向同一个结论：**现代 CPU 的性能不由“执行了多少条指令”决定，而由“每个周期提供的流水线槽位（pipeline slot）如何被消耗”决定**。Bakhvalov 在 *Performance Analysis and Tuning on Modern CPUs*（下称 perf-book）中将这一视角系统化为 Top-Down Microarchitecture Analysis Methodology（TMA）：它不要求开发者预先掌握所有 PMU 事件的语义，就能把瓶颈路由到前端、后端、错误推测或退休四个互斥类别之一。
 
-<svg width="760" height="230" viewBox="0 0 760 230" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
-  <rect x="8" y="8" width="744" height="214" fill="#fafafa" stroke="#ccc" rx="6"/>
-  <text x="30" y="35" font-size="13" font-weight="bold" fill="#333">一个周期内 6 个流水线槽位的四种去向</text>
-  <g transform="translate(30,55)">
-    <rect x="0" y="0" width="68" height="42" fill="#4caf50" stroke="#2e7d32" stroke-width="1.5"/>
-    <rect x="78" y="0" width="68" height="42" fill="#4caf50" stroke="#2e7d32" stroke-width="1.5"/>
-    <rect x="156" y="0" width="68" height="42" fill="#ff9800" stroke="#e65100" stroke-width="1.5"/>
-    <rect x="234" y="0" width="68" height="42" fill="#f44336" stroke="#b71c1c" stroke-width="1.5"/>
-    <rect x="312" y="0" width="68" height="42" fill="#f44336" stroke="#b71c1c" stroke-width="1.5"/>
-    <rect x="390" y="0" width="68" height="42" fill="#9e9e9e" stroke="#616161" stroke-width="1.5"/>
-    <text x="14" y="27" font-size="10" fill="#fff" font-weight="bold">Retire</text>
-    <text x="92" y="27" font-size="10" fill="#fff" font-weight="bold">Retire</text>
-    <text x="164" y="27" font-size="10" fill="#fff" font-weight="bold">Bad Spec</text>
-    <text x="242" y="27" font-size="10" fill="#fff" font-weight="bold">FE Bound</text>
-    <text x="320" y="27" font-size="10" fill="#fff" font-weight="bold">BE Bound</text>
-    <text x="405" y="27" font-size="10" fill="#fff" font-weight="bold">空闲</text>
-  </g>
-  <g transform="translate(30,130)">
-    <rect x="0" y="0" width="12" height="12" fill="#4caf50"/><text x="18" y="11" font-size="10" fill="#333">Retiring</text>
-    <rect x="90" y="0" width="12" height="12" fill="#ff9800"/><text x="108" y="11" font-size="10" fill="#333">Bad Speculation</text>
-    <rect x="220" y="0" width="12" height="12" fill="#f44336"/><text x="238" y="11" font-size="10" fill="#333">FE / BE Bound</text>
-    <rect x="350" y="0" width="12" height="12" fill="#9e9e9e"/><text x="368" y="11" font-size="10" fill="#333">核心提供的槽位</text>
-  </g>
-  <text x="30" y="200" font-size="10" fill="#666">TMA 把这 6 个槽位的去向互斥地归入四类；总和即 Level 1 百分比。</text>
-</svg>
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261030_376e7f.svg)
 
 &emsp;&emsp;本文的目标不是罗列优化技巧，而是建立一条可复现的闭环：**先做实验，再看 PMU 输出，然后解释微架构机制，最后用重新测量来验证假设**。所有命令、代码、事件名都以 AMD Ryzen 5 5600X 为实验环境给出——它是 Zen 3 架构、6 核 12 线程、单 CCD、32MB 统一 L3，Linux perf 对其有较完整的 vendor event 支持，适合作为“把方法论落到具体机器上”的样本。
 
