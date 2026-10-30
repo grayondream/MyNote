@@ -155,7 +155,7 @@ static void worker(long *p, long n, std::atomic<int> &ready, std::atomic<int> &g
 
 ## 2. 测量的第一课：基准在测量微架构状态，而不是“计算量”
 
-### 2.1 频率不是常量
+## 2.1 频率不是常量，但漂移幅度取决于负载
 
 &emsp;&emsp;连续运行同一个 CPU 密集型循环 5 次，中间不插入其他负载。
 
@@ -165,27 +165,76 @@ for i in 1 2 3 4 5; do
 done
 ```
 
-&emsp;&emsp;5600X 的基础频率 3.7 GHz，最大 boost 4.6 GHz，TDP 65W，默认 PPT 约 76W。Precision Boost 在温度较低时会推高短时频率，温度上升后回落。第一次运行可能快于后续，不是“缓存冷了”，而是频率在漂移。
+&emsp;&emsp;5600X 的基础频率 3.7 GHz，最大 boost 4.6 GHz，TDP 65W，默认 PPT 约 76W。直觉上，“第一次运行快、后续运行慢”应该来自缓存预热或频率漂移。但在 `amd-pstate-epp` 驱动下，**频率是否漂移、漂移多少，取决于 governor 的 EPP 设置和负载功耗是否逼近 PPT/温度墙**。用 `freq_drift` 逐次读取 `scaling_cur_freq`，四种条件下的数据如下：
 
-<svg width="760" height="235" viewBox="0 0 760 235" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
-  <rect x="8" y="8" width="744" height="219" fill="#fafafa" stroke="#ccc" rx="6"/>
-  <text x="30" y="32" font-size="12" font-weight="bold" fill="#333">持续负载下的频率—功耗—温度耦合</text>
-  <line x1="55" y1="190" x2="715" y2="190" stroke="#333"/>
-  <line x1="55" y1="190" x2="55" y2="45" stroke="#333"/>
-  <polyline points="55,68 135,71 215,84 295,102 375,115 455,122 535,125 615,126 695,126" fill="none" stroke="#1565c0" stroke-width="3.5"/>
-  <polyline points="55,152 135,142 215,126 295,112 375,104 455,100 535,99 615,99 695,99" fill="none" stroke="#ef6c00" stroke-width="3" stroke-dasharray="7,4"/>
-  <line x1="55" y1="108" x2="715" y2="108" stroke="#c62828" stroke-width="1.5" stroke-dasharray="4,4"/>
-  <text x="60" y="103" font-size="10" fill="#c62828">▲ 温度墙 / PPT</text>
-  <text x="590" y="118" font-size="10" fill="#1565c0" font-weight="bold">频率</text>
-  <text x="590" y="92" font-size="10" fill="#ef6c00" font-weight="bold">功耗</text>
-  <circle cx="135" cy="71" r="4" fill="#1565c0"/><circle cx="135" cy="142" r="4" fill="#ef6c00"/>
-  <text x="105" y="215" font-size="10" fill="#555">冷启动</text>
-  <text x="560" y="215" font-size="10" fill="#555">热稳态</text>
-  <line x1="135" y1="190" x2="135" y2="195" stroke="#999"/><line x1="600" y1="190" x2="600" y2="195" stroke="#999"/>
-  <text x="20" y="125" font-size="10" fill="#555" transform="rotate(-90 20,125)">GHz / W</text>
+**表 2-1 · 四种条件下的频率与耗时**
+
+| 条件 | 频率 | ns/iter | 单次耗时 | 相对 baseline |
+|---|---|---|---|---|
+| `powersave` EPP，单核 | 4099 MHz | 1.47 | 293.7 ms | **+13.4%** |
+| `performance` EPP，单核 | 4649 MHz | 1.29 | 258.9 ms | baseline |
+| `performance` + 5 核 stress-ng，61.8°C | 4600 MHz | 1.31 | 261.3 ms | +0.9% |
+| `performance` + 更重负载 | 4550 MHz | 1.32 | 263.9 ms | +1.9% |
+
+<svg width="760" height="280" viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
+  <rect x="8" y="8" width="744" height="264" fill="#fafafa" stroke="#ccc" rx="6"/>
+  <text x="30" y="34" font-size="13" font-weight="bold" fill="#333">表 2-1 的可视化：时间与频率严格成反比</text>
+  <line x1="80" y1="225" x2="720" y2="225" stroke="#333"/>
+  <line x1="80" y1="225" x2="80" y2="60" stroke="#333"/>
+  <text x="20" y="145" font-size="10" fill="#555" transform="rotate(-90 20,145)">相对 baseline</text>
+  <text x="360" y="260" font-size="10" fill="#555">条件 →</text>
+  <g transform="translate(120,0)">
+    <rect x="0" y="100" width="36" height="125" fill="#c62828"/>
+    <rect x="44" y="216" width="36" height="9" fill="#1565c0"/>
+    <text x="0" y="94" font-size="10" fill="#c62828" font-weight="bold">+13.4%</text>
+    <text x="48" y="210" font-size="10" fill="#1565c0" font-weight="bold">4099</text>
+    <text x="4" y="245" font-size="10" fill="#333">powersave</text>
+  </g>
+  <g transform="translate(290,0)">
+    <rect x="0" y="218" width="36" height="7" fill="#c62828"/>
+    <rect x="44" y="210" width="36" height="15" fill="#1565c0"/>
+    <text x="0" y="210" font-size="10" fill="#c62828" font-weight="bold">基准</text>
+    <text x="48" y="204" font-size="10" fill="#1565c0" font-weight="bold">4649</text>
+    <text x="0" y="245" font-size="10" fill="#333">perf</text>
+  </g>
+  <g transform="translate(460,0)">
+    <rect x="0" y="212" width="36" height="13" fill="#c62828"/>
+    <rect x="44" y="211" width="36" height="14" fill="#1565c0"/>
+    <text x="0" y="206" font-size="10" fill="#c62828" font-weight="bold">+0.9%</text>
+    <text x="48" y="205" font-size="10" fill="#1565c0" font-weight="bold">4600</text>
+    <text x="0" y="245" font-size="10" fill="#333">+5核 62°C</text>
+  </g>
+  <g transform="translate(630,0)">
+    <rect x="0" y="208" width="36" height="17" fill="#c62828"/>
+    <rect x="44" y="209" width="36" height="16" fill="#1565c0"/>
+    <text x="0" y="202" font-size="10" fill="#c62828" font-weight="bold">+1.9%</text>
+    <text x="48" y="203" font-size="10" fill="#1565c0" font-weight="bold">4550</text>
+    <text x="0" y="245" font-size="10" fill="#333">+重负载</text>
+  </g>
+  <g transform="translate(500,40)">
+    <rect x="0" y="0" width="12" height="12" fill="#c62828"/>
+    <text x="18" y="11" font-size="10" fill="#333">耗时</text>
+    <rect x="70" y="0" width="12" height="12" fill="#1565c0"/>
+    <text x="88" y="11" font-size="10" fill="#333">频率（相对值）</text>
+  </g>
 </svg>
 
-&emsp;&emsp;这意味着：**任何不控制热状态的微基准比较，都是在比较两个不同频率下的运行结果**。`cycles` 本身会“吸收”频率变化，使得 CPI 看起来正常而实际吞吐已经下降。稳健的做法是同时采集 `cycles`、`instructions` 和 `aperf/mperf`，用 `mperf/aperf` 的比值判断频率是否偏离了 TSC 基准。
+&emsp;&emsp;**时间比与频率比严格一致**：powersave vs performance 是 1.134 倍时间、1.134 倍频率；5 核负载 vs baseline 是 1.009 倍时间、1.010 倍频率；重负载 vs baseline 是 1.019 倍时间、1.021 倍频率。三者都落在 0.5% 的误差内。这说明 `freq_drift` 的循环在四种条件下执行的是**完全相同的指令流**，**时间差异 100% 由频率解释**，没有任何缓存、分支或代码生成的混杂因素。`scaling_cur_freq` 读数与执行速度严格成比例，可以作为微基准频率条件的可靠锚点。
+
+&emsp;&emsp;但四种条件揭示了**频率漂移并不是一个固定幅度的噪音源**：
+
+- **EPP 切换造成 13.4% 的差异**——这是四种条件中最大的单一变量。`powersave` 下 5 次运行波动 < 0.02%，`performance` 下 5 次运行波动 < 0.06%——两者各自都“非常稳定”，但前者稳定在 4099 MHz，后者稳定在 4649 MHz。**稳定性不等于正确性**：`powersave` 下测出的 293.7 ms 是一个高度可重复的数字，但它不代表代码在不受 EPP 压制时的真实性能。
+- **5 核 stress-ng 只造成 0.9% 的差异**——温度 61.8°C，远低于 5600X 的 Tjmax（95°C）。Precision Boost 的频率退档通常从 75–80°C 才开始明显，61.8°C 意味着散热系统还有 15–20°C 的余量，CPU 完全没有理由大幅降频。频率在 4599–4643 MHz 之间小幅抖动（不是单调下降），反映的是 Precision Boost 在功耗预算内做的微调，不是热降频。
+- **更重负载造成 1.9% 的差异**——频率在 4549–4574 MHz 之间抖动（0.5% 的范围），仍然没有出现单调下降的趋势。这说明即便功耗更接近 PPT 限制，在良好散热下，频率也只是在更高 boost 频率附近小幅调整，而不是断崖式退档。
+
+>实际上用手机芯片测试更容易遇到温度墙，PC机器的CPU需要长时间高负载任务才容易触发温度墙。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261030_c063d1.svg)
+
+&emsp;&emsp;这意味着：**“频率漂移”不是一个可以笼统假设的噪音源，而是一个需要被测量的条件变量**。漂移的幅度取决于**负载功耗是否逼近 PPT/温度墙**：单核 30–40W 时温度稳定在 60°C 以下，boost 不降；5 核 55–65W 时温度到 61.8°C，boost 只微降 1%；只有把功耗推到 76W 或温度推到 80°C+，漂移才会进入 5–10% 量级。
+
+&emsp;&emsp;**`cycles` 本身会“吸收”频率变化**，使得 CPI 看起来正常而实际吞吐已经下降——powersave 下 `cycles / instructions` 可能和 performance 下几乎相同，因为 `cycles` 是按频率计数的，频率降了，`cycles` 计数也按比例变少了。稳健的做法是同时采集 `cycles`、`instructions` 和 `aperf/mperf`，用 `mperf/aperf` 的比值判断频率是否偏离了 TSC 基准；同时在实验记录中明确标注 **EPP 设置、governor、后台负载和温度**——这四项是解释任何跨运行时间差异的前提。在 5600X 上做微基准比较之前，先做两件事：**把 EPP 固定为 `performance`，并在实验记录中记下当前温度**。前者消除了 13.4% 量级的配置差异，后者界定了当前条件下频率漂移的幅度上限。
+
 
 ### 2.2 被编译器消除的基准比“测不准”更危险
 
