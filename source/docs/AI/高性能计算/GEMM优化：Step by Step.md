@@ -106,9 +106,9 @@ $$
 I=\frac{\text{FLOP}}{\text{Byte}}
 $$
 
-    对 GEMM，运算量为 $2MNK$。若只考虑 DRAM 流量，至少需要读取 A、B 并写回 C，数据量约为 $4(MK+KN+MN)$ 字节。方阵 $M=N=K=n$ 时，$I_{\text{DRAM}}\approx 2n^3/[4(3n^2)]=n/6$。随着 n 增大，算术强度线性增长。
+&emsp;&emsp;对 GEMM，运算量为 $2MNK$。若只考虑 DRAM 流量，至少需要读取 A、B 并写回 C，数据量约为 $4(MK+KN+MN)$ 字节。方阵 $M=N=K=n$ 时，$I_{\text{DRAM}}\approx 2n^3/[4(3n^2)]=n/6$。随着 n 增大，算术强度线性增长。
+&emsp;&emsp;Roofline 模型给出性能上界：
 
-    Roofline 模型给出性能上界：
 $$
 P\le \min(P_{\text{peak}}, I\cdot BW)
 $$
