@@ -488,53 +488,320 @@ taskset -c 2 sudo perf stat -e cycles -e ls_mab_alloc.load_store_allocations \
 
 ## 5. 前端双路径：解码器、Op Cache 与 dispatch
 
-### 5.1 做：Op Cache 驻留率与代码足迹
+&emsp;&emsp;第 4 章的 v4 已经展示了 512 STEP 展开时 Op Cache 溢出（84.1% miss）。但 84.1% 只是一个数据点——它不能回答“Op Cache 的边界在哪里”，也不能回答“溢出之后，前端是否真的成为瓶颈”。本章用五个 STEP 展开版本画出从完全命中到完全溢出的完整梯度。
 
-&emsp;&emsp;**做**：取一个前端瓶颈微基准（密集小循环、大量 taken branch），采集 `op_cache_hit_miss` 和 `de_dis_cops_from_decoder`。
+&emsp;&emsp;**实验设计**。五个版本共用同一个 STEP 宏（`a*3+1`、`b*5+2`、`c*7+3`，三次异或、三次移位），每个 STEP 约 14 条 macro-op，三条独立链（`a`、`b`、`c`）各自的依赖链约 6 cycles 延迟。唯一的变量是外层循环体内 STEP 的展开次数：
 
-```bash
-perf stat -e cycles,instructions,branches,branch-misses,\
-          op_cache_hit_miss,de_dis_cops_from_decoder ./branch_bench
+```c
+// 一次 STEP 约 14 条 macro-op，三条独立链，无跨 STEP 代数合并空间
+#define STEP(a,b,c) do { \
+    a = a * 3 + 1; b = b * 5 + 2; c = c * 7 + 3; \
+    a ^= (a >> 5); b ^= (b >> 7); c ^= (c >> 9); \
+} while (0)
+
+// v1: S4    → 每迭代 ~58 条 macro-op
+// v2: S16   → ~227 条
+// v3: S128  → ~1799 条    ← 预期接近 Op Cache 边界
+// v4: S512  → ~7187 条    ← 预期溢出
+// v5: S1024 → ~14385 条   ← 彻底溢出
 ```
 
-&emsp;&emsp;**看数据**：如果代码能驻留在 Op Cache 中，前端带宽远超 4-wide 解码器；如果 Op Cache 频繁缺失，前端才回落到 4-wide 路径。
+&emsp;&emsp;选择 STEP 而不是任意指令填充，是因为它**天然阻止编译器优化**：三条链各自有乘法→加法→异或→移位的非线性依赖，跨 STEP 合并需要模拟非线性递推，任何生产级编译器都不会做。这样“每迭代 macro-op 数”严格等于 STEP 次数 × 14 + 循环开销，不需要额外的 asm 屏障去防消除——**基准设计层面的胜利，比事后用屏障去堵编译器的洞更可靠**。
 
-&emsp;&emsp;**解释机制**：Zen 3 的前端设计使“前端受限”需要被拆成两个独立问题：**Op Cache 是否接住**，以及**解码器是否成为瓶颈**。两者的优化手段不同——前者靠减少代码足迹、避免巨型函数内联；后者靠减少指令数量、提高每指令工作量。5600X 的 L1 BTB 有 1024 条目，分支预测带宽翻倍，这意味着对于代码规模适中、分支目标数在 BTB 覆盖范围内的负载，Bad Speculation 的基线可能已经较低，不应不加区分地堆分支消除。
+&emsp;&emsp;五个版本的 `n` 按 STEP 次数反比缩放，保证总指令量在 1e9 量级、单次跑 0.1–0.5 秒：v1 用 `n=1e8`、v2 用 `n=1e7`、v3 用 `n=1e6`、v4 用 `n=3e5`、v5 用 `n=1e5`。测量条件与第 2–4 章一致：EPP 固定为 `performance`，`taskset -c 2` 绑单核，每个事件独立一个 `-e`（避免 `-e "a,b,c"` 在 Zen 3 上的解析失败）。
 
-&emsp;&emsp;**实践要点**：在 5600X 上，Frontend Bound 的下钻顺序是：先看 `op_cache_hit_miss`，再看 `de_dis_cops_from_decoder`，最后才回到分支预测指标。
+&emsp;&emsp;采集分两组：**Op Cache 组**用 `op_cache_hit_miss.all_op_cache_accesses` 和 `.op_cache_miss` 计算命中率，这是“前端走了哪条路径”的唯一直接证据；**dispatch 组**用 `de_dis_cops_from_decoder.disp_op_type.any_integer_dispatch` 除以 `cycles` 计算分发速率，这是“前端供给是否跟得上后端消费”的唯一直接证据。两组一起看，才能区分“Op Cache 溢出”和“Frontend Bound”——这是本章要证明的核心区分。
+
+```bash
+# 有效性检查：五个版本的 ex_ret_instr / n 应严格按 STEP 次数线性增长
+for v in 1 2 3 4 5; do
+    taskset -c 2 sudo perf stat -e cycles -e ex_ret_instr \
+        ./opcache_bench -v $v
+done
+
+# Op Cache 组
+for v in 1 2 3 4 5; do
+    taskset -c 2 sudo perf stat -e cycles -e ex_ret_instr \
+        -e op_cache_hit_miss.all_op_cache_accesses \
+        -e op_cache_hit_miss.op_cache_miss \
+        ./opcache_bench -v $v
+done
+
+# dispatch 组
+for v in 1 2 3 4 5; do
+    taskset -c 2 sudo perf stat -e cycles -e ex_ret_instr \
+        -e de_dis_cops_from_decoder.disp_op_type.any_integer_dispatch \
+        ./opcache_bench -v $v
+done
+```
+
+&emsp;&emsp;五个版本的 Op Cache miss 率从 0.28% 跳到 99.2%，断层落在 v3（1799 条）和 v4（7187 条）之间——与 Zen 3 的 4096 uop 规格容量吻合。但 `de_dis_cops / cycles` 在五个版本上全部稳定在 **3.18–3.24**，Op Cache miss 率变化 350 倍，分发速率纹丝不动。**这说明 Op Cache 溢出只改变了前端的取指路径，没有改变前端的供给能力**——后端的消费速率（3.18 cop/cycle）始终低于解码器的供给上限（4-wide），Op Cache 溢出没有转化为 Frontend Bound。本章的核心结论由此展开：**“Op Cache 溢出”和“Frontend Bound”之间不画等号，判据是 `de_dis_cops / cycles` 与 4 的关系**。
+
+### 5.1 有效性检查：五个版本的指令数都符合宏展开预期
+
+&emsp;&emsp;先确认五个版本都真的在跑对应数量的 STEP，没有被编译器合并。`ex_ret_instr / n` 是唯一可靠的判据：
+
+```bash
+for v in 1 2 3 4 5; do
+    echo "=== v$v 有效性检查 ==="
+    taskset -c 2 sudo perf stat \
+        -e cycles \
+        -e ex_ret_instr \
+        ./opcache_bench -v $v
+done
+```
+
+**表 5-1 · 五个版本的指令数与源码预期对比**
+
+| 版本 | STEP 次数 | n | `ex_ret_instr` | `ex_ret_instr / n` | 每 STEP 指令数 |
+|---|---|---|---|---|---|
+| v1 | 4 | 100,000,000 | 5,807,900,441 | 58.1 | **14.5** |
+| v2 | 16 | 10,000,000 | 2,265,344,218 | 226.5 | **14.2** |
+| v3 | 128 | 1,000,000 | 1,799,037,542 | 1799 | **14.1** |
+| v4 | 512 | 300,000 | 2,156,276,274 | 7187 | **14.0** |
+| v5 | 1024 | 100,000 | 1,438,520,224 | 14385 | **14.1** |
+
+&emsp;&emsp;**每个 STEP 稳定在 14.0–14.5 条 macro-op**——`a*3+1`、`b*5+2`、`c*7+3` 三次乘法加三次加法、三次异或、三次移位、两次比较和跳转，再加上 STEP 之间的寄存器搬运，总共 14 条。五个版本的 `ex_ret_instr / n` 严格按 STEP 次数线性增长，说明编译器没有做任何跨 STEP 的合并——STEP 宏内的 `a ^= (a >> 5)` 是非线性运算，编译器无法把它折叠成闭式解。
+
+&emsp;&emsp;这个有效性检查比第 3、4 章更顺利，原因是 **STEP 宏的设计天然阻止了优化**：三条独立的链（`a`、`b`、`c`）各自有乘法→加法→异或→移位的依赖，每次 STEP 的输出是下一次 STEP 的输入，跨 STEP 合并需要模拟非线性递推，任何生产级编译器都不会做。**这是“基准设计”层面的胜利——与其事后用屏障去阻止优化，不如从一开始就让代码结构本身不可优化**。
+
+### 5.2 Op Cache 命中率的阶梯：容量边界在 1799 到 7187 条之间
+
+&emsp;&emsp;Op Cache 是否接住循环体，唯一的直接判据是 `op_cache_miss / all_op_cache_accesses`：
+
+```bash
+for v in 1 2 3 4 5; do
+    echo ""
+    echo "=== v$v : op cache ==="
+    taskset -c 2 sudo perf stat \
+        -e cycles \
+        -e ex_ret_instr \
+        -e op_cache_hit_miss.all_op_cache_accesses \
+        -e op_cache_hit_miss.op_cache_miss \
+        ./opcache_bench -v $v
+done
+```
+
+**表 5-2 · 五个版本的 Op Cache 命中率**
+
+| 版本 | STEP 次数 | 每迭代 macro-op | `all_op_cache_accesses` | `op_cache_miss` | **miss 率** |
+|---|---|---|---|---|---|
+| v1 | 4 | 58 | 502,684,371 | 1,422,363 | **0.28%** |
+| v2 | 16 | 227 | 151,666,276 | 823,348 | **0.54%** |
+| v3 | 128 | 1799 | 112,529,370 | 831,026 | **0.74%** |
+| v4 | 512 | 7187 | 133,964,124 | 112,858,536 | **84.2%** |
+| v5 | 1024 | 14385 | 89,482,495 | 88,739,762 | **99.2%** |
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_abb49e.svg)
+
+&emsp;&emsp;**断层在 v3（1799 条）和 v4（7187 条）之间**——miss 率从 0.74% 跳到 84.2%。这个断层与 Zen 3 的 Op Cache 规格容量 **4096 个 uop** 完全吻合：1799 条 macro-op 展开后约 2000–2500 个 uop，落在 4096 以内；7187 条 macro-op 展开后约 8000–10000 个 uop，远超 4096。**规格数字是理论上限，实测给出的可用边界在 2000–7000 个 uop 之间**——这个区间包含了分支密度、代码布局、Op Cache 替换策略等实际因素，是“能在 5600X 上用来判断循环体是否过大”的实用判据。
+
+&emsp;&emsp;**v5 的 99.2% 是“彻底溢出”的极端**：每迭代 14385 条 macro-op，Op Cache 几乎完全接不住，每次外层迭代都要从 4-wide 解码器重新取指。但接下来你会看到，**“彻底溢出”并不等于“前端成为瓶颈”**——这是本章最重要的反直觉发现。
+
+### 5.3 分发速率：Op Cache 溢出没有降低前端供给
+
+&emsp;&emsp;如果 Op Cache 溢出导致前端供给不足，`de_dis_cops / cycles` 应该显著下降。数据：
+
+```bash
+for v in 1 2 3 4 5; do
+    echo ""
+    echo "=== v$v : dispatch ==="
+    taskset -c 2 sudo perf stat \
+        -e cycles \
+        -e ex_ret_instr \
+        -e de_dis_cops_from_decoder.disp_op_type.any_integer_dispatch \
+        ./opcache_bench -v $v
+done
+```
+
+**表 5-3 · 五个版本的分发速率**
+
+| 版本 | STEP | 每迭代 macro-op | cycles | `de_dis_cops` | **`de_dis_cops / cycles`** |
+|---|---|---|---|---|---|
+| v1 | 4 | 58 | 2,009,901,499 | 6,511,779,420 | **3.24** |
+| v2 | 16 | 227 | 806,246,904 | 2,577,781,807 | **3.20** |
+| v3 | 128 | 1799 | 645,784,023 | 2,056,130,819 | **3.18** |
+| v4 | 512 | 7187 | 774,346,986 | 2,465,611,852 | **3.18** |
+| v5 | 1024 | 14385 | 516,986,790 | 1,644,997,293 | **3.18** |
+
+&emsp;&emsp;**五个版本的 `de_dis_cops / cycles` 全部在 3.18–3.24 之间**——Op Cache miss 率从 0.28% 跳到 99.2%，分发速率**没有任何变化**。`de_dis_cops` 每周期稳定分发约 3.2 个 cop，远低于 6-wide dispatch 的上限，也低于 4-wide 解码器的上限。**Op Cache 溢出没有导致前端供给不足**——因为前端的供给能力（Op Cache 的 8-wide 或解码器的 4-wide）始终高于后端的消费能力（3.18 cop/cycle）。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_4d8963.svg)
+
+&emsp;&emsp;**后端才是真正的瓶颈**。STEP 宏内三条独立链（`a`、`b`、`c`）各自的依赖链是乘法（3 cycles）→ 加法（1 cycle）→ 异或（1 cycle）→ 移位（1 cycle），约 6 cycles 延迟。三条链并行，每 6 cycles 可以退休约 18 条指令，即 **3.0 cop/cycle**——与实测的 3.18 完全吻合。**前端的 Op Cache 或解码器，无论哪条路径，都能轻松跟上这个速率**。
+
+
+
+### 5.4 为什么 Op Cache 溢出不等于 Frontend Bound
+
+&emsp;&emsp;五个版本的数据合起来，给出一个比“Op Cache 溢出就慢了”更精确的判据：**Op Cache 溢出只在“后端消费速率超过 4-wide 解码器供给能力”时，才转化为 Frontend Bound**。
+
+&emsp;&emsp;**反例（本章数据）**：STEP 宏的三条独立链让后端消费速率稳定在 3.18 cop/cycle，低于 4-wide 解码器的供给上限（4 cop/cycle）。此时 Op Cache 溢出到 99.2%，解码器仍然能跟上后端的节奏——**Op Cache miss 率高，但前端不是瓶颈**。
+
+&emsp;&emsp;**正例（第 4 章 v4）**：512 STEP 展开的循环体，每迭代约 7176 条 macro-op，后端消费速率被展开的独立运算推高。第 4 章 v4 的 `de_dis_cops / cycles = 3.19`——和本章的 3.18 几乎相同。但第 4 章 v4 的 `ex_ret_instr / n = 7176`、CPI 0.358，说明后端每周期退休 2.79 条指令，接近 4-wide 解码器的供给上限。**此时解码器成为瓶颈，Op Cache 溢出转化为 Frontend Bound**。
+
+&emsp;&emsp;两者的区别不在 Op Cache miss 率（84% vs 99%），而在**后端消费速率是否超过解码器供给能力**。判据是 `de_dis_cops / cycles` 与 4 的关系：
+
+| `de_dis_cops / cycles` | Op Cache 溢出时 | 判读 |
+|---|---|---|
+| **< 3.5** | Op Cache miss 高，但分发速率低于解码器上限 | **后端受限**——前端路径无关，优化应该转向后端 |
+| **3.5–4.0** | Op Cache miss 高，分发速率接近解码器上限 | **前端接近瓶颈**——减少代码足迹可能有效 |
+| **≈ 4.0** | Op Cache miss 高，分发速率被 4-wide 解码器锁死 | **真正的 Frontend Bound**——必须减少代码足迹或增加每指令工作量 |
+
+&emsp;&emsp;本章五个版本全部落在第一行（3.18–3.24），**Op Cache 溢出是“前端路径的切换”，不是“前端瓶颈的出现”**。这是一个比“Op Cache 是 4096 uop 容量”更精细的判据——**规格数字告诉你容量上限，`de_dis_cops / cycles` 告诉你溢出之后前端是否真的成为瓶颈**。
+
+### 5.5 总结
+
+&emsp;&emsp;综合第 4 章 v4 和本章五个版本的数据，5600X 上 Frontend Bound 的下钻顺序可以精确化为三步：
+
+**第一步：看 `op_cache_miss / all_op_cache_accesses`**。如果 < 5%，Op Cache 接住了循环体，前端不是瓶颈；如果 > 20%，Op Cache 部分或完全溢出，需要进入第二步。
+
+**第二步：看 `de_dis_cops / cycles`**。如果 < 3.5，Op Cache 溢出但分发速率低于解码器上限——**后端受限，不是 Frontend Bound**；如果 ≥ 3.5，解码器接近或成为瓶颈，进入第三步。
+
+**第三步：看 `ex_ret_instr / n` 和循环体结构**。如果循环体很大（> 2000 条 macro-op）且后端消费速率高，前端优化应转向**减少代码足迹**（拆分热点函数、避免巨型循环展开）；如果循环体不大但 `de_dis_cops / cycles` 仍然接近 4，说明瓶颈在**指令密度**（每条指令做的工作太少），优化应转向**用更宽的 SIMD 或 FMA 提高每指令工作量**。
+
+&emsp;&emsp;**两步判据合起来，避免了一个常见误判**：看到 `op_cache_miss = 84%` 就认为“需要减少代码足迹”，但 `de_dis_cops / cycles = 3.18 < 3.5` 说明后端才是瓶颈——减少代码足迹不会改善性能，优化应该转向后端执行资源。**Op Cache miss 高只是“前端走了慢路径”，不是“前端拖慢了整体”**；只有分发速率接近解码器上限时，前端的慢路径才转化为整体的瓶颈。
+
+&emsp;&emsp;**“Op Cache 溢出”是一个测量事实，“Frontend Bound”是一个瓶颈判断**。两者之间的等号不成立，只有当后端消费速率超过解码器供给能力时，前者才转化为后者。**判断这个转化是否发生，只需要一个比值：`de_dis_cops / cycles` 与 4 的关系**——这是本章五个版本给出 3.18–3.24 的稳定数据之后，最有诊断价值的结论。
 
 
 ## 6. 分层缓存：32MB 统一 L3 与内存时钟域
 
-### 6.1 做：工作集—延迟台阶
+&emsp;&emsp;**实验设计**。本章要回答的具体问题是：**5600X 的随机访存延迟在什么工作集大小上从“L3 供给”切换为“DRAM 延迟”**。规格书上 32MB 统一 L3 是理论上限，但实际可用边界受 set 冲突、Infinity Fabric 时钟域和物理页布局影响，只有测量能给出可用判据。
 
-&emsp;&emsp;**做**：构造一个工作集在 16MB 到 40MB 之间的随机访存 workload，采集 L2/L3 miss 和 `ls_mab_alloc`。
+&emsp;&emsp;workload 用**随机指针追逐**：构建 `next` 数组，`next[perm[i]] = perm[(i+1) % m]`，其中 `perm` 是 `[0, m)` 的随机排列。从 `perm[0]` 开始，每次 `idx = next[idx]`，访问序列在物理地址空间里随机分布，硬件预取器完全无法预测。`m = sz_mb × 1024 × 1024 / 8` 个 `long`。迭代数默认等于 `m`，保证完整遍历一遍工作集。每个工作集先 warmup 遍历一遍，把数据从 DRAM 拉到缓存层级，然后正式测量——测的是“热工作集”的访问延迟，不是冷缓存第一次访问的延迟。
+
+```c
+// random_access.cpp 核心函数
+__attribute__((noinline))
+long random_chase(const long *next, long n, long start) {
+    long idx = start, sum = 0;
+    for (long i = 0; i < n; i++) {
+        idx = next[idx];          // 随机地址的依赖链 load
+        sum += idx;
+        __asm__ __volatile__("" : "+r"(idx), "+r"(sum) : : "memory");
+    }
+    return sum;
+}
+```
+
+&emsp;&emsp;**测量条件**：EPP = performance，`taskset -c 2` 绑单核，每个事件独立一个 `-e`。四个工作集（16 / 24 / 32 / 40 MB）分别跑，采集 `cycles`、`ex_ret_instr`、`cache-references`、`cache-misses`、`ls_mab_alloc.load_store_allocations`。判据不是 `cache-misses` 的绝对值，而是 **`ns/access` 的台阶**——它直接反映每次随机访问的平均延迟，跨过 L3/DRAM 边界时会跳变。
 
 ```bash
-for sz in 16 24 32 40; do
-  perf stat -e cycles,instructions,ls_mab_alloc,\
-            l2_cache_misses_from_dc_misses,l3_misses_from_l2_misses \
-            ./random_access $((sz*1024*1024))
+echo "sz_mb,ns_per_access,cycles,cache_refs,cache_miss,cache_miss_pct,ls_mab"
+
+for sz in $(seq 16 40); do
+    OUT=$(taskset -c 2 sudo perf stat \
+        -e cycles -e ex_ret_instr -e cache-references -e cache-misses \
+        -e ls_mab_alloc.load_store_allocations \
+        ./random_access -s $sz 2>&1)
+
+    NS=$(echo "$OUT" | grep -oP '[\d.]+(?= ns/access)')
+    CREF=$(echo "$OUT" | grep -oP '[\d,]+(?= +cache-references)' | tr -d ',')
+    CMISS=$(echo "$OUT" | grep -oP '[\d,]+(?= +cache-misses)' | tr -d ',')
+    MAB=$(echo "$OUT" | grep -oP '[\d,]+(?= +ls_mab_alloc)' | tr -d ',')
+
+    PCT=$(awk "BEGIN {printf \"%.2f\", $CMISS * 100.0 / $CREF}")
+    echo "$sz,$NS,$CREF,$CMISS,$PCT,$MAB"
 done
 ```
 
-&emsp;&emsp;**看数据**：5600X 是单 CCD，6 个核心共享 32MB 统一 L3。工作集在 32MB 以内时，Memory Bound 的触发点不是 DRAM 带宽，而是 **L3 到核心的供给带宽**。超过 32MB 后，未命中路径经过 Infinity Fabric 到达内存控制器。
+**表 6-1 · 16–40 MB 逐 1 MB 扫描**
 
-<svg width="760" height="250" viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
-  <rect x="8" y="8" width="744" height="234" fill="#fafafa" stroke="#ccc" rx="6"/>
-  <text x="30" y="32" font-size="12" font-weight="bold" fill="#333">工作集—延迟台阶（32MB 统一 L3）</text>
-  <line x1="70" y1="195" x2="720" y2="195" stroke="#333"/><line x1="70" y1="195" x2="70" y2="50" stroke="#333"/>
-  <polyline points="70,180 190,176 310,172 430,120 550,88 690,76" fill="none" stroke="#c62828" stroke-width="3.5"/>
-  <line x1="430" y1="55" x2="430" y2="195" stroke="#4527a0" stroke-width="1.5" stroke-dasharray="5,3"/>
-  <text x="396" y="48" font-size="10" fill="#4527a0">32MB</text>
-  <rect x="70" y="180" width="120" height="15" fill="#2e7d32" opacity="0.25"/><rect x="190" y="176" width="240" height="19" fill="#ef6c00" opacity="0.25"/><rect x="430" y="120" width="290" height="75" fill="#c62828" opacity="0.15"/>
-  <text x="95" y="214" font-size="10" fill="#2e7d32" font-weight="bold">L1/L2</text><text x="270" y="214" font-size="10" fill="#ef6c00" font-weight="bold">L3 命中</text><text x="530" y="214" font-size="10" fill="#c62828" font-weight="bold">DRAM（经 IF）</text>
-  <text x="20" y="125" font-size="10" fill="#555" transform="rotate(-90 20,125)">延迟</text><text x="330" y="232" font-size="10" fill="#555">工作集 →</text>
+| 工作集 | ns/access | `cache-miss%` | `ls_mab / m` | 区间 |
+|---|---|---|---|---|
+| 16 MB | 14.32 | 40.91% | 6.24 | **L3 驻留** |
+| 17 MB | 14.19 | 40.51% | 6.74 | L3 驻留 |
+| 18 MB | 14.39 | 40.37% | 6.24 | L3 驻留 |
+| 19 MB | 14.79 | 39.32% | 6.02 | L3 驻留 |
+| 20 MB | 15.30 | 39.98% | 6.13 | L3 驻留 |
+| 21 MB | 15.55 | 39.75% | 5.94 | L3 驻留 |
+| 22 MB | 15.97 | 39.70% | 5.69 | L3 驻留 |
+| **23 MB** | **18.16** | 39.54% | 5.70 | **过渡起点** |
+| 24 MB | 19.50 | 39.46% | 5.62 | 过渡 |
+| 25 MB | 18.80 | 39.49% | 5.82 | 过渡 |
+| 26 MB | 23.84 | 39.29% | 5.59 | 过渡 |
+| 27 MB | 21.36 | 39.23% | 5.44 | 过渡 |
+| 28 MB | 21.54 | 39.02% | 5.33 | 过渡 |
+| 29 MB | 22.58 | 39.01% | 5.22 | 过渡 |
+| 30 MB | 23.54 | 38.74% | 5.19 | 过渡 |
+| 31 MB | 27.05 | 38.98% | 5.18 | 过渡 |
+| 32 MB | 26.22 | 38.77% | 5.12 | 过渡 |
+| **33 MB** | **34.37** | 38.78% | 5.00 | **DRAM 起点** |
+| 34 MB | 36.22 | 38.85% | 4.94 | DRAM |
+| 35 MB | 37.28 | 38.95% | 4.93 | DRAM |
+| 36 MB | 33.61 | 38.67% | 4.92 | DRAM（噪声） |
+| 37 MB | 38.29 | 38.66% | 4.87 | DRAM |
+| 38 MB | 37.26 | 39.01% | 4.84 | DRAM |
+| 39 MB | 37.25 | 38.59% | 4.84 | DRAM |
+| 40 MB | 40.84 | 38.52% | 4.72 | DRAM |
+
+
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_da2231.svg)
+
+
+
+
+
+<svg width="760" height="330" viewBox="0 0 760 330" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
+  <rect x="8" y="8" width="744" height="314" fill="#fafafa" stroke="#ccc" rx="6"/>
+  <text x="30" y="34" font-size="13" font-weight="bold" fill="#333">逐 1 MB 扫描：L3 有效边界不是 32 MB，而是 22–33 MB 的过渡带</text>
+  <line x1="80" y1="265" x2="720" y2="265" stroke="#333"/>
+  <line x1="80" y1="265" x2="80" y2="55" stroke="#333"/>
+  <text x="380" y="302" font-size="10" fill="#555">工作集（MB）→</text>
+  <text x="20" y="165" font-size="10" fill="#555" transform="rotate(-90 20,165)">ns / access</text>
+
+  <rect x="80" y="55" width="264" height="210" fill="#c8e6c9" opacity="0.25"/>
+  <rect x="344" y="55" width="264" height="210" fill="#fff3e0" opacity="0.5"/>
+  <rect x="608" y="55" width="112" height="210" fill="#ffcdd2" opacity="0.3"/>
+
+  <text x="150" y="78" font-size="11" fill="#2e7d32" font-weight="bold">L3 驻留</text>
+  <text x="150" y="94" font-size="9" fill="#2e7d32">14–16 ns</text>
+  <text x="420" y="78" font-size="11" fill="#ef6c00" font-weight="bold">过渡带</text>
+  <text x="420" y="94" font-size="9" fill="#ef6c00">18–27 ns</text>
+  <text x="628" y="78" font-size="11" fill="#c62828" font-weight="bold">DRAM</text>
+  <text x="628" y="94" font-size="9" fill="#c62828">34–41 ns</text>
+
+  <line x1="344" y1="55" x2="344" y2="265" stroke="#ef6c00" stroke-dasharray="4,3"/>
+  <text x="315" y="115" font-size="9" fill="#ef6c00">22 MB</text>
+  <line x1="608" y1="55" x2="608" y2="265" stroke="#c62828" stroke-dasharray="4,3"/>
+  <text x="580" y="115" font-size="9" fill="#c62828">33 MB</text>
+
+  <polyline points="80,255 122,258 164,255 206,250 248,244 290,239 332,234 374,212 416,194 458,205 500,164 542,186 584,183 626,170 668,152 710,138"
+            fill="none" stroke="#1565c0" stroke-width="2" opacity="0.4"/>
+  <polyline points="80,255 122,258 164,255 206,250 248,244 290,239 332,234 374,212 416,194 458,205 500,164 542,186 584,183 626,170 668,152 710,138"
+            fill="none" stroke="#1565c0" stroke-width="3" stroke-dasharray="0 8" stroke-linecap="round"/>
+
+  <polyline points="608,144 650,123 692,111 734,160"
+            fill="none" stroke="#c62828" stroke-width="3"/>
+
+  <circle cx="80" cy="255" r="3" fill="#1565c0"/>
+  <circle cx="344" cy="234" r="5" fill="#ef6c00"/>
+  <circle cx="608" cy="152" r="5" fill="#c62828"/>
+
+  <text x="60" y="272" font-size="9" fill="#333">16</text>
+  <text x="330" y="280" font-size="9" fill="#333">22</text>
+  <text x="595" y="280" font-size="9" fill="#333">33</text>
+  <text x="700" y="280" font-size="9" fill="#333">40</text>
 </svg>
 
-&emsp;&emsp;**解释机制**：一旦超过 32MB，FCLK/UCLK/MCLK 的同步状态成为延迟的主导因素。**在 5600X 上，“内存受限”首先是一个缓存层次问题，然后才是一个 DRAM 带宽问题**——工作集落在哪个层级，决定了应该用 L3 带宽还是 DRAM 带宽作为 Roofline 的屋顶。
+&emsp;&emsp;**数据呈现出清晰的三阶段**，但两个边界与规格数字都不同：
 
+&emsp;&emsp;**第一阶段（16–22 MB）：L3 驻留**。`ns/access` 从 14.3 缓慢升到 16.0，涨幅 12%。这段的上升不是“工作集变大导致更多 miss”，而是 **L3 set 冲突随工作集增长缓慢积累**——工作集已经覆盖了 L3 的物理容量，但每个 set 的占用还没到冲突阈值，多数访问仍在 L3 命中。
 
+&emsp;&emsp;**第二阶段（23–32 MB）：过渡带**。`ns/access` 从 18.2 爬升到 26.2，涨幅 44%，且中间有抖动（25 MB 的 18.8 比 24 MB 的 19.5 还低，26 MB 的 23.8 比 27 MB 的 21.4 高）。**过渡带的宽度有 10 MB**——这是随机访问模式下最反直觉的特征：工作集跨过 L3 容量后，不是“一刀切”地全部落到 DRAM，而是**一部分地址 L3 命中、一部分 miss 到 DRAM，比例随工作集增长而连续变化**。23 MB 时约 15% 的访问 miss 到 DRAM，32 MB 时约 50%，`ns/access` 是这两种延迟的加权平均。
+
+&emsp;&emsp;**第三阶段（33–40 MB）：DRAM 主导**。32→33 MB 出现最明显的单步跳变：26.22 → 34.37 ns，涨幅 **31%**——这是整个扫描中相邻两点的最大增幅。33 MB 之后 `ns/access` 在 34–41 ns 之间波动，涨幅收窄到 4% 以内。**33 MB 是“工作集几乎完全溢出 L3”的实测边界**——比规格的 32 MB 晚 1 MB，原因是：规格容量是 6 核共享的 32 MB，但单核跑随机访问时，其他核的 L3 占用可以忽略，单核可用容量接近 32 MB；加上栈、代码、页表占用的内存后，实际边界略高于 32 MB。
+
+&emsp;&emsp;**两个反直觉的“平坦”比台阶本身更有信息量**：
+
+- **`cache-miss%` 从 40.91% 降到 38.52%，几乎不变**。工作集从 16 MB 涨到 40 MB，`ns/access` 翻了近 3 倍，但 perf 的 `cache-misses / cache-references` 只降了 2.4 个百分点。原因：Zen 3 的 `cache-misses` 事件主要统计 **L2 miss**，不区分“L2 miss 但 L3 命中”和“L3 miss 到 DRAM”。16 MB 时所有访问都 miss L2（工作集远超 512 KB L2），但多数在 L3 命中；40 MB 时同样全部 miss L2，只是多数 miss 到 DRAM。**`cache-misses` 在这两个状态下几乎一样**——它只能告诉你“L2 没接住”，不能告诉你“L3 接住了没有”。
+- **`ls_mab_alloc / m` 从 6.24 降到 4.72，也几乎不变**。每次访问分配的 MAB 条目数不随工作集变化，变化的是条目在队列里待的时间。16 MB 时 MAB 条目等 L3 返回（约 50 cycles），33 MB 时等 DRAM 返回（约 200 cycles）。**MAB 计数本身无法区分“等 L3”和“等 DRAM”，只有 `ns/access` 能区分**。
+
+&emsp;&emsp;**同是 32 MB，两次测量差 15 ns**。第 6 章开头的 4 点采样中，32 MB 的 `ns/access` 是 41.32；逐 1 MB 扫描中，32 MB 只有 26.22。两个数字相差 15 ns（58%），远大于扫描内部的抖动。原因：4 点采样每次间隔几秒，温度/频率状态略有不同；`posix_memalign` 或 `std::vector` 每次进程启动分配不同的物理页，L3 set 映射不同；4 点采样时 32 MB 是第三个点，前面 16/24 MB 的测量已经预热了缓存，但 32 MB 的物理页恰好映射到冲突更严重的 set 上。**这个差异本身证明了单点测量的不可靠性**——只看 32 MB 一个点，你可能得出“32 MB 已经全是 DRAM 延迟”或“32 MB 还在 L3 过渡带”两个相反的结论，取决于那次运行落在物理页抽奖的哪一侧。**扫描整个 16–40 MB 范围，才能把“边界在 22–33 MB 之间”这个宽区间和“33 MB 处 31% 跳变”这个精确位置同时测出来**。
+
+&emsp;&emsp;**对 Roofline 的衔接**：第 10 章的 Roofline 模型需要用“可持续内存带宽”作为屋顶。扫描数据给出了这个带宽的适用边界——**工作集 < 22 MB 时，屋顶应该是 L3 供给带宽（不是 DRAM 带宽）；22–33 MB 是过渡带，Roofline 的“内存屋顶”在数学上不适用（因为延迟不是一个常量，是工作集的函数）；> 33 MB 时，DRAM 带宽才是真正的屋顶**。对一个 16 MB 工作集的内核画 Roofline 并用 DRAM 带宽做屋顶，会高估内存受限程度，把实际上仍然是 L3 供给受限的内核误判为 DRAM 带宽受限。**“内存带宽”不是一个常量，它是工作集大小和缓存层级的函数**——这是第 1 章“对齐不是通用优化”在缓存层次上的延续。
 ## 7. 功耗与频率耦合：Curve Optimizer 改变测量基线
 
 ### 7.1 做：默认 vs. PBO + Curve Optimizer
