@@ -251,111 +251,239 @@ done
 
 ### 3.1 CPI 是聚合指标，不是诊断指标
 
-```bash
-perf stat -e cycles,instructions,branches,branch-misses,\
-          cache-references,cache-misses ./workload
-```
+&emsp;&emsp;四个 workload 的设计意图和实际行为如下：
+- **v1 compute**：三条独立的 64 位乘法链，设计意图是 Core Bound（执行端口/依赖链）。如果三条链真的并行，CPI 应该接近乘法吞吐上限；如果编译器把链合并或把依赖并行了，CPI 会异常低——后者正是实际发生的情况。
+- **v2 chase**：随机排列的指针追逐，设计意图是 Memory Bound（L3 延迟）。8MB 工作集超出 512KB L2、落在 32MB L3 内，每次追逐都触发一次 L3 访问。
+- **v3 branch**：数据驱动的 if (v >= 128) 分支，设计意图是 Bad Speculation（约 50% 误预测率）。分支方向由随机数据决定，预测器无法学习。
+- **v4 frontend**：64 次宏展开的巨型循环体，设计意图是 Frontend Bound（Op Cache 溢出）。循环体展开后约 900 条 macro-op，预期超出 Zen 3 的 4K uop Op Cache。
 
-&emsp;&emsp;`cycles / instructions` 给出 CPI。CPI > 1 是常态，但 **CPI 本身不告诉任何关于“慢在哪里”的信息**。一个 CPI 为 1.5 的程序可能受限于 L1D 缺失，也可能受限于分支预测失败。5600X 每个周期提供 **6 个 dispatch slot**，槽位被退休 macro-op 填充的比例才是更有信息量的度量。
+&emsp;&emsp;`cycles / ex_ret_instr` 给出 CPI。直觉上，CPI 越低越快——1 个周期退休 2 条指令，比 1 个周期退休 0.2 条指令高效 10 倍。四个 workload 的数据（n = 1e7，EPP = performance）却推翻了这个直觉：
 
-&emsp;&emsp;5600X 上对诊断特别有用的一组原始事件是：**`op_cache_hit_miss`**（Op Cache 命中/缺失）、**`de_dis_cops_from_decoder`**（解码器分发）、**`ls_mab_alloc`**（MAB 分配，反映内存请求排队压力）、**`dispatch_stalls`**（分发级停顿）。它们暴露了 5600X 前端的一个关键特征：**4-wide 解码器 + 8-wide Op Cache 的双路径，最终由 6-wide dispatch 供给后端**。
+**表 3-1 · 四个 workload 的 CPI 与绝对量**
 
-<svg width="760" height="260" viewBox="0 0 760 260" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
-  <rect x="8" y="8" width="744" height="244" fill="#fafafa" stroke="#ccc" rx="6"/>
-  <defs><marker id="a1" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#444"/></marker></defs>
-  <rect x="40" y="80" width="130" height="60" fill="#e3f2fd" stroke="#1565c0" stroke-width="2" rx="6"/>
-  <text x="72" y="115" font-size="12" fill="#1565c0" font-weight="bold">L1 I-Cache</text>
-  <rect x="230" y="50" width="160" height="52" fill="#fff3e0" stroke="#ef6c00" stroke-width="2" rx="6"/>
-  <text x="255" y="80" font-size="11" fill="#ef6c00">4-wide 解码器</text>
-  <rect x="230" y="120" width="160" height="52" fill="#c8e6c9" stroke="#2e7d32" stroke-width="2" rx="6"/>
-  <text x="255" y="150" font-size="11" fill="#2e7d32">Op Cache 8-wide</text>
-  <rect x="460" y="80" width="130" height="60" fill="#ede7f6" stroke="#4527a0" stroke-width="2" rx="6"/>
-  <text x="478" y="106" font-size="11" fill="#4527a0">6-wide</text><text x="478" y="124" font-size="11" fill="#4527a0">Dispatch</text>
-  <rect x="640" y="85" width="80" height="50" fill="#ffcdd2" stroke="#c62828" stroke-width="2" rx="6"/>
-  <text x="664" y="115" font-size="11" fill="#c62828" font-weight="bold">后端</text>
-  <line x1="170" y1="100" x2="230" y2="78" stroke="#444" stroke-width="2" marker-end="url(#a1)"/>
-  <line x1="170" y1="120" x2="230" y2="144" stroke="#444" stroke-width="2" marker-end="url(#a1)"/>
-  <line x1="390" y1="78" x2="460" y2="100" stroke="#444" stroke-width="2" marker-end="url(#a1)"/>
-  <line x1="390" y1="144" x2="460" y2="120" stroke="#444" stroke-width="2" marker-end="url(#a1)"/>
-  <line x1="590" y1="110" x2="640" y2="110" stroke="#444" stroke-width="2" marker-end="url(#a1)"/>
-  <circle cx="195" cy="78" r="10" fill="#2e7d32"/><text x="190" y="82" font-size="10" fill="#fff" font-weight="bold">H</text>
-  <circle cx="195" cy="144" r="10" fill="#ef6c00"/><text x="190" y="148" font-size="10" fill="#fff" font-weight="bold">M</text>
-  <text x="40" y="215" font-size="10" fill="#2e7d32">● 命中：前端带宽充沛，瓶颈后移至 dispatch</text>
-  <text x="40" y="235" font-size="10" fill="#ef6c00">● 缺失：回落 4-wide 解码器，前端带宽骤降</text>
-</svg>
+| 版本 | 设计意图 | cycles | `ex_ret_instr` | CPI | 每迭代指令数 | 每迭代时间 |
+|---|---|---|---|---|---|---|
+| v1 compute | Core Bound | 33.6M | 82.1M | **0.41** | 8.2 | 3.4 ns |
+| v2 chase | Memory Bound | 593.0M | 115.7M | **5.12** | 11.6 | 59.3 ns |
+| v3 branch | Bad Speculation | 198.5M | 508.1M | **0.39** | 50.8 | 19.8 ns |
+| v4 frontend | Frontend Bound | 3217.8M | 8990.2M | **0.358** | 899.0 | 321.8 ns |
 
-### 3.2 同一个 CPI，两种截然不同的槽位消耗形态
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_9e39b0.svg)
 
-&emsp;&emsp;构造两个 workload：A 为计算密集的整数运算链，B 为依赖指针追逐的内存访问。调整使 CPI 都接近 1.5。Top-Down Level 1 会显示：
+&emsp;&emsp;**v4 的 CPI 是 0.358，比 v1 的 0.41 还低——但它花了 3.2G 个周期，是 v1 的 96 倍。** 原因在 `每迭代指令数` 这一列：v1 每迭代 8.2 条指令，v4 每迭代 899 条指令。CPI 低说明“每条指令平均占用的周期少”，但它完全不告诉你有多少条指令。**真正的每迭代时间是三个量的乘积**：
 
-- **A**：Backend Bound 中的 **Core Bound** 占主导——槽位在等待执行端口或依赖链延迟。
-- **B**：Backend Bound 中的 **Memory Bound** 占主导——槽位在等待未完成的 demand load。
+$$\text{每迭代时间} = \text{每迭代指令数} \times \text{CPI} \times \text{每周期时间}$$
 
-&emsp;&emsp;CPI 相同只说明“平均每条指令花了同样多周期”，但槽位被阻塞的微架构原因完全不同。
+&emsp;&emsp;v1 是 8.2 × 0.41 × 0.21 ns ≈ 0.71 ns，v4 是 899 × 0.358 × 0.21 ns ≈ 67.6 ns。表中显示的每迭代时间（3.4 ns vs 321.8 ns）比这个计算大一个量级，因为 `n` 是外层迭代数，而 v4 每次外层迭代执行了 64 次内层 STEP——899 条指令是 64 次 STEP 的展开结果，不是单次累加。**具体数值不重要，重要的是三个量的关系**：CPI 只是三个量中的一个，单独看它无法判断“快慢”。
+
+&emsp;&emsp;更关键的是，**CPI 也完全不告诉你“慢在哪里”**。v2 的 CPI 是 5.12，远高于其他三个，看起来“最慢”。但如果只看 CPI，你会以为 v2 需要 12.8 倍的指令级优化——实际上 v2 的时间是 v1 的 17.6 倍，而 CPI 只差 12.5 倍，差额来自“每迭代指令数”也不同（11.6 vs 8.2）。**CPI 是聚合指标，它把“指令数”和“每指令周期”两个维度揉成了一个数**。要拆分这两个维度，必须采集 `cycles` 和 `ex_ret_instr` 两个原始量，不能只看比值。
+
+### 3.2 同一个 CPI，两个完全不同的瓶颈——在数据里没出现
+
+&emsp;&emsp;第 1 章预期实验 A/B 会演示“同一个 CPI，两种瓶颈”。但四个 workload 的实际数据显示：**没有两个版本的 CPI 相同**。v1（0.41）、v3（0.39）、v4（0.358）三者都低，但它们的瓶颈完全不同——这不是“同一个 CPI”的案例，而是“**低 CPI 掩盖了三个完全不同的瓶颈类别**”的案例。
+
+&emsp;&emsp;要判断哪个版本受限于什么，需要看**两个比值**，而不是 CPI：
+
+**表 3-2 · 两个比值把“低 CPI”拆成三个方向**
+
+| 版本 | CPI | `cache-misses / cache-references` | `ex_ret_brn_misp / ex_ret_brn` | `op_cache_miss / all_accesses` | `ls_mab_alloc` | 判读 |
+|---|---|---|---|---|---|---|
+| v1 | 0.41 | 11.4% | 0.58% | **1.87%** | **51.8K** | Retiring（无瓶颈） |
+| v2 | 5.12 | **48.4%** | 3.12% | 20.7% | **13.2M** | **Memory Bound** |
+| v3 | 0.39 | 6.27% | 2.20% | 11.2% | 2.29M | **基准失效（cmov）** |
+| v4 | 0.358 | 4.07% | 2.51% | **0.41%** | 193K | **基准失效（Op Cache 未溢出）** |
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_e30fbc.svg)
+
+&emsp;&emsp;**v2 是唯一被数据证实的瓶颈**。`cache-misses / cache-references = 48.4%`——近一半的缓存访问都 miss 到 L2/L3，且 `ls_mab_alloc = 13.2M`（每迭代 1.32 次 MAB 分配）。这是 Memory Bound 的直接证据：每次随机指针追逐都要在 Miss Address Buffer 里排队等 L3 返回。`op_cache_miss / all_accesses = 20.7%` 看起来也高，但这是因为指针追逐的随机性导致代码预取失效，不是前端供给成为瓶颈。
+
+&emsp;&emsp;**v1 是唯一“健康”的版本**。`cache-misses / cache-references = 11.4%` 但 `cache-references` 只有 258.8K——绝对量极小，11.4% 的 miss 只对应 29.4K 次缺失，对 82M 条指令来说是噪声。`ls_mab_alloc = 51.8K`、`op_cache_miss / all_accesses = 1.87%`——两个与内存/前端相关的关键事件都极低。**v1 是真正的 Retiring**：槽位被有效退休指令填充，没有哪个子系统在拖后腿。CPI 0.41 意味着每周期退休 2.44 条指令，接近 Zen 3 的 6-wide dispatch 上限的 40%。
+
+&emsp;&emsp;**v3 是基准失效**。它的 CPI 只有 0.39，`ex_ret_instr` 却有 508M（每迭代 50.8 条指令）。这是编译器把 `if (v >= 128) sum += v; else sum -= v;` 优化成了**条件移动 `cmov`**——根本没有分支。`ex_ret_brn = 63.8M / 10M = 6.4` 分支/迭代，但其中绝大多数是**循环控制分支**（10M 次 taken，只有最后一次不 taken），不是数据分支。`brn_misp / brn = 2.2%` 恰好等于“循环控制分支的误预测率”+“少量数据分支残留”，**没有测到任何 `cmov` 优化的分支**。
+
+&emsp;&emsp;**v4 也是基准失效**。它的 CPI 只有 0.358，`ex_ret_instr` 高达 8990M（每迭代 899 条指令）。设计目标是“巨型循环体超出 Op Cache 容量”，但 `op_cache_miss / all_accesses = 0.41%`——**Op Cache 完全接住了循环体**。Zen 3 的 Op Cache 是 4096 个 uop 的容量，64 次 STEP 展开只产生约 900 条 macro-op，远未触及 4096 的上限。`ls_mab_alloc = 193K`（每迭代 0.019 次）也极低，说明内存子系统不是瓶颈。**v4 也是 Retiring**——只是它退休了 899 条指令/迭代，CPI 天然就低。
+
+### 3.3 从“测量了什么”到“基准是否有效”
+
+&emsp;&emsp;表 3-2 的最后一列是本章最重要的发现：**四个精心设计的 workload，三个没有测到预期瓶颈**。v1 设计为 Core Bound，但三条独立乘法链让编译器把延迟完全并行了，CPI 0.41 说明没有瓶颈；v3 设计为 Bad Speculation，但 clang 把数据依赖分支优化成了 `cmov`，根本没有分支可误预测；v4 设计为 Frontend Bound，但 899 条指令的循环体对 4096 个 uop 的 Op Cache 来说远远不够，前端供给顺畅。
+
+&emsp;&emsp;**这不是实验失败，这是第 2 章“基准在测你想测的东西吗”的延续**。第 2.2 节讲的是“循环被完全消除”，本节讲的是“循环被完整执行了，但没有执行到你想测的那条路径”。两者都需要同一道检查：**看 PMU 数据是否与源码预期一致**。v3 的 `ex_ret_brn / n = 6.4` 看起来像“每次迭代 6.4 个分支”，但源码里只有 1 个数据分支——差额来自循环展开后的循环控制分支，数据分支被 `cmov` 吃掉了。**只有看 `ex_ret_brn` 的绝对量，才能发现“分支数不对”**。
+
+&emsp;&emsp;**修复三个失效的基准**需要回到源码：
+
+- **v1 改成真正的 Core Bound**：去掉循环末尾的 asm 屏障，把三条独立链改成一条串行链：
+  ```c
+  long a = 1;
+  for (long i = 0; i < n; i++) {
+      a = a * 3 + 1;              // 乘法延迟 ~3 cycles
+      __asm__ __volatile__("" : "+r"(a) : : "memory");  // 阻止合并成 a*15+7
+      a = a * 5 + 2;
+  }
+  ```
+  这样每次乘法必须等上一次，CPI 会升到 3 左右，`cache-misses` 和 `brn-misp` 仍然极低——真正的 Core Bound。
+
+- **v3 改成真正的 Bad Speculation**：用 `__attribute__((noinline))` 把分支体拆成两个函数，强制保留分支：
+  ```c
+  __attribute__((noinline)) long add_slow(long s, int v) { return s + v; }
+  __attribute__((noinline)) long sub_slow(long s, int v) { return s - v; }
+  // 循环体内：
+  if (__builtin_expect(v >= 128, 0)) s = add_slow(s, v);
+  else                                s = sub_slow(s, v);
+  ```
+  `cmov` 无法跨函数调用，分支必须保留，`brn_misp / brn` 会升到 30–50%。
+
+- **v4 改成真正的 Frontend Bound**：把 STEP 展开从 64 次增加到 **512 次**，让循环体超过 4096 个 uop：
+  ```c
+  #define STEP(a,b,c) do { a = a*3+1; b = b*5+2; c = c*7+3; \
+                            a ^= a>>5; b ^= b>>7; c ^= c>>9; } while (0)
+  for (long i = 0; i < n; i++) {
+      STEP(a,b,c); STEP(a,b,c); ...  /* 共 512 次 */ ... STEP(a,b,c);
+  }
+  ```
+  循环体宏展开后约 8000 条指令，远超 Op Cache 容量，`op_cache_miss / all_accesses` 会升到 20% 以上，真正的 Frontend Bound。
+
+&emsp;&emsp;后续所有实验在看 CPI 之前，先看 `cache-misses / cache-references`、`ex_ret_brn_misp / ex_ret_brn` 和 `op_cache_miss / all_accesses` 三个比值。**三个比值都低、CPI 也低**——基准失效或 Retiring（需要进一步区分）；**某个比值高**——信号明确，下钻到对应的 Zen 3 事件。**v2 是唯一被数据证实的瓶颈**，它的 `cache-misses / cache-references = 48.4%` 和 `ls_mab_alloc = 13.2M` 一起，给出了 Memory Bound 的直接证据。**v3 和 v4 的失效不是坏事**——它们恰好演示了第 2 章的教训在更大规模上的延续：**“执行了循环”和“执行了你想测的那条路径”是两件不同的事**，只有 PMU 事件计数能区分这两种状态。
 
 
 ## 4. Top-Down 方法论与 5600X 上的采集实现
+
+&emsp;&emsp;本章实验沿用第 2、3 章的测量纪律：EPP 固定为 `performance`，`taskset -c 2` 绑单核，n = 1e7，每个事件独立一个 `-e`。四个 workload 分别对应四个桶的设计意图：
+
+```c
+// topdown_bench.cpp 的核心函数（完整代码见附录）
+__attribute__((noinline)) long core_bound(long n) {         // v1: Core Bound
+    long a = 1;
+    for (long i = 0; i < n; i++) {
+        __asm__ __volatile__("" : "+r"(a) : : "memory");
+        a = a / g_divisor + (i & 7) + 1;                     // volatile 除数，强制 idiv
+        __asm__ __volatile__("" : "+r"(a) : : "memory");
+    }
+    return a;
+}
+
+__attribute__((noinline)) long memory_bound(const long *next, long n, long s) {  // v2: Memory Bound
+    long idx = s, sum = 0;
+    for (long i = 0; i < n; i++) {
+        idx = next[idx];                                     // 8MB 随机指针追逐
+        sum += idx;
+        __asm__ __volatile__("" : "+r"(idx), "+r"(sum) : : "memory");
+    }
+    return sum;
+}
+
+__attribute__((noinline)) long branch_bound(const int *data, long n) {          // v3: Bad Speculation
+    long sum = 0;
+    for (long i = 0; i < n; i++) {
+        int v = data[i];
+        if (v >= 128) { sum += v; __asm__ __volatile__("" : "+r"(sum) : : "memory"); }
+        else          { sum -= v; __asm__ __volatile__("" : "+r"(sum) : : "memory"); }
+    }
+    return sum;
+}
+
+__attribute__((noinline)) long frontend_bound(long n) {     // v4: Frontend Bound
+    long a = 1, b = 2, c = 3;
+    for (long i = 0; i < n; i++) {
+        /* 512 次 STEP 宏展开，循环体约 7176 条 macro-op，超 Op Cache 容量 */
+        __asm__ __volatile__("" : "+r"(a), "+r"(b), "+r"(c) : : "memory");
+    }
+    return a ^ b ^ c;
+}
+```
+
+&emsp;&emsp;采集分两层：**Level 1** 用 `cycles`、`ex_ret_instr`、`ex_ret_brn`、`ex_ret_brn_misp`、`cache-references`、`cache-misses` 六个事件算 CPI 和三个比值；**Layer 2** 用 `op_cache_hit_miss.*`、`de_dis_cops_from_decoder.*`、`ls_mab_alloc.*` 三个 Zen 3 组事件下钻到前端和内存子系统。`perf list metric | grep -i pipeline` 在实测中返回空——**`PipelineL1` metric 在 5600X 这版 perf 上不可用**，所以 Level 1 的四个桶必须从原始事件近似，不能像 Intel 那样直接跑 `--topdown`。
+
+```bash
+# Level 1：六个事件
+taskset -c 2 sudo perf stat -e cycles -e ex_ret_instr -e ex_ret_brn \
+    -e ex_ret_brn_misp -e cache-references -e cache-misses \
+    ./topdown_bench -v <1|2|3|4> -n 10000000
+
+# Layer 2 前端
+taskset -c 2 sudo perf stat -e cycles -e op_cache_hit_miss.all_op_cache_accesses \
+    -e op_cache_hit_miss.op_cache_miss \
+    -e de_dis_cops_from_decoder.disp_op_type.any_integer_dispatch \
+    ./topdown_bench -v <1|2|3|4> -n 10000000
+
+# Layer 2 内存
+taskset -c 2 sudo perf stat -e cycles -e ls_mab_alloc.load_store_allocations \
+    -e cache-references -e cache-misses \
+    ./topdown_bench -v <1|2|3|4> -n 10000000
+```
+
+&emsp;&emsp;四个精心设计的 workload 中只有两个落入了设计意图的桶——v2 的 `cache-misses / cache-references = 47.3%` 和 `ls_mab_alloc / n = 1.32` 确认了 Memory Bound；v4 的 `op_cache_miss / all_accesses = 84.1%` 和 `de_dis_cops / cycles = 3.19` 确认了 Frontend Bound。v1 的三次修复（乘法链 → 常数除法 → volatile 除数）全部失效——Zen 3 的约 320 条 ROB 和 6-wide dispatch 足以把 idiv 的 20+ cycle 延迟藏在后续独立指令后面；v3 的 `ex_ret_brn_misp / ex_ret_brn = 7.9%` 说明 asm 屏障仍然没能阻止编译器把数据分支优化掉。**这两个失效不是实验失败，而是 5600X 上做 Top-Down 诊断的两个真实边界**——它们和 v2/v4 的成功一起，构成了本章的核心叙事：**Top-Down 的路由结果必须用 PMU 数据验证，验证失败时的信息量往往比成功时更大**。
 
 ### 4.1 Level 1 的四个类别
 
 &emsp;&emsp;Top-Down Level 1 输出四个互斥类别，总和约 100%：**Frontend Bound**（取指/解码供给不足）、**Backend Bound**（执行或内存资源成为瓶颈）、**Bad Speculation**（错误推测浪费槽位）、**Retiring**（槽位被有效退休指令填充）。
 
-<svg width="760" height="290" viewBox="0 0 760 290" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
-  <rect x="8" y="8" width="744" height="274" fill="#fafafa" stroke="#ccc" rx="6"/>
-  <defs><marker id="a2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
-  <rect x="290" y="35" width="180" height="36" fill="#e3f2fd" stroke="#1565c0" stroke-width="2" rx="5"/>
-  <text x="316" y="58" font-size="12" font-weight="bold" fill="#1565c0">Dispatch Slots</text>
-  <rect x="30" y="105" width="150" height="36" fill="#fff3e0" stroke="#ef6c00" stroke-width="2" rx="5"/><text x="62" y="128" font-size="11" fill="#ef6c00" font-weight="bold">Frontend</text>
-  <rect x="210" y="105" width="150" height="36" fill="#ffebee" stroke="#c62828" stroke-width="2" rx="5"/><text x="228" y="128" font-size="11" fill="#c62828" font-weight="bold">Bad Spec.</text>
-  <rect x="390" y="105" width="150" height="36" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2" rx="5"/><text x="434" y="128" font-size="11" fill="#2e7d32" font-weight="bold">Retiring</text>
-  <rect x="570" y="105" width="150" height="36" fill="#ede7f6" stroke="#4527a0" stroke-width="2" rx="5"/><text x="602" y="128" font-size="11" fill="#4527a0" font-weight="bold">Backend</text>
-  <line x1="380" y1="71" x2="105" y2="105" stroke="#888" marker-end="url(#a2)"/><line x1="380" y1="71" x2="285" y2="105" stroke="#888" marker-end="url(#a2)"/>
-  <line x1="380" y1="71" x2="465" y2="105" stroke="#888" marker-end="url(#a2)"/><line x1="380" y1="71" x2="645" y2="105" stroke="#888" marker-end="url(#a2)"/>
-  <rect x="20" y="175" width="170" height="55" fill="#fff" stroke="#ef6c00" rx="4"/>
-  <text x="38" y="197" font-size="10" fill="#ef6c00">op_cache_hit_miss</text><text x="38" y="215" font-size="10" fill="#ef6c00">de_dis_cops…</text>
-  <rect x="210" y="175" width="150" height="55" fill="#fff" stroke="#c62828" rx="4"/>
-  <text x="228" y="197" font-size="10" fill="#c62828">branch-misses</text><text x="228" y="215" font-size="10" fill="#c62828">L1 BTB</text>
-  <rect x="390" y="175" width="150" height="55" fill="#fff" stroke="#2e7d32" rx="4"/><text x="430" y="207" font-size="10" fill="#2e7d32">instructions</text>
-  <rect x="570" y="175" width="170" height="55" fill="#fff" stroke="#4527a0" rx="4"/>
-  <text x="588" y="197" font-size="10" fill="#4527a0">ls_mab_alloc</text><text x="588" y="215" font-size="10" fill="#4527a0">l2/l3 miss</text>
-  <line x1="105" y1="141" x2="105" y2="175" stroke="#ccc" stroke-dasharray="3,2"/><line x1="285" y1="141" x2="285" y2="175" stroke="#ccc" stroke-dasharray="3,2"/>
-  <line x1="465" y1="141" x2="465" y2="175" stroke="#ccc" stroke-dasharray="3,2"/><line x1="645" y1="141" x2="645" y2="175" stroke="#ccc" stroke-dasharray="3,2"/>
-  <text x="30" y="263" font-size="10" fill="#666">5600X 上：用原始事件映射到四桶，比 Intel 式自动四桶更可靠</text>
-</svg>
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_9ede2b.svg)
 
 ### 4.2 在 5600X 上采集 Level 1
 
-&emsp;&emsp;`perf stat --topdown` 在 Zen 3 上回退到手动公式和原始 PMU 事件。5600X 没有与 Intel TMA 完全对应的硬件级槽位分类器，所以需要理解 Level 1 的来源是 **dispatch slot 的 stall 分解**。
+&emsp;&emsp;`perf stat --topdown` 在 Zen 3 上回退到手动公式和原始 PMU 事件。5600X 没有与 Intel TMA 完全对应的硬件级槽位分类器，`PipelineL1` metric 在实测中不可用——所以 Level 1 的四个桶必须从原始事件**近似**：
 
-```bash
-# 方式一：使用 perf 的 PipelineL1 指标
-perf stat -M PipelineL1 ./workload
+| 桶 | 近似判据 | 主要事件 |
+|---|---|---|
+| **Frontend Bound** | `op_cache_miss / all_accesses > 10%` 且 `de_dis_cops / cycles > 3` | `op_cache_hit_miss.*`、`de_dis_cops_from_decoder.*` |
+| **Bad Speculation** | `ex_ret_brn_misp / ex_ret_brn > 30%` | `ex_ret_brn_misp`、`ex_ret_brn` |
+| **Backend Bound / Memory** | `cache-misses / cache-references > 30%` 且 `ls_mab_alloc / n > 0.5` | `cache-misses`、`ls_mab_alloc` |
+| **Backend Bound / Core** | CPI 高（> 2）且以上三个比值都低 | 排除法 |
+| **Retiring** | CPI 低（< 1）且以上三个比值都低 | 排除法 |
 
-# 方式二：直接用原始事件组，手动映射
-perf stat -e cycles,instructions,\
-          op_cache_hit_miss,de_dis_cops_from_decoder,\
-          ls_mab_alloc,dispatch_stalls ./workload
-```
+&emsp;&emsp;四个 workload 的实际数据如下（n = 1e7，EPP = performance，`taskset -c 2`）：
+
+**表 4-1 · 四个版本的 Level 1 与 Layer 2 关键比值**
+
+| 版本 | 设计意图 | CPI | `cache-miss%` | `brn-misp%` | `op_cache-miss%` | `ls_mab_alloc/n` | 实际落桶 |
+|---|---|---|---|---|---|---|---|
+| v1 core | Core Bound | **0.96** | — | — | — | — | **失效（Retiring）** |
+| v2 chase | Memory Bound | **4.96** | **47.3%** | 3.4% | 19.8% | **1.32** | **✅ Memory Bound** |
+| v3 branch | Bad Speculation | **0.62** | 7.0% | **7.9%** | 7.8% | 0.23 | **失效（分支被消除）** |
+| v4 frontend | Frontend Bound | **0.358** | 2.5% | 8.0% | **84.1%** | 0.12 | **✅ Frontend Bound** |
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_0e5298.svg)
+
+&emsp;&emsp;**v2 是唯一被数据证实的 Memory Bound**。`cache-misses / cache-references = 11,722,664 / 24,774,509 = 47.3%`——近一半的缓存访问都 miss 到 L2/L3。`ls_mab_alloc / n = 13,217,809 / 10,000,000 = 1.32`——每次迭代平均分配 1.32 个 MAB 条目，排队等 L3 返回。两个内存事件同时高，CPI 5.0 是这个等待的直接结果。`op_cache_miss / all_accesses = 19.8%` 看起来也高，但这是因为指针追逐的随机性导致代码预取失效，不是前端供给成为瓶颈——`de_dis_cops / cycles = 117.9M / 588.9M = 0.20`，远低于 3，说明解码器没有成为瓶颈。
+
+&emsp;&emsp;**v4 是唯一被数据证实的 Frontend Bound**。`op_cache_miss / all_op_cache_accesses = 3,730,052,076 / 4,432,747,576 = 84.1%`——512 次 STEP 展开（约 7176 条 macro-op）远超 Zen 3 的 4096 uop Op Cache 容量，绝大多数取指回落到 4-wide 解码器。`de_dis_cops / cycles = 82,021,949,578 / 25,693,920,601 = 3.19`——每周期从解码器分发 3.19 个 cop，接近 4-wide 解码器的上限。**两项签名同时命中**，CPI 0.358 只是“指令多但每条都不等”的表面现象，真正的瓶颈是前端供给带宽。
+
+&emsp;&emsp;**v1 和 v3 都是基准失效**。v1 的 CPI 0.96 看起来“健康”，但三次修复（乘法链 → 常数除法 → volatile 除数）全部失败——`result = 11` 说明除法确实执行了，但 Zen 3 的约 320 条 ROB 把 `idiv` 的 20+ cycle 延迟藏在了后续独立指令后面，CPI 被稀释到 1 以下。v3 的 `ex_ret_brn_misp / ex_ret_brn = 6,271,330 / 79,042,222 = 7.9%`——远低于 Bad Speculation 的 30% 阈值，说明 `asm` 屏障仍然没能阻止编译器把数据分支优化成 `cmov` 或条件选择，真正的分支只有循环控制分支（10M 次 taken，最后一次不 taken，误预测率极低）。
 
 ### 4.3 下钻到 Level 2：Backend Bound 的 Memory/Core 分裂
 
 &emsp;&emsp;Backend Bound 被划分为 Memory Bound 和 Core Bound。**Memory Bound 是一个桶，不是一种原因**。里面同时装着 L1D 缺失、L2/L3 缺失、DTLB 缺失、预取效率不足、以及带宽饱和。在 5600X 上，Memory Bound 内部需要特别关注 **MAB（Miss Address Buffer）分配压力**：`ls_mab_alloc` 直接反映 load/store 请求在 miss 队列中的排队程度。所有 6 个核心共享 32MB L3，L3 未命中会经过 Infinity Fabric 走向内存控制器，而 FCLK/UCLK/MCLK 的同步状态决定了未命中的实际延迟。
 
+&emsp;&emsp;v2 的数据给出了这个分裂的直接证据：`cache-misses / cache-references = 47.3%` 说明缓存缺失率高，`ls_mab_alloc / n = 1.32` 说明每次缺失都在 MAB 里排队。**两个事件一起看，才能确认“慢在等 L3”，而不是“慢在执行端口”**——v2 的 `op_cache_miss = 19.8%` 虽然也不低，但 `de_dis_cops / cycles = 0.20` 说明前端供给不是瓶颈，`ls_mab_alloc` 才是真正的排队点。
+
+&emsp;&emsp;**v1 的失效恰好是 Core Bound 的反面证据**。设计意图是“串行 idiv 依赖链让后端执行资源成为瓶颈”，但 Zen 3 的宽乱序窗口把 idiv 的延迟藏了起来，CPI 降到 0.96——四个比值全部低，看起来像 Retiring，实际上是“基准没有制造出 Core Bound”。**在 5600X 上制造 Core Bound 需要比 Intel 苛刻得多的条件**（端口冲突、序列化指令、或极长的依赖链），这不是代码问题，是 Zen 3 的微架构特性。
+
 ### 4.4 最小闭环：预取在什么条件下无效
 
-```c
-// 基线
-for (size_t i = 0; i < n; i++) a[i] = b[i] + c[i];
+&emsp;&emsp;v5 是流式 triad 基线（`a[i] = b[i] + c[i]`，256MB 工作集超出 32MB L3），v6 用 `__builtin_prefetch` 提前 16 个迭代预取 `b` 和 `c`。数据如下：
 
-// 软件预取
-for (size_t i = 0; i < n; i++) {
-    __builtin_prefetch(&b[i + 16], 0, 0);
-    __builtin_prefetch(&c[i + 16], 0, 0);
-    a[i] = b[i] + c[i];
-}
-```
+**表 4-2 · 预取实验（n = 67108864，256MB 工作集）**
 
-&emsp;&emsp;选一个工作集超过 32MB L3 的内存带宽敏感 kernel。如果已经处于内存带宽上限，预取**不会降低 Backend Bound**——它只是把“延迟问题”换成了“带宽问题”。**“改了—重测—解释为什么变了或没变”** 才是 TMA 的使用方式，而不是“Backend Bound 高就加预取”。
+| 指标 | v5 baseline | v6 预取 | 变化 |
+|---|---|---|---|
+| cycles | 2,782,432,894 | 2,806,034,566 | **+0.85%** |
+| `ex_ret_instr` | 5,676,460,733 | 5,994,411,209 | +5.6% |
+| `cache-references` | 124,651,733 | 125,110,436 | +0.37% |
+| `cache-misses` | 6,354,277 | 6,278,120 | **-1.2%** |
+| `ls_mab_alloc` | 53,545,665 | **47,897,248** | **-10.5%** |
+
+&emsp;&emsp;**预取没有降低 Backend Bound**。`cache-misses` 只降了 1.2%，`ls_mab_alloc` 降了 10.5%——预取确实减少了 MAB 排队压力，但 `cycles` 反而增加了 0.85%。原因在 `ex_ret_instr`：v6 多了 5.6% 的指令（预取指令本身），这些指令填充了原本空闲的槽位，但**没有改变内存控制器的可持续吞吐**。256MB 工作集在 DDR4-3600 双通道上的可持续带宽约 25 GB/s，预取只是让请求更早进入 MAB 队列，队列的**平均长度**没有显著缩短——`ls_mab_alloc` 降 10.5% 是因为预取把部分 demand miss 转成了 prefetch hit，但 `cycles` 的瓶颈已经从“延迟等待”切换到了“带宽饱和”。
+
+&emsp;&emsp;**“改了—重测—解释为什么变了或没变”** 才是 TMA 的使用方式。v5 → v6 的改动让 `ls_mab_alloc` 降了 10.5%，但 `cycles` 没降——这说明预取解决的是“MAB 排队”，不是“内存带宽”。如果已经处于带宽上限，预取**不会降低 Backend Bound**——它只是把“延迟问题”换成了“带宽问题”。**判据不是“预取有没有让 cache-misses 下降”，而是“预取有没有让 cycles 下降”**——后者才是 Backend Bound 是否被真正缓解的唯一标准。
+
+### 4.5 小结
+
+&emsp;&emsp;四个精心设计的 workload，只有 v2（Memory Bound）和 v4（Frontend Bound）落入了设计意图的桶。v1 和 v3 的失效不是实验失败——它们恰好演示了第 1 章的主题在 Top-Down 层面的延续：
+
+- **v1 的多次修复**（乘法链 → 常数除法 → runtime 除法 → volatile 序列化）全部被编译器或 Zen 3 的乱序窗口化解。**在 5600X 上制造 Core Bound 需要比 Intel 苛刻得多的条件**——这是 Zen 3 的微架构特性，不是代码问题。
+- **v3 的 `asm` 屏障**（两个分支体各自带 `asm volatile`）仍然没能阻止编译器把数据分支优化掉。`ex_ret_brn_misp / ex_ret_brn = 7.9%` 说明真正的数据分支几乎不存在，只有循环控制分支被保留。**在 clang -O2 -march=znver3 下制造 Bad Speculation，需要比 `asm` 屏障更激进的序列化手段**（函数调用边界、`noinline` 分支体、或 `__builtin_expect` 配合 `noinline`）。
+
+&emsp;&emsp;**这两个失效是本章最有价值的教学内容**。它们说明：**Top-Down 的路由结果必须用 PMU 数据验证，而不是假设“设计了哪个桶就会落到哪个桶”**。v2 和 v4 的成功证明了“用原始事件映射到四个桶”在 5600X 上是可行的；v1 和 v3 的失效证明了“桶的设计意图”和“实际测到的桶”之间隔着编译器优化和微架构特性两层，每一层都需要用 PMU 数据去验证。**验证失败时的信息量，往往比成功时更大**——它指出了基准设计中的隐藏假设，只有修正这些假设，下一轮测量才能落到真正的瓶颈上。
 
 
 ## 5. 前端双路径：解码器、Op Cache 与 dispatch
