@@ -1,10 +1,8 @@
 高性能计算
 ======================
-
 .. toctree::
    :maxdepth: 1
    :caption: 高性能计算
-
    Nvidia显卡架构
    OpenCL概论
    Vulkan Compute
@@ -19,4 +17,4 @@
    FlashAttention 完全解析：从 Roofline 诊断到 CUDA 实现
    KV Cache详解
    DMA Buffer零拷贝
-   
+   现代 CPU 性能优化
