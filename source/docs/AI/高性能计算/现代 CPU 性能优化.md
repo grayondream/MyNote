@@ -1042,104 +1042,117 @@ clang++-22 -O2 -march=znver3 -ffast-math -o roofline_bench roofline_bench.cpp -p
 
 &emsp;&emsp;每个实验的结构：**基线测量 → 预测 → 改一行/几行 → 重新测量 → 用微架构机制解释差异**。
 
-### 11.1 False Sharing：同一缓存行上的两个写者
+## 11.1 False Sharing：同一缓存行上的两个写者
 
-```c
-#include <pthread.h>
-#include <stdio.h>
+**表 11-1 · 裸跑（每线程 1 亿次递增，cpu0+cpu1）**
 
-struct counters_bad  { long a; long b; };
-struct counters_good { alignas(64) long a; alignas(64) long b; };
+| 版本 | 布局 | 时间 | ns/inc | result |
+|---|---|---|---|---|
+| **v1** | a、b 同一条 64B 行 | **675.8 ms** | **3.38** | a=100000000, b=100000000 |
+| **v2** | a、b 各占一条 64B 行 | **40.6 ms** | **0.20** | a=100000000, b=100000000 |
 
-static void *worker(void *arg) {
-    long *p = (long *)arg;
-    for (long i = 0; i < 100000000; i++) (*p)++;
-    return NULL;
-}
+**表 11-2 · PMU 事件（单次运行）**
 
-int main(void) {
-    struct counters_bad c;
-    pthread_t t1, t2;
-    pthread_create(&t1, NULL, worker, &c.a);
-    pthread_create(&t2, NULL, worker, &c.b);
-    pthread_join(t1, NULL); pthread_join(t2, NULL);
-    printf("%ld %ld\n", c.a, c.b);
-    return 0;
-}
-```
+| 指标 | v1（同缓存行） | v2（独占行） | 比值 |
+|---|---|---|---|
+| `cache-references` | **39,094,352** | **374,314** | **104×** |
+| `cache-misses` | **37,496,977** | **97,861** | **383×** |
+| miss rate | **95.9%** | 26.1% | — |
+| `cycles` | **5,678,147,536** | **226,365,549** | **25.1×** |
+| `ex_ret_instr` | 681,974,281 | 664,598,866 | **1.03×** |
+| **CPI** | **8.33** | **0.341** | **24.4×** |
+| **每递增引用数** | **0.195** | **0.0019** | **104×** |
 
-```bash
-perf stat -e cache-misses,cache-references,cycles,instructions ./false_sharing
-```
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_1a1f56.svg)
 
-&emsp;&emsp;**预测**：对齐后 `cache-misses` 应显著下降，`cycles` 应下降，`instructions` 基本不变。
+&emsp;&emsp;**时间差 16.7 倍**——v1 的 675.8 ms，v2 的 40.6 ms，`ns/inc` 从 3.38 降到 0.20。同样的循环、同样的指令、同样的线程数，只因两个 `long` 是否在同一条缓存行上，吞吐差了 16.7 倍。`ex_ret_instr` 几乎相同（681M vs 664M），但 `cache-references` 差 104 倍（3909 万 vs 37.4 万），`cache-misses` 差 383 倍（3750 万 vs 9.8 万），CPI 从 8.33 降到 0.341——**所有差异都在“等待”，不在“计算”**。miss rate 不能直接用于诊断：v1 的 95.9% 和 v2 的 26.1% 看起来都“不健康”，但 v2 的 9.8 万次 miss 落在 L2/L3，代价几乎为零；v1 的 3750 万次全部是跨核 RFO，每次都是整条缓存行迁移——**同一个百分比，绝对代价差 383 倍**。
 
-<svg width="760" height="200" viewBox="0 0 760 200" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
-  <rect x="8" y="8" width="744" height="184" fill="#fafafa" stroke="#ccc" rx="6"/>
-  <text x="30" y="32" font-size="12" font-weight="bold" fill="#333">False sharing：不同核心写同一缓存行的不同字节</text>
-  <defs><marker id="red" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#c62828"/></marker></defs>
-  <text x="30" y="65" font-size="11" fill="#333" font-weight="bold">未填充</text>
-  <rect x="130" y="50" width="480" height="40" fill="#ffcdd2" stroke="#c62828" stroke-width="2"/><rect x="130" y="50" width="240" height="40" fill="#ef9a9a" opacity="0.7"/>
-  <text x="220" y="75" font-size="11" fill="#7f0000" font-weight="bold">core0 写</text><text x="420" y="75" font-size="11" fill="#7f0000" font-weight="bold">core1 写</text>
-  <path d="M370,50 Q400,30 430,50" fill="none" stroke="#c62828" stroke-width="2" marker-end="url(#red)"/>
-  <path d="M430,90 Q400,110 370,90" fill="none" stroke="#c62828" stroke-width="2" marker-end="url(#red)"/>
-  <text x="630" y="75" font-size="10" fill="#c62828" font-weight="bold">同一行</text>
-  <text x="30" y="145" font-size="11" fill="#333" font-weight="bold">对齐后</text>
-  <rect x="130" y="130" width="230" height="40" fill="#c8e6c9" stroke="#2e7d32" stroke-width="2"/><text x="200" y="155" font-size="11" fill="#1b5e20" font-weight="bold">core0 写</text>
-  <rect x="380" y="130" width="230" height="40" fill="#c8e6c9" stroke="#2e7d32" stroke-width="2"/><text x="450" y="155" font-size="11" fill="#1b5e20" font-weight="bold">core1 写</text>
-  <text x="640" y="155" font-size="10" fill="#2e7d32" font-weight="bold">各行独占</text>
-</svg>
+&emsp;&emsp;缓存一致性协议以缓存行为单位。核心 0 写 `a` 时，核心 1 中该行被置为 Invalid；核心 1 写 `b` 时，必须重新获取整行所有权——**即使 `a`、`b` 只差 8 字节、语义上完全无关，一致性流量仍以 64 字节为粒度发生**。`alignas(64)` 把两者分到独立的缓存行，两个核心各持有自己的行，不再触发 RFO。代价是每计数器浪费 56 字节，换来 16.7 倍的时间差——**用 56 字节换 635 毫秒**。
 
-&emsp;&emsp;**解释机制**：缓存一致性协议以缓存行为单位。核心 0 写入字节 0 时，核心 1 缓存中的该行被置为 Invalid；核心 1 写入字节 8 时，需要重新获取所有权。即使访问的字节没有重叠，一致性流量仍然以整行为粒度发生。
+&emsp;&emsp;两个核心在 MESI 状态机上反复拉锯，每次运行的碰撞节奏不同。v2 的时间序列方差极小（40.6 ms 附近波动 < 0.1%），因为两个核心独立推进，没有共享状态机。**方差本身就是 false sharing 的指纹**。
 
-### 11.2 Op Cache 驻留率：代码足迹对 Frontend Bound 的影响
+## 11.2 Op Cache 驻留率：代码足迹对 Frontend Bound 的影响
 
-```c
-// A：循环体小，能驻留 Op Cache
-for (size_t i = 0; i < n; i++) out[i] = in[i] * 2 + 1;
+&emsp;&emsp;通过改变循环的指令数量来改变Op的cach驻存，实测数据：
 
-// B：手工展开 + 巨型内联，超出 Op Cache 容量
-for (size_t i = 0; i < n; i += 8) {
-    out[i+0] = in[i+0] * 2 + 1; out[i+1] = in[i+1] * 2 + 1;
-    /* ... 反复展开 ... */
-}
-```
+**表 11-3 · 两个代码足迹的指令数与 Op Cache 行为**
 
-```bash
-perf stat -e cycles,instructions,op_cache_hit_miss,\
-          de_dis_cops_from_decoder ./opcache_bench
-```
+| 版本 | STEP | n | `ex_ret_instr` | instr/iter | `all_op_cache_accesses` | `op_cache_miss` | **miss rate** |
+|---|---|---|---|---|---|---|---|
+| A | 4 | 1e8 | 5,808,200,039 | **58.08** | 403,077,498 | 1,761,517 | **0.44%** |
+| B | 512 | 1e6 | 7,180,503,251 | **7180.5** | 444,652,982 | 376,375,938 | **84.6%** |
 
-&emsp;&emsp;**预测**：A 的 `op_cache_hit` 比例高、Frontend Bound 低；B 的 `op_cache_miss` 上升，`de_dis_cops_from_decoder` 成为前端供给的主要来源。
+**表 11-4 · 两个代码足迹的分发速率**
 
-&emsp;&emsp;**解释机制**：在 5600X 上，“前端慢”不等于“分支预测差”或“取指带宽不够”，它首先等于“Op Cache 没接住”。
+| 版本 | cycles | `de_dis_cops` | **`de_dis_cops / cycles`** |
+|---|---|---|---|
+| A | 2,016,084,632 | 6,513,038,117 | **3.23** |
+| B | 2,645,103,862 | 8,208,863,823 | **3.10** |
 
-### 11.3 分支排序：Bad Speculation 是输入顺序的函数
+&emsp;&emsp;**`ex_ret_instr / n` 严格按 STEP 次数成比例**——A 是 58.08，B 是 7180.5，比值 123.6，与 STEP 次数比（512/4 = 128）差 3.4%。差异来自循环控制指令的固定开销（每次迭代 3–4 条）在 A 中占比更高。**两个版本的指令数都符合源码预期，没有跨 STEP 折叠**。
 
-```c
-for (size_t i = 0; i < n; i++)
-    if (data[i] >= 128) sum += data[i];
-```
+&emsp;&emsp;**Op Cache miss 从 0.44% 跳到 84.6%**——A 的 58 条 macro-op 完全在 Zen 3 的 4096 uop Op Cache 内，403M 次访问中只有 1.76M 次 miss；B 的 7180 条远超 4096 uop，444M 次访问中有 376M 次 miss。**这就是 Op Cache 容量边界的直接读数：58 条完全接住，7180 条彻底溢出**。
 
-```bash
-perf stat -e branches,branch-misses ./branch_bench_unsorted
-perf stat -e branches,branch-misses ./branch_bench_sorted
-```
+&emsp;&emsp;**但 `de_dis_cops / cycles` 几乎不变：3.23 vs 3.10**——A 走 8-wide Op Cache 路径，B 走 4-wide 解码器路径，两条路径的供给能力差一倍，分发速率却几乎相同。原因在后端：STEP 宏内三条独立链各自的依赖链约 6 cycles，每 6 cycles 退休约 18 条指令，即 **3.0 cop/cycle**——后端的消费速率始终低于解码器的 4-wide 上限，**Op Cache 溢出没有转化为前端供给不足**。
 
-&emsp;&emsp;**预测**：随机输入的 `branch-misses / branches` 应显著高于排序输入。不可预测输入下误预测率可达 25% 量级；排序后相同方向的长序列使预测器容易学习，误预测率骤降。
+&emsp;&emsp;**这就是 11.2 与第 5 章的核心判据：Op Cache 溢出只是“前端走了慢路径”，不等于“前端成为瓶颈”**。判据是 `de_dis_cops / cycles` 与 4 的关系：< 3.5 说明后端受限（前端路径切换无关）；3.5–4.0 说明前端接近瓶颈；≈ 4.0 说明分发被 4-wide 解码器锁死，真正的 Frontend Bound。**A 和 B 都落在第一行（3.23 / 3.10）——看到 `op_cache_miss = 84.6%` 就认为“需要减少代码足迹”是错的**，因为后端才是瓶颈，减少代码足迹不会改善性能。
 
-### 11.4 预取 + FCLK 同步：Memory Bound 的两个独立杠杆
+&emsp;&emsp;**“前端慢”在 5600X 上不等于“分支预测差”或“取指带宽不够”，它首先等于“Op Cache 没接住”**——但“没接住”只是路径切换，要转化为真正的瓶颈，还需要后端的消费速率超过解码器的供给能力。**这就是为什么 11.2 的判据不是单一的 `op_cache_miss%`，而是两个比值的组合：`op_cache_miss / all_accesses` 告诉你“走了哪条路径”，`de_dis_cops / cycles` 告诉你“这条路径是否成为瓶颈”**。
 
-```bash
-# 场景 1：JEDEC DDR4-3200，FCLK 1600（1:1）
-perf stat -e cycles,instructions,ls_mab_alloc,l3_misses_from_l2_misses ./stream_triad
+## 11.3 分支排序：Bad Speculation 是输入顺序的函数
 
-# 场景 2：DDR4-3600，FCLK 1800（1:1）
-# 场景 3：DDR4-4000，UCLK 2:1（分频）
-# 每个场景分别跑 baseline 和软件预取版本
-```
+&emsp;&emsp;通过随机排列来改变访问顺序，来模拟分支预测频繁失败和成功的对比：
 
-&emsp;&emsp;**预测**：如果瓶颈在内存延迟而非带宽，FCLK 1:1 同步的收益可能大于软件预取；如果瓶颈在带宽饱和，预取可能只改变 L1/L2 命中率而不降低 `ls_mab_alloc` 的排队压力。
+**表 11-6 · 随机顺序 vs 排序后（n = 16M，perf 只统计 `branch_sum`）**
+
+| 版本 | `ex_ret_brn` | `ex_ret_brn_misp` | **misp rate** | `cycles` | `ex_ret_instr` | CPI |
+|---|---|---|---|---|---|---|
+| 随机 | 65,087,869 | 10,758,908 | **16.5%** | 457,047,346 | 238,700,679 | **1.91** |
+| 排序 | 64,594,606 | 2,349,536 | **3.64%** | 265,873,630 | 236,455,558 | **1.12** |
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_118afc.svg)
+
+&emsp;&emsp;**`ex_ret_brn` 两版本几乎相同**（65.09M vs 64.59M，差 0.8%）——排序不改变分支数量，只改变分支方向序列。每元素约 3.9 个分支（一个数据分支 + 循环控制），与源码预期一致。**这是比较有效的前提：两个版本的分支数相同，差异只能来自误预测**。
+
+&emsp;&emsp;**误预测率从 16.5% 降到 3.64%，差 4.5 倍**。随机顺序下，`v >= 128` 的方向由均匀随机数决定，50/50，预测器无法从历史学习；排序后，所有 `<128` 在前、`>=128` 在后，方向形成两个长序列，预测器只在切换点附近错几次。**16.5% 而不是 50%**，是因为 Zen 3 的分支预测器（TAGE 类）对随机序列仍能捕捉一部分短程模式，加上循环控制分支高度可预测，拉低了整体误预测率——**但数据分支本身的误预测率仍然远高于排序后的 3.64%**。
+
+&emsp;&emsp;**CPI 从 1.91 降到 1.12，cycles 从 457M 降到 266M**。`ex_ret_instr` 两版本几乎相同（238.7M vs 236.5M，差 0.9%）——指令流没有变化，**42% 的 cycles 差异全部来自 Bad Speculation**：随机顺序下每次误预测冲刷流水线约 15–20 cycles，10.76M 次误预测 × 17.5 ≈ 188M cycles，与实测的 191M cycles 差值（457M − 266M）精确吻合。
+
+&emsp;&emsp;**判据：`ex_ret_brn_misp / ex_ret_brn`**。这个比值是 Bad Speculation 的直接读数——> 10% 说明分支预测失败是主要瓶颈，< 5% 说明分支预测没有拖后腿。**同一个内核、同一组数据分布、同样的分支数，只因为输入顺序不同，误预测率差 4.5 倍、cycles 差 1.7 倍**——这是 Bad Speculation 作为“输入顺序的函数”的直接证据。
+
+&emsp;&emsp;**排序不是优化，是把“不可预测”变成“可预测”的输入预处理**。排序本身有成本（16M 元素约 0.5–1 秒），但如果内核要被反复执行（数据库扫描、图像遍历），排序成本可以被多次执行摊销。**判断“排序是否值得”的算术是：排序成本 ÷ 单次内核节省的 cycles**——如果内核执行 100 次，排序的 0.5 秒摊销到每次 5 ms，而单次节省约 100 ms（457M − 266M cycles / 4.6 GHz），排序就是值得的。**这个判断不需要 profiler，只需要一个除法**——与第 10 章 Roofline 的“静态判断”是同一种纪律。
+
+## 11.4 预取 + FCLK 同步：Memory Bound 的两个独立杠杆
+
+&emsp;&emsp;主动预取和非预取对比：
+
+**表 11-7 · baseline vs prefetch（16M float × 3 数组 = 192MB，10 次重复，单核）**
+
+| 指标 | baseline（5 轮中位数） | prefetch（5 轮中位数） | 变化 |
+|---|---|---|---|
+| `cycles` | **740,529,264** | **868,044,046** | **+17.22%** |
+| `cache-references` | 97,955,206 | 108,989,009 | +11.3% |
+| `cache-misses` | 4,216,334 | 3,670,370 | **-13.0%** |
+| `ls_mab_alloc` | **42,042,937** | **31,829,241** | **-24.3%** |
+
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_0fc859.svg)
+
+&emsp;&emsp;**预取降了 MAB 排队 24%、cache-misses 13%，但 cycles 反而升了 17%**——这与“预取改善性能”的直觉完全相反。原因很具体：**triad 是顺序访问，硬件预取器已经完美预测了访问模式，软件预取是冗余的**。
+
+&emsp;&emsp;**`ls_mab_alloc` 从 42M 降到 32M（-24%）**——软件预取把 `b[i+16]` 和 `c[i+16]` 提前拉进 L1/L2，让后续的 demand load 在 L1D 命中，MAB 里排队的 demand miss 条目减少。**`cache-misses` 从 4.2M 降到 3.7M（-13%）**——同样的原因，部分 demand miss 被预取转成了 hit。
+
+&emsp;&emsp;**但 `cache-references` 从 97.9M 升到 109.0M（+11.3%）**——**预取指令本身被计为 cache-reference**。每元素 2 条 `__builtin_prefetch`，16M 元素 × 10 次重复 = 3.2 亿次预取指令，但实际只增加了 1100 万次引用——因为预取指令命中已在缓存的数据时可能被合并或丢弃，不产生新的引用。这部分额外引用没有带来新的数据，只是消耗了前端分发带宽和 MAB 条目。
+
+&emsp;&emsp;**`cycles` 上升 17% 的直接原因**：预取指令本身（每元素 2 条）增加了指令数，而这些指令在**已经带宽饱和**的内核上不产生收益——DRAM 带宽上限约 18 GB/s，192MB × 10 次 = 1.92 GB，理论最短时间 107 ms，对应 cycles ≈ 490M。实测 baseline 740M cycles（约 161 ms），已经是带宽饱和状态（有效带宽 11.9 GB/s，低于上限但受 MAB 排队和预取效率限制）。**预取无法突破带宽上限，只是把请求更早地推进队列**——队列长度没有缩短（`ls_mab_alloc` 降了，但每个条目的平均等待时间没有缩短），而预取指令本身消耗了额外的前端带宽和执行槽位。
+
+&emsp;&emsp;**判据：预取有没有降低 `cycles`**。如果 `cycles` 降了 > 5%，说明预取解决了延迟问题（内核尚未带宽饱和）；如果 `cycles` 不变或上升，说明预取没有帮助——**`ls_mab_alloc` 降低只是“请求更早进入队列”，不是“队列更短”**。这个实验里 `cycles` 上升 17%，是预取的负面效果：**多余的指令开销没有被延迟节省抵消**。
+
+&emsp;&emsp;**软件预取的适用边界**：只在**硬件预取器失效**的场景有效——随机指针追逐（第 4 章 v2）、不规则访问模式、跨页边界的大步长。**对顺序流式访问（triad、STREAM、memcpy），硬件预取器已经做到最优，软件预取只会增加开销**。这与第 4.3 节“预取在什么条件下无效”的结论一致，但在 5600X 上更具体：**单核 DDR4-2667 的带宽上限 18 GB/s 在 192MB 工作集下已经饱和，任何“加快字节传输”的优化都无效，只有“减少字节数”有效**。
+
+&emsp;&emsp;**FCLK 同步的杠杆在这个实验里无法单独测试**——当前配置是 DDR4-2667 + FCLK 1333（1:1），要测分频的影响，需要在 BIOS 里把内存频率调到 3600 或 4000，让 FCLK 被迫分频（UCLK 2:1），重跑同样的 triad。**如果 FCLK 分频后 `cycles` 上升 > 10%，说明 FCLK 同步是比预取更强的杠杆**；如果 `cycles` 不变，说明 DDR4-2667 的带宽已经低于分频后的有效带宽，FCLK 不是瓶颈。这个对比需要两次 BIOS 重启，成本较高，但数据比预取实验更有信息量——**预取是代码层面的微调，FCLK 是内存子系统的根本配置，两者的杠杆量级不同**。
+
+&emsp;&emsp;**当前的 baseline vs prefetch 数据已经给出一个有效结论**：在 5600X 上，流式 triad 在 192MB 工作集下已经带宽饱和，软件预取降低 MAB 排队但不降低 cycles，反而因为额外指令增加 17% 的 cycles。**优化访存的优先级应该从“加预取”转向“减少内存流量”**（数据压缩、计算复用、分块让工作集落进 L3），因为带宽已经饱和，预取只是在饱和的管道里重新排列请求。这与第 10 章 Roofline 的结论一致：AI < 1 的内核是严格内存受限，优化方向是**减少字节数**，不是**加快字节传输**。
 
 
 ## 12. 指令集扩展：从 AVX2 到 AVX-512 与 VNNI 的测量边界
