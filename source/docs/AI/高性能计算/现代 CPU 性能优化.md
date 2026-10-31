@@ -155,7 +155,7 @@ static void worker(long *p, long n, std::atomic<int> &ready, std::atomic<int> &g
 
 ## 2. 测量的第一课：基准在测量微架构状态，而不是“计算量”
 
-## 2.1 频率不是常量，但漂移幅度取决于负载
+### 2.1 频率不是常量，但漂移幅度取决于负载
 
 &emsp;&emsp;连续运行同一个 CPU 密集型循环 5 次，中间不插入其他负载。
 
@@ -176,48 +176,7 @@ done
 | `performance` + 5 核 stress-ng，61.8°C | 4600 MHz | 1.31 | 261.3 ms | +0.9% |
 | `performance` + 更重负载 | 4550 MHz | 1.32 | 263.9 ms | +1.9% |
 
-<svg width="760" height="280" viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
-  <rect x="8" y="8" width="744" height="264" fill="#fafafa" stroke="#ccc" rx="6"/>
-  <text x="30" y="34" font-size="13" font-weight="bold" fill="#333">表 2-1 的可视化：时间与频率严格成反比</text>
-  <line x1="80" y1="225" x2="720" y2="225" stroke="#333"/>
-  <line x1="80" y1="225" x2="80" y2="60" stroke="#333"/>
-  <text x="20" y="145" font-size="10" fill="#555" transform="rotate(-90 20,145)">相对 baseline</text>
-  <text x="360" y="260" font-size="10" fill="#555">条件 →</text>
-  <g transform="translate(120,0)">
-    <rect x="0" y="100" width="36" height="125" fill="#c62828"/>
-    <rect x="44" y="216" width="36" height="9" fill="#1565c0"/>
-    <text x="0" y="94" font-size="10" fill="#c62828" font-weight="bold">+13.4%</text>
-    <text x="48" y="210" font-size="10" fill="#1565c0" font-weight="bold">4099</text>
-    <text x="4" y="245" font-size="10" fill="#333">powersave</text>
-  </g>
-  <g transform="translate(290,0)">
-    <rect x="0" y="218" width="36" height="7" fill="#c62828"/>
-    <rect x="44" y="210" width="36" height="15" fill="#1565c0"/>
-    <text x="0" y="210" font-size="10" fill="#c62828" font-weight="bold">基准</text>
-    <text x="48" y="204" font-size="10" fill="#1565c0" font-weight="bold">4649</text>
-    <text x="0" y="245" font-size="10" fill="#333">perf</text>
-  </g>
-  <g transform="translate(460,0)">
-    <rect x="0" y="212" width="36" height="13" fill="#c62828"/>
-    <rect x="44" y="211" width="36" height="14" fill="#1565c0"/>
-    <text x="0" y="206" font-size="10" fill="#c62828" font-weight="bold">+0.9%</text>
-    <text x="48" y="205" font-size="10" fill="#1565c0" font-weight="bold">4600</text>
-    <text x="0" y="245" font-size="10" fill="#333">+5核 62°C</text>
-  </g>
-  <g transform="translate(630,0)">
-    <rect x="0" y="208" width="36" height="17" fill="#c62828"/>
-    <rect x="44" y="209" width="36" height="16" fill="#1565c0"/>
-    <text x="0" y="202" font-size="10" fill="#c62828" font-weight="bold">+1.9%</text>
-    <text x="48" y="203" font-size="10" fill="#1565c0" font-weight="bold">4550</text>
-    <text x="0" y="245" font-size="10" fill="#333">+重负载</text>
-  </g>
-  <g transform="translate(500,40)">
-    <rect x="0" y="0" width="12" height="12" fill="#c62828"/>
-    <text x="18" y="11" font-size="10" fill="#333">耗时</text>
-    <rect x="70" y="0" width="12" height="12" fill="#1565c0"/>
-    <text x="88" y="11" font-size="10" fill="#333">频率（相对值）</text>
-  </g>
-</svg>
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261030_391bcc.svg)
 
 &emsp;&emsp;**时间比与频率比严格一致**：powersave vs performance 是 1.134 倍时间、1.134 倍频率；5 核负载 vs baseline 是 1.009 倍时间、1.010 倍频率；重负载 vs baseline 是 1.019 倍时间、1.021 倍频率。三者都落在 0.5% 的误差内。这说明 `freq_drift` 的循环在四种条件下执行的是**完全相同的指令流**，**时间差异 100% 由频率解释**，没有任何缓存、分支或代码生成的混杂因素。`scaling_cur_freq` 读数与执行速度严格成比例，可以作为微基准频率条件的可靠锚点。
 
@@ -238,14 +197,54 @@ done
 
 ### 2.2 被编译器消除的基准比“测不准”更危险
 
-&emsp;&emsp;朴素微基准会被编译器整个消除。perf-book 的检测方法是：用 PMU 确认 `instructions` 退休数是否与预期相符。如果一条本应执行 1000 次的循环只退休了 3 条指令，基准已经失效。5600X 的 perf 支持一组额外的前端事件，提供第二道信号：
+&emsp;&emsp;朴素微基准会被编译器整个消除。perf-book 的检测方法是：用 PMU 确认 `instructions` 退休数是否与预期相符。如果一条本应执行 1000 次的循环只退休了 3 条指令，基准已经失效。
+
+&emsp;&emsp;在 5600X 上，写四个版本的求和基准，每个版本用不同的方式试图“阻止编译器消除”。v1 朴素——循环内联到调用方，结果只用于 `printf`；v2 每次迭代写 volatile 全局变量；v3 把循环放进 `noinline` 函数，在函数**外部**加 asm 屏障；v4 把 asm 屏障放进循环**内部**。用 `perf stat` 采集 Zen 3 的退休指令数 `ex_ret_instr` 和 Op Cache 事件：
 
 ```bash
-perf stat -e instructions,uops_retired,op_cache_hit_miss,\
-          de_dis_cops_from_decoder ./workload
+PERF_EVENTS="ex_ret_instr,macro_ops_retired,op_cache_hit_miss.all_op_cache_accesses,op_cache_hit_miss.op_cache_miss,de_dis_cops_from_decoder.disp_op_type.any_integer_dispatch"
+
+for v in 1 2 3 4; do
+    echo "=== version $v ==="
+    taskset -c 2 perf stat -e "$PERF_EVENTS" \
+        ./elim_bench -v $v -n 100000000 2>&1 | \
+        grep -E 'version|time|ns/iter|ex_ret_instr|macro_ops_retired|op_cache|de_dis'
+done
 ```
 
-&emsp;&emsp;`op_cache_hit_miss` 和 `de_dis_cops_from_decoder` 是 Zen 3 新增的 vendor events，从 Linux 5.13 起可用。如果编译器消除了一个本应重复执行的循环，`instructions` 与 `op_cache_hit` 的比例会异常——把几组计数放在一起看，比单看 `instructions` 更可靠地发现“基准已经失效”。
+**表 2-2 · 四个版本的退休指令与耗时（n = 1 亿次迭代）**
+
+| 版本 | 写法 | time | `ex_ret_instr` | `ex_ret_instr / n` |
+|---|---|---|---|---|
+| v1 | 朴素（内联 + printf） | **0.000090 ms** | 3,234,521 | **0.032** |
+| v2 | volatile 全局 sink | 24.512 ms | 341,231,541 | **3.41** |
+| v3 | `noinline` + 函数外屏障 | **0.000110 ms** | 3,207,347 | **0.032** |
+| v4 | 循环内 asm 屏障 | 28.828 ms | 703,811,029 | **7.04** |
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_4df583.svg)
+
+&emsp;&emsp;**v1 和 v3 的 `ex_ret_instr / n` 都是 0.032——1 亿次迭代只退休了约 320 万条指令**。如果循环真的执行了 1 亿次，即使每次只有 1 条加法，也应该退休 1 亿条指令。实测只有 320 万，差了两个数量级。这 320 万条不是循环的指令，是 `perf stat` 启动、动态链接和 `printf` 本身的开销。**循环根本没有执行**——编译器把 `s += i` 归纳成了 `n*(n-1)/2 = 4999999950000000`，直接算出结果。
+
+&emsp;&emsp;**v3 是本章最重要的教学点。** 它写了 `noinline`、写了 `asm volatile` 屏障、结果被 `printf` 使用——三个看起来“应该有效”的措施全部到位，但 `ex_ret_instr` 和 v1 一样低，`time` 一样是 0.000 ms。原因很具体：`noinline` 只阻止**调用方内联 `simple_sum_noinline`**，但 `simple_sum_noinline` **内部**的循环仍然被编译器归纳成闭式解——函数调用保留了，循环没了。`asm` 屏障在函数**外部**，保护的是“`s` 的返回值不被优化掉”，而不是“循环体内部的累加不被归纳”。**屏障的位置决定了它保护的是什么**：循环外的屏障保护返回值，循环内的屏障保护循环体。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_5e3c78.svg)
+
+&emsp;&emsp;**v4 是唯一真正阻止消除的写法。** `asm volatile("" : "+r"(s) : : "memory")` 放在循环体内，每次迭代都告诉编译器“`s` 可能被外部修改”——编译器无法把累加折叠成 `n*(n-1)/2`，循环必须逐次执行。`ex_ret_instr / n = 7.04`，与源码预期一致（加法、循环比较、跳转、屏障对代码生成的影响），`time = 28.8 ms`。
+
+&emsp;&emsp;v2 用 volatile 全局变量也阻止了消除，但代价是每次迭代多一次 store：`ex_ret_instr / n = 3.41`，`time = 24.5 ms`。**v2 和 v4 的时间差（24.5 vs 28.8 ms）比指令数差（3.41 vs 7.04）小得多**——v4 的指令数是 v2 的两倍，时间只多 17%。原因在依赖链：`s += i` 的加法延迟很短，多出的指令填充了原本空闲的流水线槽位，CPI 从 v2 的约 1 降到 v4 的约 0.5。**指令数不能单独用于判断性能**——退休指令数告诉你有多少工作被完成，但不告诉你有多少工作被等待。
+
+&emsp;&emsp;5600X 的 Op Cache 事件提供了第二道验证：
+
+| 版本 | Op Cache 访问 | Op Cache 缺失 | 缺失率 |
+|---|---|---|---|
+| v1 | 878,563 | 348,266 | **39.6%** |
+| v2 | 51,055,620 | 450,570 | 0.88% |
+| v3 | 863,583 | 341,952 | **39.6%** |
+| v4 | 101,077,489 | 462,762 | 0.46% |
+
+&emsp;&emsp;v1 和 v3 的 Op Cache 访问只有 86 万次，缺失率却高达 39.6%——因为程序只执行了 `perf stat` 启动和 `printf` 的少量代码，这些冷代码不在 Op Cache 里。v2 和 v4 的 Op Cache 访问在 5000 万到 1 亿次量级，缺失率低于 1%——**循环代码完全驻留在 Op Cache 中，前端供给不是瓶颈**。`ex_ret_instr` 和 `op_cache` 的对比比单看任何一个都可靠：前者告诉你“退休了多少指令”，后者告诉你“前端是否真的在供给这些指令”。
+
+&emsp;&emsp;后续所有实验在跑计时之前，先用 `perf stat -e ex_ret_instr,macro_ops_retired` 采集一次，计算 `ex_ret_instr / n`。判据不是 `time`，而是这个比值——**v1 的 `time = 0.000090 ms` 看起来像一个极快的微基准，但 `ex_ret_instr / n = 0.032` 揭穿了它**。只看 `time` 无法区分“循环被消除”和“微基准本来就在微秒量级”；`ex_ret_instr` 一锤定音。如果它与源码里数出的每迭代指令数一致到 2 倍以内，基准有效；如果差一个数量级以上，基准失效。这个检查的成本是每次实验多一次 `perf stat` 运行，收益是排除“测的根本不是你想测的东西”这个最危险的陷阱——**它比“测不准”更危险，因为它的输出看起来完全正常：`time` 很小、`result` 正确（v1/v3 的 4999999950000000 与 v4 一致）、程序没有崩溃，只有退休指令数能揭穿它**。
 
 
 ## 3. 用 PMU 建立指标语言：CPI 之后用什么
