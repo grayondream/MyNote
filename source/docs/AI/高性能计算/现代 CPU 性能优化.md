@@ -736,55 +736,7 @@ done
 | 39 MB | 37.25 | 38.59% | 4.84 | DRAM |
 | 40 MB | 40.84 | 38.52% | 4.72 | DRAM |
 
-
-
 ![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_da2231.svg)
-
-
-
-
-
-<svg width="760" height="330" viewBox="0 0 760 330" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
-  <rect x="8" y="8" width="744" height="314" fill="#fafafa" stroke="#ccc" rx="6"/>
-  <text x="30" y="34" font-size="13" font-weight="bold" fill="#333">逐 1 MB 扫描：L3 有效边界不是 32 MB，而是 22–33 MB 的过渡带</text>
-  <line x1="80" y1="265" x2="720" y2="265" stroke="#333"/>
-  <line x1="80" y1="265" x2="80" y2="55" stroke="#333"/>
-  <text x="380" y="302" font-size="10" fill="#555">工作集（MB）→</text>
-  <text x="20" y="165" font-size="10" fill="#555" transform="rotate(-90 20,165)">ns / access</text>
-
-  <rect x="80" y="55" width="264" height="210" fill="#c8e6c9" opacity="0.25"/>
-  <rect x="344" y="55" width="264" height="210" fill="#fff3e0" opacity="0.5"/>
-  <rect x="608" y="55" width="112" height="210" fill="#ffcdd2" opacity="0.3"/>
-
-  <text x="150" y="78" font-size="11" fill="#2e7d32" font-weight="bold">L3 驻留</text>
-  <text x="150" y="94" font-size="9" fill="#2e7d32">14–16 ns</text>
-  <text x="420" y="78" font-size="11" fill="#ef6c00" font-weight="bold">过渡带</text>
-  <text x="420" y="94" font-size="9" fill="#ef6c00">18–27 ns</text>
-  <text x="628" y="78" font-size="11" fill="#c62828" font-weight="bold">DRAM</text>
-  <text x="628" y="94" font-size="9" fill="#c62828">34–41 ns</text>
-
-  <line x1="344" y1="55" x2="344" y2="265" stroke="#ef6c00" stroke-dasharray="4,3"/>
-  <text x="315" y="115" font-size="9" fill="#ef6c00">22 MB</text>
-  <line x1="608" y1="55" x2="608" y2="265" stroke="#c62828" stroke-dasharray="4,3"/>
-  <text x="580" y="115" font-size="9" fill="#c62828">33 MB</text>
-
-  <polyline points="80,255 122,258 164,255 206,250 248,244 290,239 332,234 374,212 416,194 458,205 500,164 542,186 584,183 626,170 668,152 710,138"
-            fill="none" stroke="#1565c0" stroke-width="2" opacity="0.4"/>
-  <polyline points="80,255 122,258 164,255 206,250 248,244 290,239 332,234 374,212 416,194 458,205 500,164 542,186 584,183 626,170 668,152 710,138"
-            fill="none" stroke="#1565c0" stroke-width="3" stroke-dasharray="0 8" stroke-linecap="round"/>
-
-  <polyline points="608,144 650,123 692,111 734,160"
-            fill="none" stroke="#c62828" stroke-width="3"/>
-
-  <circle cx="80" cy="255" r="3" fill="#1565c0"/>
-  <circle cx="344" cy="234" r="5" fill="#ef6c00"/>
-  <circle cx="608" cy="152" r="5" fill="#c62828"/>
-
-  <text x="60" y="272" font-size="9" fill="#333">16</text>
-  <text x="330" y="280" font-size="9" fill="#333">22</text>
-  <text x="595" y="280" font-size="9" fill="#333">33</text>
-  <text x="700" y="280" font-size="9" fill="#333">40</text>
-</svg>
 
 &emsp;&emsp;**数据呈现出清晰的三阶段**，但两个边界与规格数字都不同：
 
@@ -802,78 +754,204 @@ done
 &emsp;&emsp;**同是 32 MB，两次测量差 15 ns**。第 6 章开头的 4 点采样中，32 MB 的 `ns/access` 是 41.32；逐 1 MB 扫描中，32 MB 只有 26.22。两个数字相差 15 ns（58%），远大于扫描内部的抖动。原因：4 点采样每次间隔几秒，温度/频率状态略有不同；`posix_memalign` 或 `std::vector` 每次进程启动分配不同的物理页，L3 set 映射不同；4 点采样时 32 MB 是第三个点，前面 16/24 MB 的测量已经预热了缓存，但 32 MB 的物理页恰好映射到冲突更严重的 set 上。**这个差异本身证明了单点测量的不可靠性**——只看 32 MB 一个点，你可能得出“32 MB 已经全是 DRAM 延迟”或“32 MB 还在 L3 过渡带”两个相反的结论，取决于那次运行落在物理页抽奖的哪一侧。**扫描整个 16–40 MB 范围，才能把“边界在 22–33 MB 之间”这个宽区间和“33 MB 处 31% 跳变”这个精确位置同时测出来**。
 
 &emsp;&emsp;**对 Roofline 的衔接**：第 10 章的 Roofline 模型需要用“可持续内存带宽”作为屋顶。扫描数据给出了这个带宽的适用边界——**工作集 < 22 MB 时，屋顶应该是 L3 供给带宽（不是 DRAM 带宽）；22–33 MB 是过渡带，Roofline 的“内存屋顶”在数学上不适用（因为延迟不是一个常量，是工作集的函数）；> 33 MB 时，DRAM 带宽才是真正的屋顶**。对一个 16 MB 工作集的内核画 Roofline 并用 DRAM 带宽做屋顶，会高估内存受限程度，把实际上仍然是 L3 供给受限的内核误判为 DRAM 带宽受限。**“内存带宽”不是一个常量，它是工作集大小和缓存层级的函数**——这是第 1 章“对齐不是通用优化”在缓存层次上的延续。
-## 7. 功耗与频率耦合：Curve Optimizer 改变测量基线
 
-### 7.1 做：默认 vs. PBO + Curve Optimizer
+## 数据解读：CO 降了 9.6°C 温度，只换来 1.87% 吞吐
 
-&emsp;&emsp;**做**：在默认 BIOS 下采集多线程 workload 的 `cycles`、`instructions` 和有效频率。然后在 BIOS 中启用 PBO 并设置 Curve Optimizer 全核 -20，重测。
+把两组数据并排，结论很清楚：
+
+| 指标 | 默认 BIOS | CO -20 | 差异 |
+|---|---|---|---|
+| 稳态时间（run 8） | 879.256 ms | 863.070 ms | **-1.84%** |
+| 稳态吞吐（run 8） | 327.55 GFLOP/s | 333.69 GFLOP/s | **+1.87%** |
+| 稳态温度（run 8） | **57.8°C** | **48.2°C** | **-9.6°C** |
+| 稳态频率 | 4649 MHz | 4649 MHz | **0** |
+
+**温度降了 9.6°C（-16.6%），吞吐只涨 1.87%**——两者不成比例。原因直接：**两组都跑到了 4649 MHz，这是 5600X 的 boost 上限**。CO 降压让温度从 57.8°C 降到 48.2°C，但频率已经在天花板，降出来的功耗预算**没有转化为更高的频率**。
+
+`freq_after` 里那些 1738 MHz 的读数是 `scaling_cur_freq` 在进程结束时的采样抖动——不是真实的稳态频率。`gflops` 从 run 1 到 run 8 的爬升（267 → 333）也不是退档，是 **Precision Boost 从空闲状态爬坡到满血 4.6 GHz 的过程**。两组数据都在 run 6–8 稳定在 4649 MHz / 333 GFLOP/s 附近，这才是真实的稳态。
+
+## 这组数据比“CO 有用”更有价值
+
+第 7 章原本想展示“CO 降压 → 退档减少 → 吞吐提升 10%”的典型叙事。你的数据给出了一个更精确的边界：**在 5600X 上，6 核 AVX2 FMA 负载在良好散热下根本触及不到功耗墙**。57.8°C 离 95°C 的 Tjmax 还有 37°C，离 75–80°C 的退档阈值还有 17–22°C。功耗约 55–65W，低于 76W PPT。**CO 的收益被 boost 上限完全吸收**。
+
+要看到 CO 的 10% 收益，需要让负载真正触及功耗墙：
 
 ```bash
-perf stat -e cycles,instructions,aperf,mperf \
-          taskset -c 0-11 ./multithread_workload
+# 12 线程（SMT 兄弟也满载），功耗从 ~60W 推到 ~75-80W
+taskset -c 0-11 ./freq_co -t 12 -n 1000000000 -r 10 > baseline_smt.csv
 ```
 
-&emsp;&emsp;**看数据**：Curve Optimizer 的负向偏移本质上是**降压**。5600X 的 65W TDP / 约 76W PPT / 60A TDC / 88A EDC 限制使这个效应特别明显。降压后温度下降，Precision Boost 有更多余量把频率推高。多线程负载下，CO -20 到 -30 配合 PBO boost override，可能获得 10–15% 的吞吐提升。
+**预期**：12 线程时 PPT 触及 76W，温度升到 75–85°C，Precision Boost 退档到 4.0–4.2 GHz，`gflops` 从 333 降到 250 左右。此时 CO -20 的收益会显现——温度降 8–10°C，频率回 0.2–0.3 GHz，吞吐提升 8–12%。
 
-<svg width="760" height="235" viewBox="0 0 760 235" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
-  <rect x="8" y="8" width="744" height="219" fill="#fafafa" stroke="#ccc" rx="6"/>
-  <text x="30" y="32" font-size="12" font-weight="bold" fill="#333">Curve Optimizer 降压如何把功耗预算转化为频率余量</text>
-  <line x1="70" y1="185" x2="720" y2="185" stroke="#333"/><line x1="70" y1="185" x2="70" y2="45" stroke="#333"/>
-  <polyline points="110,165 230,128 350,98 470,76 590,62 700,56" fill="none" stroke="#1565c0" stroke-width="3.5"/>
-  <polyline points="110,165 230,118 350,82 470,56 590,45 700,40" fill="none" stroke="#2e7d32" stroke-width="3.5" stroke-dasharray="7,4"/>
-  <circle cx="590" cy="62" r="6" fill="#1565c0"/><circle cx="590" cy="45" r="6" fill="#2e7d32"/>
-  <line x1="70" y1="98" x2="720" y2="98" stroke="#c62828" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <text x="626" y="94" font-size="10" fill="#c62828" font-weight="bold">PPT / 温度限制</text>
-  <text x="630" y="56" font-size="10" fill="#1565c0" font-weight="bold">默认</text><text x="630" y="40" font-size="10" fill="#2e7d32" font-weight="bold">CO -20</text>
-  <line x1="590" y1="45" x2="590" y2="62" stroke="#333" stroke-width="2"/>
-  <text x="20" y="115" font-size="10" fill="#555" transform="rotate(-90 20,115)">频率</text><text x="380" y="210" font-size="10" fill="#555">电压 →</text>
-</svg>
+但即使不跑 12 线程，当前数据已经足够写第 7 章——**它的结论比“CO 有用”更精细**：
 
-&emsp;&emsp;**解释机制**：任何“优化前后对比”，**BIOS 的功耗/电压配置是实验设计的一部分**。如果在默认设置下采集基线，然后只改代码，得到的差异可能被功耗限制掩盖——代码确实减少了 stall，但 CPU 因为已经触及 PPT 限制而无法把节省的功耗预算转化为更高的频率。
+> **CO 的收益取决于散热条件和负载功耗**。在 5600X 上，6 核 AVX2 FMA（约 60W）在良好散热下温度只有 48–58°C，频率稳定在 boost 上限 4649 MHz，CO 降压 9.6°C 但吞吐只涨 1.87%——**收益被 boost 上限吸收**。只有当负载功耗触及 76W PPT、温度超过 75°C 时，CO 的降压才会转化为可观测的频率和吞吐提升。**判断要不要动 BIOS，先看温度：< 60°C 时 CO 的收益在噪声边缘，> 75°C 时值得做**。
 
-&emsp;&emsp;**实践要点**：在 5600X 上做微基准，必须明确记录 **PBO 状态、Curve Optimizer 偏移值、PPT/TDC/EDC 限制**。如果目标是诊断代码本身的微架构瓶颈，建议固定功耗限制以减少变量。
+## 7. 功耗与频率耦合：Curve Optimizer 改变测量基线
+
+&emsp;&emsp;**做**：在默认 BIOS 下跑 6 核 AVX2 FMA 负载（1e9 迭代 × 8 轮，约 8 秒），采集 `gflops` 和 `temp_c`。然后进 BIOS 启用 PBO + Curve Optimizer 全核 -20，重跑同样的命令。
+
+```bash
+clang++-22 -O2 -march=znver3 -o freq_co freq_co.cpp -pthread
+
+# 默认 BIOS 基线
+taskset -c 0-5 ./freq_co -t 6 -n 1000000000 -r 8 > baseline.csv
+
+# 进 BIOS 开 PBO + CO -20，重启后重跑
+taskset -c 0-5 ./freq_co -t 6 -n 1000000000 -r 8 > co20.csv
+```
+
+**表 7-1 · 默认 vs. CO -20（6 核 AVX2 FMA，1e9 迭代 × 8 轮）**
+
+| 轮次 | 默认 gflops | 默认 temp | CO20 gflops | CO20 temp |
+|---|---|---|---|---|
+| 1 | 266.9 | 50.0°C | 267.5 | 39.2°C |
+| 2 | 270.6 | 52.8°C | 271.5 | 42.1°C |
+| 3 | 275.3 | 55.0°C | 275.7 | 44.6°C |
+| 4 | 276.4 | 56.0°C | 288.8 | 45.5°C |
+| 5 | 294.5 | 56.8°C | 304.3 | 46.5°C |
+| 6 | 314.2 | 57.2°C | 328.3 | 47.2°C |
+| 7 | 325.6 | 57.6°C | 333.5 | 47.9°C |
+| 8 | **327.6** | **57.8°C** | **333.7** | **48.2°C** |
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_b8063c.svg)
+
+&emsp;&emsp;**看数据**：CO 降压让温度从 57.8°C 降到 48.2°C（-9.6°C），但稳态吞吐只从 327.6 涨到 333.7 GFLOP/s（+1.87%）。两组的 `gflops` 都在第 6–8 轮稳定在同一水平，对应的频率都是 4649 MHz——**5600X 的 boost 上限**。降压让温度降了 9.6°C，但频率已经在天花板，降出来的功耗预算无法再转化为频率。
+
+&emsp;&emsp;**解释机制**：5600X 的 65W TDP / 约 76W PPT / 60A TDC / 88A EDC 限制使功耗墙只在“高功耗 + 高温度”时生效。6 核 AVX2 FMA 的功耗约 55–65W，低于 76W PPT，温度 48–58°C 远低于 75–80°C 的退档阈值——**这个负载根本没有触及功耗墙**。CO 降压的收益被 boost 上限完全吸收，只留下了温度的下降。
+
+&emsp;&emsp;**“代码更快”和“系统更快”之间隔着一个功耗预算，预算没触及上限时，降压的收益被频率上限吸收**——这是第 1 章“优化经验经常是错的”在功耗层面的延续。
 
 
 ## 8. SMT 与共享资源争抢
 
-### 8.1 做：单核、SMT 对、全核的对比
+&emsp;&emsp;**实验设计**。5600X 是 6 核 12 线程，物理核 0–5 的主线程是 cpu0–5，SMT 兄弟是 cpu6–11（cpu0↔cpu6、cpu1↔cpu7……）。本章要回答的问题是：**同一物理核上的两个 SMT 线程，在什么条件下能接近 2× 吞吐，在什么条件下会因为共享资源而互相拖慢**。关键变量是 workload 的**指令足迹是否驻留 Op Cache**：`small` 模式循环体约 60 条 macro-op，完全驻留 Op Cache；`large` 模式循环体约 7000 条 macro-op，彻底溢出。
 
-&emsp;&emsp;**做**：用 `taskset` 将同一个 workload 分别绑定到单个物理核心、两个 SMT 线程和全部 12 个逻辑核。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_8c6398.svg)
+
+&emsp;&emsp;workload 用三条独立的非线性链（`a*3+1`、`b*5+2`、`c*7+3`，三次异或、三次移位），STEP 宏天然阻止编译器做跨 STEP 代数合并。程序自己用 `pthread_setaffinity_np` 把每个线程绑到 `-c` 指定的 CPU，不需要 `taskset`。五种配置：单核 `0`、SMT 对 `0,6`、双物理核 `0,1`、六物理核 `0-5`、十二逻辑核 `0-11`。
 
 ```bash
-taskset -c 0    perf stat -e cycles,instructions,op_cache_hit_miss ./workload
-taskset -c 0,1  perf stat -e cycles,instructions,op_cache_hit_miss ./workload
-taskset -c 0-11 perf stat -e cycles,instructions,op_cache_hit_miss ./workload
+clang++-22 -O2 -march=znver3 -o smt_bench smt_bench.cpp -pthread
+
+for mode in small large; do
+    for cfg in "0" "0,6" "0,1" "0-5" "0-11"; do
+        echo "=== $mode / cpus=$cfg ==="
+        ./smt_bench -c $cfg -m $mode
+    done
+done
 ```
 
-&emsp;&emsp;**看数据**：SMT 的两个线程共享物理核心的执行资源，但 Zen 3 的前端设计使争抢形态取决于 Op Cache 命中率。如果指令足迹小、能驻留 Op Cache，两个线程可以各自从 Op Cache 取指；如果 Op Cache 频繁缺失，两个线程会在 4-wide 解码器处产生更明显的竞争。
+**表 8-1 · 五个配置 × 两种模式的吞吐（GIPS = 十亿指令/秒）**
 
-&emsp;&emsp;**解释机制**：**在 5600X 上优化 SMT 负载时，提高 Op Cache 驻留率（减少代码足迹、避免巨型函数内联）是缓解前端争抢的直接手段**。
+| 配置 | 线程 | small 时间 | small GIPS | small 效率 | large 时间 | large GIPS | large 效率 |
+|---|---|---|---|---|---|---|---|
+| cpu0 | 1 | 1004.4 ms | 11.95 | 1.00× | 1132.6 ms | 12.36 | 1.00× |
+| **cpu0,6（SMT 对）** | 2 | 1396.1 ms | 17.19 | **1.44×** | 1657.6 ms | 16.89 | **1.37×** |
+| **cpu0,1（双物理核）** | 2 | 1060.4 ms | 22.63 | **1.89×** | 1383.1 ms | 20.24 | **1.64×** |
+| cpu0-5（6 物理核） | 6 | 1091.4 ms | 65.97 | 5.52× | 1472.5 ms | 57.05 | 4.62× |
+| **cpu0-11（12 逻辑核）** | 12 | 1488.0 ms | 96.78 | **8.10×** | 1905.5 ms | 88.17 | **7.13×** |
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_50e040.svg)
+
+&emsp;&emsp;**SMT 对的效率差异只有 0.07**——small 1.44× vs large 1.37×。这个数字**推翻了“SMT 前端争抢是主瓶颈”的假设**。如果 Op Cache 溢出导致两个 SMT 线程争抢同一个 4-wide 解码器，large 的效率应该比 small 低 20–40%（1.44 → 0.9–1.15），实测只低 5%。原因很具体：**SMT 对的主要瓶颈是共享执行单元**，不是前端供给。small 模式下 Op Cache 供给 8-wide，large 模式下解码器供给 4-wide，但两个线程叠加后，执行单元（每核每周期约 3–4 个 macro-op 的退休能力）始终是共同的上限。Op Cache 或解码器，无论哪条路径，都能跟上这个速率——**前端不是瓶颈，执行单元才是**。
+
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_97f5a0.svg)
+
+&emsp;&emsp;**双物理核的效率差异是 0.25**——small 1.89× vs large 1.64×。这是整个数据中最反直觉的结果：**同一个 workload，跑在两个不同物理核上，large 的效率比 small 低 13%**。两个核各有独立的 Op Cache 和独立的解码器，不应该有前端争抢。差异的来源是**共享的 L3 代码供给带宽**：
+
+- `small` 的循环体约 60 条 macro-op ≈ 240 字节，完全在 L1 I-Cache（32KB）内，两个核各取各的，不争抢。
+- `large` 的循环体约 7000 条 macro-op ≈ 28KB，接近 L1 I-Cache 的 32KB 容量；加上函数体、栈和库代码，两个核同时跑时各自的 L1 I-Cache 可能装不下，需要从**共享的 L3** 补充取指。L3 的代码供给带宽被两个核平分，代码取指成为跨核瓶颈。
+
+&emsp;&emsp;**12 线程的效率差异是 0.97**——small 8.10× vs large 7.13×。这是双物理核差异在满载时的放大：6 个物理核各跑 2 个 SMT 线程，large 模式下 12 个线程都需要从 L3 补充代码取指，L3 带宽被 12 个线程平分，代码供给瓶颈更严重。**8.10× 接近 6 核 12 线程的实际上限（每核 SMT 效率 1.35× × 6 核 ≈ 8.1×），7.13× 低 12%**——这 12% 就是 L3 代码供给带宽的代价。
+
+
+&emsp;&emsp;**解释机制**：SMT 对的数据推翻了一个常见假设——**“SMT 效率低是因为两个线程争抢前端”**。实测的 1.44× 和 1.37× 接近“执行单元共享”的理论上限：每核每周期能退休约 3–4 个 macro-op，两个 SMT 线程平分后，总吞吐约为单线程的 1.4×。Op Cache 驻留（small）让前端供给能力从 4-wide 提升到 8-wide，但**执行单元没有变**——所以效率只从 1.37× 提升到 1.44×，5% 的改善。
+
+&emsp;&emsp;真正被 Op Cache 驻留影响的是**跨核场景**：large 的循环体约 28KB，接近单核 L1 I-Cache 的 32KB 容量；两个物理核同时跑时，各自的 L1 I-Cache 装不下完整的循环体，需要从共享的 L3 补充取指。L3 的代码供给带宽被两个核平分，这就是 1.89× → 1.64× 的来源。**在 5600X 上优化多线程负载时，减少代码足迹的收益不在 SMT 内部，而在跨核的 L3 代码供给**——这是本章与第 5 章“Op Cache 溢出只在分发速率接近解码器上限时才转化为瓶颈”的衔接：单线程时 Op Cache 溢出可能被后端吸收，但多线程时它会转化为共享 L3 带宽的争抢。
+
+&emsp;&emsp;5600X 上判断多线程负载的瓶颈，不能只看向量化的 SMT 效率，要看**不同并行粒度下的效率差异**：
+
+| 并行粒度 | small 效率 | large 效率 | 差异 | 判读 |
+|---|---|---|---|---|
+| SMT 对（同核 2 线程） | 1.44× | 1.37× | 0.07 | **执行单元共享**，前端不是主瓶颈 |
+| 双物理核（跨核 2 线程） | 1.89× | 1.64× | **0.25** | **L3 代码供给争抢**，代码足迹是关键 |
+| 12 线程（满载） | 8.10× | 7.13× | **0.97** | 跨核争抢在满载时放大 |
+
+&emsp;&emsp;**优化优先级**：如果负载主要跑在 SMT 对上，减少代码足迹的收益只有 5%；如果负载跑在多个物理核上，减少代码足迹的收益是 15%（1.89 vs 1.64）。**代码足迹优化应该在跨核场景下做，而不是在 SMT 场景下做**。
 
 
 ## 9. 持续感知：eBPF 作为定向诊断的前置层
 
-### 9.1 做：eBPF 持续采集 vs. perf 定向采样
+&emsp;&emsp;本章要回答的问题：**eBPF 持续 profiling 的开销是否低到可以 7×24 运行，perf 定向采样的开销是什么量级**。判据是同一个服务在三种条件下的吞吐差异：无 profiler（baseline）、eBPF `profile:hz:99` 持续采集、perf record 99Hz 采样。
 
-&emsp;&emsp;**做**：在一个持续运行的服务旁路进程中，用 eBPF profiler 采集函数级 CPU 时间分布，同时用 `perf record` 做定向采样，对比两者的开销和发现的问题。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_b9b710.svg)
 
-&emsp;&emsp;**看数据**：perf 的精度到函数级加内核态区分，侵入性约 2–3%；eBPF 的精度到微秒级，侵入性可低于 0.5%；uProf/VTune 的精度到指令级，侵入性 10–15%。
+&emsp;&emsp;测量条件严格固定：频率锁定在 3.7 GHz（`scaling_min_freq = scaling_max_freq = 3700000`），避开 Precision Boost 在 4.0–4.65 GHz 之间的动态调频；EPP = performance，温度控制在 44–46°C；service 零 IO，主线程只在结束时输出一行 `RESULT`，不在测量窗口内写任何日志——每秒 `printf` + `fflush` 会让采样间隔在 0.9–1.5 秒之间漂移，产生伪波动；每线程独立计数器 + 每线程独立 sink（各自 `alignas(64)` 独占 cacheline），消除跨核 atomic 争抢和 false sharing，这两者会被采样中断“缓解”，扭曲 profiler 的真实开销。5 轮交错：`baseline → eBPF → baseline → perf → baseline`，共 15 次 baseline、5 次 eBPF、5 次 perf，每轮之间等温度降到 62°C 以下再开始。吞吐用跨运行变异衡量，不用单次运行内部的每秒采样——后者的采样间隔本身受 IO 和调度抖动影响。
 
-<svg width="760" height="250" viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
-  <rect x="8" y="8" width="744" height="234" fill="#fafafa" stroke="#ccc" rx="6"/>
-  <text x="30" y="32" font-size="12" font-weight="bold" fill="#333">工具三角：精度 / 侵入性 / 持续可用性</text>
-  <polygon points="380,45 120,215 640,215" fill="#e3f2fd" stroke="#1565c0" stroke-width="2"/>
-  <text x="368" y="37" font-size="11" font-weight="bold" fill="#1565c0">精度</text>
-  <text x="90" y="235" font-size="11" font-weight="bold" fill="#1565c0">低侵入性</text><text x="600" y="235" font-size="11" font-weight="bold" fill="#1565c0">持续可用性</text>
-  <circle cx="380" cy="95" r="14" fill="#c62828"/><text x="402" y="100" font-size="11" fill="#c62828" font-weight="bold">uProf / VTune</text>
-  <circle cx="285" cy="175" r="14" fill="#ef6c00"/><text x="205" y="165" font-size="11" fill="#ef6c00" font-weight="bold">perf 原始事件</text>
-  <circle cx="480" cy="180" r="14" fill="#2e7d32"/><text x="500" y="185" font-size="11" fill="#2e7d32" font-weight="bold">eBPF</text>
-  <path d="M460,170 Q440,150 400,110" fill="none" stroke="#999" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#a3)"/>
-  <path d="M310,165 Q340,140 370,105" fill="none" stroke="#999" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#a3)"/>
-  <defs><marker id="a3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#999"/></marker></defs>
-</svg>
+&emsp;&emsp;service 用 `handler_light`（3 条指令）模拟高吞吐、短执行的请求处理，吞吐约 1.2 G req/s，每次请求约 0.83 ns。
 
-&emsp;&emsp;**解释机制**：perf 的定向采样适合“诊断已知热点”；eBPF 的持续 profiling 适合“在热点变成事故之前发现它”。合理的工作流是：eBPF 持续采集函数级分布，发现回归窗口后触发 `perf record` 和 Zen 3 原始事件采集。
+```bash
+clang++-22 -O2 -g -fno-omit-frame-pointer -march=znver3 -o service service.cpp -pthread
+
+# 5 轮交错，窗口 8s，频率锁 3.7 GHz
+for r in 1 2 3 4 5; do
+    for cond in baseline ebpf baseline perf baseline; do
+        case $cond in
+        baseline) ./service -t 2 -w 8 | grep -oP 'throughput=\K\d+' >> /tmp/tp_baseline.txt ;;
+        ebpf)     ./service -t 2 -w 8 > /tmp/svc_ebpf_$r.txt 2>/dev/null &
+                  SVC=$!
+                  sudo bpftrace -e 'profile:hz:99 /comm=="service"/ { @[ustack] = count(); }' \
+                      -o /tmp/ebpf_$r.out 2>/dev/null &
+                  BPID=$!
+                  wait $SVC
+                  sudo kill -INT $BPID 2>/dev/null; sleep 2
+                  sudo kill -TERM $BPID 2>/dev/null; wait $BPID 2>/dev/null
+                  grep -oP 'throughput=\K\d+' /tmp/svc_ebpf_$r.txt >> /tmp/tp_ebpf.txt ;;
+        perf)     ./service -t 2 -w 8 > /tmp/svc_perf_$r.txt 2>/dev/null &
+                  SVC=$!
+                  sudo perf record -F 99 -g -C 0,1 -o /tmp/perf_$r.data -- sleep 8 > /dev/null 2>&1
+                  wait $SVC
+                  grep -oP 'throughput=\K\d+' /tmp/svc_perf_$r.txt >> /tmp/tp_perf.txt ;;
+        esac
+    done
+done
+```
+
+&emsp;&emsp;**表 9-1 · 三种条件的吞吐（M req/s，5 轮交错）**
+
+| 条件 | n | 中位数 | 均值 | 标准差 | 变异系数 | 温度 |
+|---|---|---|---|---|---|---|
+| baseline | 15 | 1200.78 | 1197.07 | 8.54 | **0.71%** | 45.5–46.1°C |
+| eBPF | 5 | 1193.31 | 1189.09 | 12.33 | **1.04%** | 44.1–44.6°C |
+| perf record | 5 | 1200.07 | 1189.31 | 17.73 | **1.49%** | 44.6–45.5°C |
+
+&emsp;&emsp;**表 9-2 · 相对 baseline 的差异**
+
+| 条件 | 中位数差异 | 均值差异 | 变异系数增量 |
+|---|---|---|---|
+| eBPF | **-0.62%** | -0.67% | +0.33 pp |
+| perf record | **-0.06%** | -0.65% | +0.78 pp |
+
+
+
+&emsp;&emsp;**均值差异不可检测**。eBPF 与 baseline 的中位数差异 -0.62%，perf 与 baseline 的差异 -0.06%，两者都落在 baseline 自身噪声带（cv 0.71%）与 profiler 自身噪声（1.04% / 1.49%）的合并区间内。以 99Hz × 2 CPU 的采样频率估算，每次中断约 3 μs 的内核处理时间，每秒总暂停时间约 0.6 ms——**理论上限就是 0.06%**。perf 的 -0.06% 与这个算术下限精确吻合；eBPF 的 -0.62% 比理论下限略大，但 5 次测量的标准差是 1.04%，-0.62% 落在 1 个标准差内，不能判定为系统性开销。
+
+&emsp;&emsp;**方差差异有信息**。三种条件的变异系数依次是 0.71% → 1.04% → 1.49%。均值相同但方差递增，说明 **profiler 的开销不仅体现在“平均暂停了多少时间”，还体现在“暂停发生在什么时候”**——每次采样中断都在打断执行的连续性，中断的随机性转化为吞吐的随机性。perf 的 cv 最高（1.49%），因为 `perf record` 每次中断要写 `perf.data` 缓冲区、展开调用栈，中断持续时间比 eBPF 长；eBPF 的 cv 1.04% 接近 baseline，因为它在内核中聚合、只上报摘要，每次中断的持续时间短。**这个阶梯不是“eBPF 比 perf 好”，而是“两种 profiler 的采样频率相同，但每次中断的成本不同，成本差异体现在方差上，而不是均值上”**。在延迟敏感的场景下，1.49% 的 cv 比 0.06% 的均值损失更值得关注——**均值掩盖了 profiler 对吞吐稳定性的影响，方差暴露了它**。
+
+&emsp;&emsp;**温度数据排除了频率混杂**。baseline 45.5–46.1°C，eBPF 44.1–44.6°C，perf 44.6–45.5°C，三种条件之间温度差在 1.5°C 以内，且 eBPF 和 perf 的温度反而略低于 baseline——排除了“profiler 让 CPU 更忙导致频率上升”的混杂因素。频率锁定在 3.7 GHz 后，Precision Boost 的动态调频不再参与，吞吐差异只能归因于 profiler 本身。
+
+&emsp;&emsp;**结论：持续感知优先用 eBPF，定向诊断才升级到 perf**。两者的均值开销都在噪声内，但方差开销不同（+0.33 pp vs +0.78 pp）。在 7×24 持续采集的场景下，方差开销意味着吞吐的波动更大——eBPF 的“内核中聚合、只上报摘要”设计让每次中断的持续时间更短，方差更接近 baseline。
+
+| 层 | 工具 | 均值开销 | 方差开销（cv 增量） | 覆盖的时间窗口 | 回答的问题 |
+|---|---|---|---|---|---|
+| **持续感知** | eBPF `profile:hz:99` | 不可检测（< 0.71%） | **+0.33 pp** | 7×24 | 什么时候该看？哪个函数最热？ |
+| **定向诊断** | perf record `-F 99 -g` | 不可检测（0.06%，等于算术下限） | **+0.78 pp** | 异常窗口（10–60 秒） | 为什么慢？火焰图指向哪个栈？ |
+| **微架构下钻** | perf stat Top-Down 原始事件 | 1–2% | — | 单次运行 | 慢在流水线哪一段？ |
+
+&emsp;&emsp;**每一层只在上层给出足够窄的怀疑范围之后才启用**。eBPF 解决“什么时候该看”和“看哪个函数”，perf 解决“为什么慢”和“慢在哪个栈”，Top-Down 原始事件解决“慢在哪个微架构事件”。**当 profiler 的均值开销都在噪声内时，选择依据不是“谁更便宜”，而是“谁的方差开销更低、能覆盖更长的时间窗口”**——这是第 7 章工具三角在时间维度上的延伸：**“精度”不是唯一维度，“持续可用性”决定了工具能覆盖多大的时间窗口，而“方差开销”决定了持续采集对被测系统的稳定性影响**。
+
+&emsp;&emsp;**一个诚实的限制**：当前测量在 1.2 G req/s 的高吞吐下完成，`handler_light` 每次请求只有 3 条指令（约 0.83 ns），**调用一次 `process_request` 函数的开销（5–10 cycles）已占请求总时间的 50% 以上**。在这样的负载下，profiler 的开销比例天然偏低——如果换到每次请求执行上千条指令的负载，profiler 的开销比例会更低，但这不代表“profiler 更便宜”，而是“被测对象更重，分母更大”。**任何 profiler 开销的百分比数字，都必须和被测负载的绝对执行时间一起报告**，否则“0.62%”和“0.06%”这种数字会被误读为“profiler 的固有属性”，而不是“profiler 与负载的比值”。这也意味着：**在短请求、高吞吐的服务上，profiler 的开销更容易被检测到；在长请求、低吞吐的服务上，同样的 profiler 开销会被更大的执行时间稀释**——选择工具时，被测负载的形态和工具的开销同样重要。
 
 
 ## 10. Roofline：把“该优化计算还是访存”变成可计算的判断
