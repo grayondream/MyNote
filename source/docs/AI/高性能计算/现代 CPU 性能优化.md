@@ -1159,65 +1159,149 @@ clang++-22 -O2 -march=znver3 -ffast-math -o roofline_bench roofline_bench.cpp -p
 
 &emsp;&emsp;第 10 章的 Roofline 给出了一个基本判断：向量化的收益取决于内核是否处于计算受限区域。但在具体硬件上，“向量化”不是二元状态——它是**指令集宽度、数据通路宽度和降频行为**的联合函数。5600X 的 AVX2 是 256-bit 原生数据通路，不存在拆分成本，可以作为效率基线；而 Zen 4 的 AVX-512 通过 **double-pumping 256-bit 数据通路**实现：512-bit FMA 被拆分为两个 256-bit μop，每周期退休一个 512-bit FMA，峰值 FLOP 上限与 AVX2 相同。
 
-### 12.1 做：AVX2 基线与 AVX-512 的“指令数下降 vs. 周期数下降”对比
+&emsp;&emsp;内核是一个 FMA 密集的逐元素变换：`a[i] = fma_chain(b[i], K)`，每个元素做 K 次 FMA。三个版本分别用标量、AVX2（8-wide）、AVX-512（16-wide）实现，循环体内加 `asm` 屏障阻止编译器把 K 次 FMA 折叠成闭式解——第 10 章已经证明，不加屏障，`x = fma(x, c, c)` 会被化简成 `x × c^K`，GFLOP/s 虚高 5–10 倍。
 
-&emsp;&emsp;**做**：取一个浮点乘加密集型内核，分别编译标量、AVX2（256-bit）和 AVX-512（在 Zen 4 上走 double-pumped 路径）三个版本。在 5600X 上跑前两个，在 Zen 4 平台上补充第三个。采集：
+```c
+// 三个版本的 chain 函数，结构完全相同，只有向量宽度不同
+__attribute__((noinline)) float scalar_chain(float x, float c, int K) {
+    for (int k = 0; k < K; k++) {
+        x = fmaf(x, c, c);
+        __asm__ __volatile__("" : "+x"(x) : : "memory");
+    }
+    return x;
+}
 
-```bash
-perf stat -e cycles,instructions,ex_ret_ops ./vec_bench
+__attribute__((noinline)) __m256 avx2_chain(__m256 x, __m256 c, int K) {
+    for (int k = 0; k < K; k++) {
+        x = _mm256_fmadd_ps(x, c, c);
+        __asm__ __volatile__("" : "+x"(x) : : "memory");
+    }
+    return x;
+}
+
+#ifdef __AVX512F__
+__attribute__((noinline)) __m512 avx512_chain(__m512 x, __m512 c, int K) {
+    for (int k = 0; k < K; k++) {
+        x = _mm512_fmadd_ps(x, c, c);
+        __asm__ __volatile__("" : "+v"(x) : : "memory");
+    }
+    return x;
+}
+#else
+// Zen 3 上回退到 AVX2——条件编译，5600X 的 v3 实际测的是 AVX2
+void avx512_kernel(float* a, const float* b, long n, int K) { avx2_kernel(a, b, n, K); }
+#endif
 ```
 
-&emsp;&emsp;**看数据**：如果 AVX-512 版本的 `instructions` 相对 AVX2 显著下降，但 `cycles` 下降幅度不成比例，说明收益被 **256-bit 数据通路的双周期执行**抵消。如果 `cycles` 同步下降，说明收益来自**前端供给压力的降低**——更少的指令让 Op Cache 和分发级更轻松。
+&emsp;&emsp;测量条件：`taskset -c 2` 绑单核，EPP = performance，K = 16，n = 1M 个 float（4MB，驻留 L2/L3，排除内存带宽干扰），每个版本跑一次 warmup + 一次正式测量。
 
-&emsp;&emsp;**5600X 的基线意义**：在 5600X 上测得的 AVX2 每周期有效 FLOP，可以作为判断“更宽指令集是否真正转化为计算吞吐”的算术锚点。
+```bash
+clang++-22 -O2 -march=znver3 -o vec_bench vec_bench.cpp
 
-### 12.2 做：VNNI 的收益边界——当 INT8 算力被内存带宽吃掉
+for v in 1 2 3; do
+    taskset -c 2 sudo perf stat -e cycles -e ex_ret_instr \
+        ./vec_bench -v $v -k 16 -n 1048576
+done
+```
 
-&emsp;&emsp;Zen 4 的 AVX-512 VNNI 将 INT8 点积吞吐提升到每周期 64 次操作（4 INT8 ops/lane × 8 lanes × 2 FMA）。AMD 官方宣称 INT8 多线程性能提升可达 2.5 倍。但这是**计算受限**条件下的结论。
+**表 12-1 · 三个版本的吞吐与指令数（5600X，K=16，n=1M）**
 
-&emsp;&emsp;**做**：在一个 INT8 矩阵乘内核上，分别在 AVX2 和 AVX-512 VNNI 路径下测量。工作集设置在两个量级：(a) L2 驻留；(b) 超过 32MB L3，走向 DRAM。采集 `instructions`、`cycles` 和 `ls_mab_alloc`。
+| 版本 | 实际指令集 | 时间 | **GFLOP/s** | `ex_ret_instr` | 相对标量 |
+|---|---|---|---|---|---|
+| v1 scalar | 标量 | 6.899 ms | **4.86** | 78,885,651 | 1.00× |
+| v2 AVX2 | AVX2 8-wide | 1.191 ms | **28.17** | 23,708,209 | **GFLOP/s 5.79×，指令 0.30×** |
+| v3 “AVX-512” | **AVX2**（5600X 回退） | 1.165 ms | **28.79** | 23,680,022 | 与 v2 相同 |
 
-&emsp;&emsp;**看数据**：在 L2 驻留的工作集上，VNNI 版本的 `cycles` 应显著低于 AVX2。一旦工作集超过 L3，VNNI 版本的 `cycles` 可能不再下降，甚至与 AVX2 持平——此时 `ls_mab_alloc` 高位运行，**INT8 算力的提升被内存供给瓶颈淹没**。VNNI 只改变了计算屋顶的高度，没有改变内存屋顶的高度。
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261031_6fbed7.svg)
+
+&emsp;&emsp;**v3 与 v2 的时间、指令数、GFLOP/s 几乎完全相同**（1.165 vs 1.191 ms，23.68M vs 23.71M，28.79 vs 28.17）——这是条件编译正确工作的证据：`-march=znver3` 下 `__AVX512F__` 不定义，`avx512_kernel` 回退到 `avx2_kernel`。**在 5600X 上，“更宽的指令集是否转化为计算吞吐”这个问题无法回答——CPU 不支持 AVX-512**。要测 AVX-512 的 double-pumped 效应，必须在 Zen 4 上跑 v3。
+
+&emsp;&emsp;**AVX2 的指令数是标量的 0.30×，GFLOP/s 是 5.79×**。指令数只降 3.3 倍而不是 8 倍，因为固定开销（屏障、加载、存储、循环控制）在标量版本中每元素重复，在 AVX2 中每 8 元素重复——摊薄了 8-wide 的宽度收益。GFLOP/s 提升 5.79 倍，大于指令数降幅的倒数（1/0.30 = 3.3），因为 AVX2 不仅减少指令数，还减少了每指令的依赖等待：标量版本 16 条 FMA 串行，每条延迟 4 cycles，AVX2 把 8 条标量 FMA 合并成 1 条向量 FMA，同样的 64 cycles 关键路径上退休了 8 倍的工作。
+
+> 不支持AVX512意义每测出来。
+
+&emsp;&emsp;**5600X 的基线意义**：AVX2 每周期有效 FLOP = `28.17 GFLOP/s / 4.65 GHz ≈ 6.06 FLOP/cycle`——是 8-wide × 2 FLOP = 16 FLOP/cycle 理论峰值的 38%。剩余 62% 的差距来自单链 FMA 的串行延迟（16 次 × 4 cycles = 64 cycles/向量）和内存/循环开销。
 
 
 ## 13. 安全缓解措施：当“安全”成为微架构实验的隐藏变量
 
 &emsp;&emsp;第 2 章讨论了频率和热状态作为测量噪音源。在现代 CPU 上，还有一个同等量级的变量：**操作系统和微码为抵御瞬态执行攻击而启用的缓解措施**。这些措施直接改变分支预测和推测执行的行为，从而改变 Top-Down 的分布。
 
-### 13.1 做：缓解措施开启与关闭时的 Top-Down 对比
-
-&emsp;&emsp;**做**：在一个包含间接分支调用和密集系统调用的 workload 上，分别采集默认内核配置（缓解措施开启）和受控环境中关闭 `pti`、`ibrs`/`retpoline`、`ssbd` 后的数据（仅用于实验诊断）。采集 Top-Down Level 1 和 `branch-misses`。
-
-&emsp;&emsp;**看数据**：关闭缓解措施后，如果 **Bad Speculation 的比例显著下降**，说明原负载的一部分“错误投机”实际上是由 **retpoline 或 IBRS 引入的间接分支序列化**造成的。retpoline 将间接分支替换为 thunk，实质上**使间接分支预测失效**，而 IBRS 则限制间接分支的推测范围。这部分代价在 Top-Down 中被归入 Bad Speculation，但它与输入顺序不可预测导致的 Bad Speculation 有本质区别：后者可以通过改变数据顺序缓解，前者只能通过**减少间接分支的数量**来降低。
-
-### 13.2 在 5600X 上建立“缓解措施开启”的基线快照
+&emsp;&emsp;在 5600X 上，`spectre_v2` 的缓解措施是 **Retpolines**（外加 IBPB conditional、IBRS_FW、STIBP always-on、RSB filling），`spec_store_bypass` 显示为空（未启用 SSB 缓解），`meltdown` 为 Not affected（AMD 不受影响，PTI 默认关闭）。**这意味着本章能测到的是 retpoline 对间接分支的影响，测不到 PTI 的代价**——PTI 的差异只在 Intel 上显现。
 
 ```bash
-grep -r . /sys/devices/system/cpu/vulnerabilities/ 2>/dev/null | sort
+# 检查缓解状态
+for f in /sys/devices/system/cpu/vulnerabilities/*; do
+    printf "%-25s : %s\n" "$(basename $f)" "$(cat $f)"
+done
 ```
 
-&emsp;&emsp;**实践要点**：如果 `ibrs_enabled` 或 retpoline 处于开启状态，且 workload 包含密集的间接调用（C++ 虚函数、回调、解释器 dispatch），Top-Down 中 Bad Speculation 的基线可能被系统性抬高。在做任何“分支优化”之前，先确认这部分 Bad Speculation 是**程序可优化的**，还是**缓解措施施加的固定成本**。后者的正确策略是在算法层面**减少间接调用的频率**，而不是试图“消除分支”。
 
+&emsp;&emsp;workload 用 16 个不同目标函数的函数指针数组，LCG 生成随机索引调用 `targets[idx](sum)`。三个版本：v1 纯间接调用；v2 每 4096 次加一个系统调用；v3 每 16 次加一个系统调用。
 
-## 14. 工作负载形态：LLM 推理如何改变 Roofline 的判断前提
+```c
+__attribute__((noinline))
+long indirect_loop(long n, unsigned seed, int syscall_every) {
+    long sum = 0;
+    unsigned x = seed;
+    for (long i = 0; i < n; i++) {
+        x = x * 1103515245u + 12345u;
+        int idx = (x >> 16) & 15;
+        sum += targets[idx](sum);
+        __asm__ __volatile__("" : "+r"(sum), "+r"(x) : : "memory");
+        if (syscall_every > 0 && (i % syscall_every) == 0)
+            syscall(SYS_getpid);
+    }
+    return sum;
+}
+```
 
-&emsp;&emsp;LLM 推理引入了一类新的工作负载形态：**权重矩阵的体量远超缓存，而每次推理的有效计算密度极低**。Decode 阶段的算术强度约为 1 FLOP/Byte，是典型的内存带宽受限工作负载。
+**表 13-1 · 三个版本的间接分支行为（n = 10M，缓解措施开启）**
 
-### 14.1 做：INT8 量化对“内存屋顶”的抬升
+| 版本 | `cycles` | `ex_ret_instr` | `ex_ret_brn` | `ex_ret_brn_misp` | `ex_ret_brn_ind_misp` | **ind_misp / 迭代** |
+|---|---|---|---|---|---|---|
+| v1 纯间接 | 300.4M | 202.8M | 40.8M | 9.45M | **9.38M** | **93.8%** |
+| v2 + 1 sc/4096 | 314.0M | 283.8M | 61.0M | 9.48M | **9.38M** | **93.8%** |
+| v3 + 1 sc/16 | 1112.7M | 518.6M | 120.6M | 16.85M | **9.22M** | **92.2%** |
 
-&emsp;&emsp;如果权重是 FP16（2 字节/参数），INT8（1 字节/参数）在同等 DRAM 带宽下将有效参数供给速率翻倍，把 Roofline 的内存斜坡整体上移。Decode 的算术强度从 1 FLOP/Byte 提升到 2 FLOP/Byte。
+<svg width="760" height="280" viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
+  <rect x="8" y="8" width="744" height="264" fill="#fafafa" stroke="#ccc" rx="6"/>
+  <text x="30" y="34" font-size="13" font-weight="bold" fill="#333">Retpoline：93.8% 的间接分支误预测，系统调用不改变这个数字</text>
+  <line x1="80" y1="225" x2="720" y2="225" stroke="#333"/>
+  <line x1="80" y1="225" x2="80" y2="55" stroke="#333"/>
+  <text x="380" y="262" font-size="10" fill="#555">版本 →</text>
+  <text x="22" y="140" font-size="10" fill="#555" transform="rotate(-90 22,140)">比值</text>
 
-&emsp;&emsp;**做**：在 5600X 上，取一个中小规模的语言模型或 Transformer 编码器，分别在 FP16 和 INT8 权重下运行单序列 decode，测量 tokens/s 和 `ls_mab_alloc`。工作集应设置到明显超过 32MB L3。
+  <line x1="80" y1="150" x2="720" y2="150" stroke="#999" stroke-dasharray="3,3"/>
+  <text x="685" y="146" font-size="9" fill="#999">100%</text>
 
-&emsp;&emsp;**看数据**：INT8 版本应表现出更高的 tokens/s，但如果提升幅度**显著低于 2 倍**，说明 `ls_mab_alloc` 或 DRAM 带宽尚未被完全利用，瓶颈可能转移到了**反量化计算**或**低精度矩阵乘的指令开销**上。INT8 的收益上限是“内存屋顶翻倍”，但实际收益取决于计算路径是否能够在不增加瓶颈的情况下消费这翻倍的供给。
+  <g transform="translate(150,0)">
+    <rect x="0" y="155" width="80" height="70" fill="#c62828"/>
+    <text x="12" y="149" font-size="11" fill="#c62828" font-weight="bold">93.8%</text>
+    <text x="20" y="248" font-size="10" fill="#333" font-weight="bold">v1 纯间接</text>
+    <text x="15" y="263" font-size="9" fill="#666">300M cycles</text>
+  </g>
+  <g transform="translate(320,0)">
+    <rect x="0" y="155" width="80" height="70" fill="#c62828"/>
+    <text x="12" y="149" font-size="11" fill="#c62828" font-weight="bold">93.8%</text>
+    <text x="0" y="248" font-size="10" fill="#333" font-weight="bold">v2 +sc/4096</text>
+    <text x="15" y="263" font-size="9" fill="#666">314M cycles</text>
+  </g>
+  <g transform="translate(490,0)">
+    <rect x="0" y="156" width="80" height="69" fill="#c62828"/>
+    <text x="12" y="150" font-size="11" fill="#c62828" font-weight="bold">92.2%</text>
+    <text x="5" y="248" font-size="10" fill="#333" font-weight="bold">v3 +sc/16</text>
+    <text x="10" y="263" font-size="9" fill="#666">1113M cycles</text>
+  </g>
+</svg>
 
-### 14.2 做：权重布局与访问粒度
+&emsp;&emsp;**v1 的 9.38M 次间接分支误预测 / 10M 次迭代 = 93.8%**。16 个目标的随机选择让间接分支预测器无法学习——每次间接调用都有约 1/3 的概率猜错是合理的，但 93.8% 不是预测器的问题：**retpoline 把间接 `call`/`jmp` 替换成了 `lfence; jmp *%rax` 的等价序列，强制推测执行停在 `lfence` 之后**。在 Top-Down 视角下，每次间接分支都被当作“总是误预测”处理——`ex_ret_brn_ind_misp` 统计的是“retpoline thunk 的推测失败”，不是“预测器猜错了目标”。
 
-&emsp;&emsp;LLM 推理每次 decode 步骤读取一整套权重矩阵，如果权重按不利于缓存行利用的方式布局，有效带宽会被浪费在“加载了但只用了部分字节”上——这与 11.2 节的 AoS 问题同构，但发生在更大的数据规模上。
+&emsp;&emsp;**v2 和 v3 的 `ex_ret_brn_ind_misp` 与 v1 几乎相同（9.38M / 9.22M）**——系统调用增加了 `ex_ret_brn`（v3 的 120.6M 是 v1 的 3 倍，系统调用路径里的分支更多），增加了 `cycles`（v3 的 1113M 是 v1 的 3.7 倍），但**间接分支的误预测数不变**。retpoline 的成本是“每次间接调用固定付一次”，与系统调用次数无关——**这是缓解措施施加的固定成本，不是“系统调用导致的”**。
 
-&emsp;&emsp;**做**：在 5600X 上，对比标准行优先布局和按输出通道分组的布局，用 `perf stat -e cache-misses,cache-references,ls_mab_alloc` 采集。如果分组布局下 `cache-misses / cache-references` 显著下降，说明原始布局的“连续读”在 decode 阶段的细粒度访问模式下并没有转化为高有效载荷。
+&emsp;&emsp;**v3 的系统调用代价可以单独算出来**：10M / 16 = 625K 次系统调用，cycles 从 300M 涨到 1113M，增量 813M，**每次系统调用约 1300 cycles**。这个数字在 5600X 上是 `SYS_getpid` 的纯内核进入/退出成本（AMD 不受 Meltdown 影响，PTI 默认关闭），不包含 PTI 的 CR3 切换和 TLB 失效。**Intel 上开启 PTI 时，同样的系统调用会额外增加 1000–2000 cycles**——这就是本章在 5600X 上测不到的部分。
 
-&emsp;&emsp;**5600X 上的定位**：32MB L3 对于小型模型或量化后的权重可能仍然容纳一部分，因此 LLM 推理的 Memory Bound 在 5600X 上可能首先表现为 **L3 到核心的供给瓶颈**，而非 DRAM 带宽饱和。权重布局和 L3 驻留策略的优先级可能高于 DRAM 级优化。
+&emsp;&emsp;**关闭 retpoline 后，v1 的 `ex_ret_brn_ind_misp` 应降到约 6M（20% 左右）**——预测器可以重新学习 16 个目标的模式。这个下降不是“优化”，是把“推测被禁用”恢复成“推测可以犯错”。**两者在 Top-Down 中都归入 Bad Speculation，但来源不同**：retpoline 施加的是**固定成本**（每次间接分支必付），预测器犯错是**可变成本**（取决于目标数和输入序列）。前者只能靠**减少间接分支数量**消除（虚函数改模板、回调改 switch、解释器改 computed goto），后者可以靠**改变输入顺序**缓解（第 11.3 节的分支排序）。**在 5600X 上做分支优化之前，先检查 `spectre_v2` 的状态**——如果默认启用了 retpoline，任何包含间接分支的 workload 的 Bad Speculation 基线都会被系统性抬高 93% 量级，这个数字不是程序能优化的，是缓解措施施加的。
 
 
 ## 15. 优化技术选型：把诊断结果接到正确的技术上
