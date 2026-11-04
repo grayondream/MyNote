@@ -376,7 +376,7 @@ swfilt=config2:0
 
 &emsp;&emsp;常见教程里的 `ibs_op/cnt_ctl=1,13missonly=1/` 在本机不可用——`13missonly` 不是合法字段，`perf record` 会报 `valid terms: cnt_ctl,swfilt,...`。`cnt_ctl=1` 与 `ibs_op//` 都能打开，但它们只改变采样条件，不改变数据源列的可用性。
 
-&emsp;&emsp;这也解释了旧日志 `a6.log` 与当前输出的反差：旧日志里出现过 `Memory access`、`Data Symbol`、`Snoop` 等列，`Total weight` 与样本数相等，`Local Weight` 全为 `0`；当前 perf 版本生成不出这些列。两者不是同一份能力，不能混用。本文以当前可复现的输出为准：**IBS op 在这台机器上给出了函数级精确归属，但没有给出数据源层级、数据符号、延迟和阻塞信息。**
+&emsp;&emsp;本文以当前可复现的输出为准：**IBS op 在这台机器上给出了函数级精确归属，但没有给出数据源层级、数据符号、延迟和阻塞信息。**
 
 &emsp;&emsp;所以第 6 章的产出不是一条可用的数据源结论，而是一组边界。能成立的只有"函数级精确归属"：`99.42%` 的样本落在 `gemm_naive_ijk`，调用链没有中间层消耗显著比例。不能成立的是"数据源层级归因"：`memory` 排序键直接段错误，`-F memory` 不识别，`Local Weight` 为 `0`，`Total weight` 缺失。下一步要么换到 Intel PEBS 平台（`mem_load_retired.l3_miss:pp` 一类事件能带数据源），要么接受这条路径在当前平台上的上限，回到 `perf stat` 的 IPC / cache-miss 率、`perf annotate` 的循环热点、以及第 7 章的对照实验来验证"在等数据"。
 
@@ -467,47 +467,7 @@ perf stat -e cycles,instructions -r 3 taskset -c 0-7 \
 
 ### 7.5 闭环
 
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" width="760" height="300" font-family="'Noto Sans CJK SC','PingFang SC','Microsoft YaHei',sans-serif">
-  <rect x="0" y="0" width="760" height="300" fill="#fbfbfd" stroke="#d8dce6" rx="8"/>
-  <text x="380" y="26" text-anchor="middle" font-size="15" font-weight="bold" fill="#263238">图 7  分层证据链与闭环验证</text>
-  <g font-size="11" text-anchor="middle">
-    <rect x="28" y="76" width="128" height="62" rx="6" fill="#e3f2fd" stroke="#64b5f6"/>
-    <text x="92" y="102" fill="#0d47a1">计数器</text>
-    <text x="92" y="122" fill="#1565c0">perf stat</text>
-    <rect x="174" y="76" width="128" height="62" rx="6" fill="#e8eaf6" stroke="#7986cb"/>
-    <text x="238" y="102" fill="#1a237e">采样</text>
-    <text x="238" y="122" fill="#283593">perf report</text>
-    <rect x="320" y="76" width="128" height="62" rx="6" fill="#fff3e0" stroke="#ffb74d"/>
-    <text x="384" y="102" fill="#e65100">缓存行</text>
-    <text x="384" y="122" fill="#ef6c00">perf c2c</text>
-    <rect x="466" y="76" width="128" height="62" rx="6" fill="#fce4ec" stroke="#f06292"/>
-    <text x="530" y="102" fill="#880e4f">指令</text>
-    <text x="530" y="122" fill="#ad1457">perf annotate</text>
-    <rect x="612" y="76" width="120" height="62" rx="6" fill="#e8f5e9" stroke="#81c784"/>
-    <text x="672" y="102" fill="#1b5e20">精确归属</text>
-    <text x="672" y="122" fill="#2e7d32">IBS op</text>
-  </g>
-  <g stroke="#90a4ae" stroke-width="1.5" fill="none" marker-end="url(#arr5)">
-    <line x1="158" y1="107" x2="172" y2="107"/>
-    <line x1="304" y1="107" x2="318" y2="107"/>
-    <line x1="450" y1="107" x2="464" y2="107"/>
-    <line x1="596" y1="107" x2="610" y2="107"/>
-  </g>
-  <defs>
-    <marker id="arr5" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-      <path d="M0,0 L8,4 L0,8 z" fill="#90a4ae"/>
-    </marker>
-  </defs>
-  <text x="380" y="168" text-anchor="middle" font-size="12" fill="#455a64">每一层只负责回答一个问题，并缩小下一层的搜索空间</text>
-  <path d="M672,196 C672,236 92,236 92,196" stroke="#26a69a" stroke-width="1.8" fill="none" stroke-dasharray="7 5" marker-end="url(#arr6)"/>
-  <defs>
-    <marker id="arr6" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
-      <path d="M0,0 L9,4.5 L0,9 z" fill="#26a69a"/>
-    </marker>
-  </defs>
-  <text x="380" y="258" text-anchor="middle" font-size="12" font-weight="bold" fill="#00796b">改动后回到同一测量起点，逐环确认方向</text>
-  <text x="380" y="280" text-anchor="middle" font-size="11" fill="#78909c">IPC 上升、L1 miss 下降、runtime 下降 —— 三者同向才构成闭环</text>
-</svg>
+![](https://cdn.jsdelivr.net/gh/grayondream/MyImageBlob@main/imgs/deepseek_svg_20261104_53557d.svg)
 
 &emsp;&emsp;回到**同一测量起点**，把 A、A2 的结果放在一起看：
 
