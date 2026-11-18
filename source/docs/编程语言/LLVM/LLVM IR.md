@@ -588,16 +588,6 @@ clang++-22 -std=c++20 -O0 -Xclang -disable-O0-optnone -S -emit-llvm ch5_1_types.
 
 &emsp;&emsp;沿用第 2 章的选择，`-O0` 保留了最朴素的栈式 IR，方便把 C++ 语句和指令一一对应。个别地方再补一份 `-O2` 的产物做对照，命令只是把 `-O0 -Xclang -disable-O0-optnone` 换成 `-O2`。
 
-&emsp;&emsp;源文件和生成文件的对应关系（都在本章配套目录下）：
-
-- 5.1 基础类型和算术操作：`ch5_1_types.cpp` → `ch5_1_types.ll`、`ch5_1_types.O2.ll`
-- 5.2 函数：`ch5_2_functions.cpp` → `ch5_2_functions.ll`
-- 5.3 控制流：`ch5_3_control.cpp` → `ch5_3_control.ll`、`ch5_3_control.O2.ll`
-- 5.4 类和结构体内存布局：`ch5_4_class_layout.cpp` → `ch5_4_class_layout.ll`
-- 5.5 继承、多态和虚函数：`ch5_5_inheritance.cpp` → `ch5_5_inheritance.ll`、`ch5_5_inheritance.O2.ll`
-- 5.6 C++ 异常和 RAII：`ch5_6_exceptions.cpp` → `ch5_6_exceptions.ll`
-- 5.7 模板：`ch5_7_templates.cpp` → `ch5_7_templates.ll`、`ch5_7_templates.O2.ll`
-
 &emsp;&emsp;文中引用的指令和类型都能在上面这些 `.ll` 文件里原样找到（行尾的中文注释是为讲解另加的），建议对照阅读。
 
 ### 5.1 基础类型和算术操作
